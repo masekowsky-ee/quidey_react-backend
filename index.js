@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json()); //parse json bodies
 
-//get endpoints
+//GET endpoints
 app.get("/api/hello", (req, res) => {
     res.json({ message: "Hello, this is the backend!" });
 });
@@ -33,6 +33,44 @@ app.get("/api/tasks", async (req, res) => {
         res.status(500).json({ success: false, error: err.message });
     }
 });
+//for debugging
+app.get("/api/task-groups", async (req, res) => {
+    try {
+        const result = await pool.query("SELECT * FROM task_groups");
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message});
+    }
+});
+
+app.get("/api/tasks/:id/groups", async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const result = await pool.query(
+            `SELECT groups.id, groups.name, groups.description
+            FROM groups
+            JOIN task_groups ON groups.id = task_groups.group_id
+            WHERE task_groups.task_id = $1`,
+            [id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get("/api/groups", async (req, res) => {
+    try {
+        const result = await pool.query("SELECT * FROM groups ORDER BY id");
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
 
 //POST endpoints
 app.post("/api/tasks", async (req, res) => {
@@ -52,6 +90,41 @@ app.post("/api/tasks", async (req, res) => {
     }
 });
 
+app.post("/api/groups", async (req, res) => {
+    const { name, description } = req.body;
+
+    try {
+        const result = await pool.query(
+            `INSERT INTO groups (name, description)
+            VALUES ($1, $2)
+            RETURNING *`,
+            [name, description]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post("/api/tasks/:taskId/groups/:groupId", async (req, res) => {
+    const { taskId, groupId } = req.params;
+
+    try { 
+        const result = await pool.query(
+            `INSERT INTO task_groups (task_id, group_id)
+            VALUES ($1, $2)
+            RETURNING *`,
+            [taskId, groupId]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+//PUT endpoints
 app.put("/api/tasks/:id", async (req, res) => {
     const { id } = req.params;
     const { name, due, description, prio, done } = req.body;
@@ -76,6 +149,31 @@ app.put("/api/tasks/:id", async (req, res) => {
     }
 });
 
+app.put("/api/groups/:id", async (req, res) => {
+    const { id } = req.params;
+    const { name, description } = req.body;
+
+    try {
+        const result = await pool.query(
+            `UPDATE groups
+            SET name = $1, description = $2
+            WHERE id = $3
+            RETURNING *`,
+            [name, description, id]
+        );
+
+        if(result.rows.length === 0) {
+            return res.status(404).json({ error: "Group not found" });
+        }
+
+        res.json(result.rows[0]);
+    } catch (err) { 
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+//DELETE endpoints
 app.delete("/api/tasks/:id", async (req, res) => {
     const { id } = req.params;
 
@@ -94,7 +192,27 @@ app.delete("/api/tasks/:id", async (req, res) => {
         console.error(err);
         res.status(500).json({ error: err.message });
     }
-})
+});
+
+app.delete("/api/groups/:id", async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const result = await pool.query(
+            "DELETE FROM groups WHERE id = $1 RETURNING *",
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "Group not found" });
+        }
+
+        res.json({ message: "Group deleted", group: result.rows[0] });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
 
 
 
@@ -102,3 +220,6 @@ app.delete("/api/tasks/:id", async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server runnin on http://localhost:${PORT}`);
 });
+
+
+// write methods for notes, sessions and to get all tasks of a group.
