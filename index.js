@@ -300,7 +300,7 @@ app.put("/api/notes/:id", async (req, res) => {
         )
 
         if (result.rows.length === 0) {
-            return res.status(400).json({ error: "Task not found" });
+            return res.status(404).json({ error: "Task not found" });
         }
 
         res.json(result.rows[0]);
@@ -361,7 +361,7 @@ app.delete("/api/notes/:id", async (req, res) => {
         );
 
         if (result.rows.length === 0) {
-            return res.status(400).json({ error: "Note not found" });
+            return res.status(404).json({ error: "Note not found" });
         }
 
         res.json({ message: "Note deleted", note: result.rows[0] });
@@ -377,3 +377,5 @@ app.delete("/api/notes/:id", async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server runnin on http://localhost:${PORT}`);
 });
+
+// net start postgresql-x64-18
