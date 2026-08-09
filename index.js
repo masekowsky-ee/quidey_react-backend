@@ -62,9 +62,70 @@ app.get("/api/tasks/:id/groups", async (req, res) => {
     }
 });
 
+app.get("/api/groups/:id/tasks", async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const result = await pool.query(
+            `SELECT tasks.id, tasks.name, tasks.description
+            FROM tasks
+            JOIN task_groups ON tasks.id = task_groups.task_id
+            WHERE task_groups.group_id = $1`,
+            [id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get("/api/groups", async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM groups ORDER BY id");
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get("/api/tasks/:taskId/notes", async (req, res) => {
+    const { taskId } = req.params;
+
+    try {
+       const result = await pool.query(
+       "SELECT * FROM notes WHERE task_id = $1 ORDER BY id",
+        [taskId]
+    );
+    res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get("/api/sessions", async (req, res) => {
+    try {
+        const result = await pool.query("SELECT * FROM sessions ORDER BY id DESC");
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get("/api/sessions/:id/tasks", async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const result = await pool.query(
+            `SELECT tasks.id, tasks.name, tasks.due, tasks.description, tasks.prio, tasks.done
+            FROM tasks
+            JOIN session_tasks ON tasks.id = session_tasks.task_id
+            WHERE session_tasks.session_id = $1`,
+            [id]
+        );
         res.json(result.rows);
     } catch (err) {
         console.error(err);
@@ -124,6 +185,58 @@ app.post("/api/tasks/:taskId/groups/:groupId", async (req, res) => {
     }
 });
 
+app.post("/api/tasks/:taskId/notes", async (req, res) => {
+    const { taskId } = req.params;
+    const { content } = req.body;
+
+    try {
+        const result = await pool.query(
+            `INSERT INTO notes (task_id, content)
+            VALUES ($1, $2)
+            RETURNING *`,
+            [taskId, content]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post("/api/sessions", async (req, res) => {
+    const { group_id, time_ms } = req.body;
+
+    try {
+        const result = await pool.query(
+            `INSERT INTO sessions (group_id, time_ms)
+            VALUES ($1, $2)
+            RETURNING *`,
+            [group_id, time_ms]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post("/api/sessions/:sessionId/tasks/:taskId", async (req, res) => {
+    const { sessionId, taskId } = req.params;
+
+    try{
+        const result = await pool.query(
+            `INSERT INTO session_tasks (session_id, task_id)
+            VALUES ($1, $2)
+            RETURNING *`,
+            [sessionId, taskId]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 //PUT endpoints
 app.put("/api/tasks/:id", async (req, res) => {
     const { id } = req.params;
@@ -173,6 +286,30 @@ app.put("/api/groups/:id", async (req, res) => {
     }
 });
 
+app.put("/api/notes/:id", async (req, res) => {
+    const { id } = req.params;
+    const { content } = req.body;
+
+    try {
+        const result = await pool.query(
+            `UPDATE notes
+            SET content = $1
+            WHERE id = $2
+            RETURNING *`,
+            [content, id]
+        )
+
+        if (result.rows.length === 0) {
+            return res.status(400).json({ error: "Task not found" });
+        }
+
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+})
+
 //DELETE endpoints
 app.delete("/api/tasks/:id", async (req, res) => {
     const { id } = req.params;
@@ -214,12 +351,29 @@ app.delete("/api/groups/:id", async (req, res) => {
     }
 });
 
+app.delete("/api/notes/:id", async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const result = await pool.query(
+            "DELETE FROM notes WHERE id = $1 RETURNING *",
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(400).json({ error: "Note not found" });
+        }
+
+        res.json({ message: "Note deleted", note: result.rows[0] });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+})
+
 
 
 //listen for requests on this url
 app.listen(PORT, () => {
     console.log(`Server runnin on http://localhost:${PORT}`);
 });
-
-
-// write methods for notes, sessions and to get all tasks of a group.
