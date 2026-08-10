@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require("cors");
 const pool = require("./db");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -231,6 +233,59 @@ app.post("/api/sessions/:sessionId/tasks/:taskId", async (req, res) => {
             [sessionId, taskId]
         );
         res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post("/api/register", async (req,res) => {
+    const { username, password } = req.body;
+
+    try { 
+        const passwordHash = await bcrypt.hash(password, 10);
+
+        const result = await pool.query(
+            `INSERT INTO users (username, password_hash)
+            VALUES ($1, $2)
+            RETURNING id, username, created_at`, 
+            [username, passwordHash]
+        );
+
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message }); 
+    }
+});
+
+app.post("/api/login", async (req, res) => {
+    const { username, password } = req.body;
+
+    try {
+        const result = await pool.query(
+            "SELECT * FROM users WHERE username = $1",
+            [username]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "Invalid sign in" });
+        }
+
+        const user = result.rows[0];
+        const passwordMatch = await bcrypt.compare(password, user.password_hash);
+
+        if(!passwordMatch) {
+            return res.status(401).json({ error: "Invalid sign in"});
+        }
+
+        const token = jwt.sign(
+            { userId: user.id, username: user.username },
+            process.env.JWT_SECRET,
+            { expiresIn: "7d" }
+        );
+
+        res.json({ token });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: err.message });
