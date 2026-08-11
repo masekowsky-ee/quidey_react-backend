@@ -11,6 +11,28 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json()); //parse json bodies
 
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.split(" ")[1];
+
+    if (!token) {
+        return res.status(401).json({ error: "No existing token" });
+    }
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) {
+            return res.status(403).json({ error: "Token invalid or expired" });
+        }
+        req.user = user;
+        next();
+    })
+}
+
+app.use("/api/tasks", authenticateToken);
+app.use("/api/groups", authenticateToken);
+app.use("/api/sessions", authenticateToken);
+app.use("/api/notes", authenticateToken);
+
 //GET endpoints
 app.get("/api/hello", (req, res) => {
     res.json({ message: "Hello, this is the backend!" });
@@ -27,8 +49,13 @@ app.get("/api/db-test", async (req, res) => {
 });
 
 app.get("/api/tasks", async (req, res) => {
+    const userId = req.user.userId;
+
     try{
-        const result = await pool.query("SELECT * FROM tasks ORDER BY id");
+        const result = await pool.query(
+            "SELECT * FROM tasks WHERE user_id = $1 ORDER BY id",
+            [userId]
+        );
         res.json(result.rows);
     } catch (err) {
         console.error(err);
@@ -83,8 +110,9 @@ app.get("/api/groups/:id/tasks", async (req, res) => {
 });
 
 app.get("/api/groups", async (req, res) => {
+    const userId = req.user.userId;
     try {
-        const result = await pool.query("SELECT * FROM groups ORDER BY id");
+        const result = await pool.query("SELECT * FROM groups WHERE user_id = $1 ORDER BY id", [userId]);
         res.json(result.rows);
     } catch (err) {
         console.error(err);
@@ -94,11 +122,16 @@ app.get("/api/groups", async (req, res) => {
 
 app.get("/api/tasks/:taskId/notes", async (req, res) => {
     const { taskId } = req.params;
+    const userId = req.user.userId;
 
     try {
        const result = await pool.query(
-       "SELECT * FROM notes WHERE task_id = $1 ORDER BY id",
-        [taskId]
+       `SELECT notes.*
+       FROM notes
+       JOIN tasks ON notes.task_id = tasks.id
+       WHERE notes.task_id = $1 AND tasks.user_id = $2
+       ORDER BY notes.id`,
+        [taskId, userId]
     );
     res.json(result.rows);
     } catch (err) {
@@ -108,8 +141,9 @@ app.get("/api/tasks/:taskId/notes", async (req, res) => {
 });
 
 app.get("/api/sessions", async (req, res) => {
+    const userId = req.user.userId;
     try {
-        const result = await pool.query("SELECT * FROM sessions ORDER BY id DESC");
+        const result = await pool.query("SELECT * FROM sessions WHERE user_id = $1 ORDER BY id DESC", [userId]);
         res.json(result.rows);
     } catch (err) {
         console.error(err);
@@ -138,13 +172,14 @@ app.get("/api/sessions/:id/tasks", async (req, res) => {
 //POST endpoints
 app.post("/api/tasks", async (req, res) => {
     const { name, due, description, prio } = req.body;
+    const userId = req.user.userId;
 
     try {
         const result = await pool.query(
-            `INSERT INTO tasks (name, due, description, prio) 
-            VALUES ($1, $2, $3, $4) 
+            `INSERT INTO tasks (name, due, description, prio, user_id) 
+            VALUES ($1, $2, $3, $4, $5) 
             RETURNING *`,
-            [name, due, description, prio]
+            [name, due, description, prio, userId]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -155,13 +190,14 @@ app.post("/api/tasks", async (req, res) => {
 
 app.post("/api/groups", async (req, res) => {
     const { name, description } = req.body;
+    const userId = req.user.userId;
 
     try {
         const result = await pool.query(
-            `INSERT INTO groups (name, description)
-            VALUES ($1, $2)
+            `INSERT INTO groups (name, description, user_id)
+            VALUES ($1, $2, $3)
             RETURNING *`,
-            [name, description]
+            [name, description, userId]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -207,13 +243,14 @@ app.post("/api/tasks/:taskId/notes", async (req, res) => {
 
 app.post("/api/sessions", async (req, res) => {
     const { group_id, time_ms } = req.body;
+    const userId = req.user.userId;
 
     try {
         const result = await pool.query(
-            `INSERT INTO sessions (group_id, time_ms)
-            VALUES ($1, $2)
+            `INSERT INTO sessions (group_id, time_ms, user_id)
+            VALUES ($1, $2, $3)
             RETURNING *`,
-            [group_id, time_ms]
+            [group_id, time_ms, userId]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -296,14 +333,15 @@ app.post("/api/login", async (req, res) => {
 app.put("/api/tasks/:id", async (req, res) => {
     const { id } = req.params;
     const { name, due, description, prio, done } = req.body;
+    const userId = req.user.userId;
 
     try {
         const result = await pool.query(
             `UPDATE tasks
             SET name = $1, due = $2, description = $3, prio = $4, done = $5
-            WHERE id = $6
+            WHERE id = $6 AND user_id = $7
             RETURNING *`,
-            [name, due, description, prio, done, id]
+            [name, due, description, prio, done, id, userId]
         );
 
         if (result.rows.length === 0) {
@@ -320,14 +358,15 @@ app.put("/api/tasks/:id", async (req, res) => {
 app.put("/api/groups/:id", async (req, res) => {
     const { id } = req.params;
     const { name, description } = req.body;
+    const userId = req.user.userId;
 
     try {
         const result = await pool.query(
             `UPDATE groups
             SET name = $1, description = $2
-            WHERE id = $3
+            WHERE id = $3 AND user_id = $4
             RETURNING *`,
-            [name, description, id]
+            [name, description, id, userId]
         );
 
         if(result.rows.length === 0) {
@@ -355,7 +394,7 @@ app.put("/api/notes/:id", async (req, res) => {
         )
 
         if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Task not found" });
+            return res.status(404).json({ error: "Note not found" });
         }
 
         res.json(result.rows[0]);
@@ -368,11 +407,12 @@ app.put("/api/notes/:id", async (req, res) => {
 //DELETE endpoints
 app.delete("/api/tasks/:id", async (req, res) => {
     const { id } = req.params;
+    const userId = req.user.userId;
 
     try {
         const result = await pool.query(
-            "DELETE FROM tasks WHERE id = $1 RETURNING *",
-            [id]
+            "DELETE FROM tasks WHERE id = $1 AND user_id = $2 RETURNING *",
+            [id, userId]
         );
 
         if (result.rows.length === 0) {
@@ -388,11 +428,12 @@ app.delete("/api/tasks/:id", async (req, res) => {
 
 app.delete("/api/groups/:id", async (req, res) => {
     const { id } = req.params;
+    const userId = req.user.userId;
 
     try {
         const result = await pool.query(
-            "DELETE FROM groups WHERE id = $1 RETURNING *",
-            [id]
+            "DELETE FROM groups WHERE id = $1 AND user_id = $2 RETURNING *",
+            [id, userId]
         );
 
         if (result.rows.length === 0) {
@@ -408,11 +449,15 @@ app.delete("/api/groups/:id", async (req, res) => {
 
 app.delete("/api/notes/:id", async (req, res) => {
     const { id } = req.params;
+    const userId = req.user.userId;
 
     try {
         const result = await pool.query(
-            "DELETE FROM notes WHERE id = $1 RETURNING *",
-            [id]
+            `DELETE FROM notes
+             WHERE id = $1
+            AND task_id IN (SELECT id FROM tasks WHERE user_id = $2) 
+            RETURNING *`,
+            [id, userId]
         );
 
         if (result.rows.length === 0) {
