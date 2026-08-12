@@ -62,27 +62,19 @@ app.get("/api/tasks", async (req, res) => {
         res.status(500).json({ success: false, error: err.message });
     }
 });
-//for debugging
-app.get("/api/task-groups", async (req, res) => {
-    try {
-        const result = await pool.query("SELECT * FROM task_groups");
-        res.json(result.rows);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message});
-    }
-});
 
 app.get("/api/tasks/:id/groups", async (req, res) => {
     const { id } = req.params;
+    const userId = req.user.userId;
 
     try {
         const result = await pool.query(
             `SELECT groups.id, groups.name, groups.description
             FROM groups
             JOIN task_groups ON groups.id = task_groups.group_id
-            WHERE task_groups.task_id = $1`,
-            [id]
+            JOIN tasks ON tasks.id = task_groups.task_id
+            WHERE task_groups.task_id = $1 AND tasks.user_id = $2`,
+            [id, userId]
         );
         res.json(result.rows);
     } catch (err) {
@@ -93,14 +85,16 @@ app.get("/api/tasks/:id/groups", async (req, res) => {
 
 app.get("/api/groups/:id/tasks", async (req, res) => {
     const { id } = req.params;
+    const userId = req.user.userId;
 
     try {
         const result = await pool.query(
             `SELECT tasks.id, tasks.name, tasks.description
             FROM tasks
             JOIN task_groups ON tasks.id = task_groups.task_id
-            WHERE task_groups.group_id = $1`,
-            [id]
+            JOIN groups ON groups.id = task_groups.group_id
+            WHERE task_groups.group_id = $1 AND groups.user_id = $2`,
+            [id, userId]
         );
         res.json(result.rows);
     } catch (err) {
@@ -153,14 +147,15 @@ app.get("/api/sessions", async (req, res) => {
 
 app.get("/api/sessions/:id/tasks", async (req, res) => {
     const { id } = req.params;
-
+    const userId = req.user.userId;
     try {
         const result = await pool.query(
             `SELECT tasks.id, tasks.name, tasks.due, tasks.description, tasks.prio, tasks.done
             FROM tasks
             JOIN session_tasks ON tasks.id = session_tasks.task_id
-            WHERE session_tasks.session_id = $1`,
-            [id]
+            JOIN sessions ON sessions.id = session_tasks.session_id
+            WHERE session_tasks.session_id = $1 AND sessions.user_id = $2`,
+            [id, userId]
         );
         res.json(result.rows);
     } catch (err) {
@@ -208,8 +203,20 @@ app.post("/api/groups", async (req, res) => {
 
 app.post("/api/tasks/:taskId/groups/:groupId", async (req, res) => {
     const { taskId, groupId } = req.params;
+    const userId = req.user.userId;
 
     try { 
+        const ownerCheck = await pool.query(
+            `SELECT 1 FROM tasks WHERE id = $1 AND user_id = $2
+            UNION ALL
+            SELECT 1 FROM groups WHERE id = $3 AND user_id = $2`,
+            [taskId, userId, groupId]
+        );
+
+        if (ownerCheck.rows.length < 2) {
+            return res.status(404).json({ error: "Task or group not found" });
+        }
+
         const result = await pool.query(
             `INSERT INTO task_groups (task_id, group_id)
             VALUES ($1, $2)
@@ -226,8 +233,18 @@ app.post("/api/tasks/:taskId/groups/:groupId", async (req, res) => {
 app.post("/api/tasks/:taskId/notes", async (req, res) => {
     const { taskId } = req.params;
     const { content } = req.body;
+    const userId = req.user.userId;
 
     try {
+        const taskCheck = await pool.query(
+            "SELECT 1 FROM tasks WHERE id = $1 AND user_id = $2",
+            [taskId, userId]
+        );
+
+        if (taskCheck.rows.length === 0) {
+            return res.status(404).json({ error: "Task not found" });
+        }
+
         const result = await pool.query(
             `INSERT INTO notes (task_id, content)
             VALUES ($1, $2)
@@ -246,6 +263,16 @@ app.post("/api/sessions", async (req, res) => {
     const userId = req.user.userId;
 
     try {
+        if (group_id) {
+            const groupCheck = await pool.query(
+                "SELECT 1 FROM groups WHERE id = $1 AND user_id = $2",
+                [group_id, userId]
+            );
+            if (groupCheck.rows.length === 0) {
+                return res.status(404).json({ error: "Group not found" });
+            }R 
+        }
+
         const result = await pool.query(
             `INSERT INTO sessions (group_id, time_ms, user_id)
             VALUES ($1, $2, $3)
@@ -261,8 +288,20 @@ app.post("/api/sessions", async (req, res) => {
 
 app.post("/api/sessions/:sessionId/tasks/:taskId", async (req, res) => {
     const { sessionId, taskId } = req.params;
+    const userId = req.user.userId;
 
     try{
+        const ownerCheck = await pool.query(
+            `SELECT 1 FROM sessions WHERE id = $1 AND user_id = $2
+            UNION ALL
+            SELECT 1 FROM tasks WHERE id = $3 AND user_id = $2`,
+            [sessionId, userId, taskId]
+        );
+
+        if (ownerCheck.rows.length < 2) {
+            return res.status(404).json({ error: "Session or task not found" });
+        }
+
         const result = await pool.query(
             `INSERT INTO session_tasks (session_id, task_id)
             VALUES ($1, $2)
@@ -383,14 +422,16 @@ app.put("/api/groups/:id", async (req, res) => {
 app.put("/api/notes/:id", async (req, res) => {
     const { id } = req.params;
     const { content } = req.body;
+    const userId = req.user.userId;
 
     try {
         const result = await pool.query(
             `UPDATE notes
             SET content = $1
             WHERE id = $2
+            AND task_id IN (SELECT id FROM tasks WHERE user_id = $3)
             RETURNING *`,
-            [content, id]
+            [content, id, userId]
         )
 
         if (result.rows.length === 0) {
