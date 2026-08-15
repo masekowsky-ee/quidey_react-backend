@@ -166,7 +166,7 @@ app.get("/api/sessions/:id/tasks", async (req, res) => {
 
 app.get("/api/me" , authenticateToken, (req, res) => {
     res.json({ userId: req.user.userId, username: req.user.username })
-})
+});
 
 //POST endpoints
 app.post("/api/tasks", async (req, res) => {
