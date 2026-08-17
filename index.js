@@ -32,6 +32,7 @@ app.use("/api/tasks", authenticateToken);
 app.use("/api/groups", authenticateToken);
 app.use("/api/sessions", authenticateToken);
 app.use("/api/notes", authenticateToken);
+app.use("/api/task-groups", authenticateToken);
 
 //GET endpoints
 app.get("/api/hello", (req, res) => {
@@ -82,7 +83,7 @@ app.get("/api/tasks/:id/groups", async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-
+//group tasks by id
 app.get("/api/groups/:id/tasks", async (req, res) => {
     const { id } = req.params;
     const userId = req.user.userId;
@@ -486,6 +487,32 @@ app.delete("/api/groups/:id", async (req, res) => {
         }
 
         res.json({ message: "Group deleted", group: result.rows[0] });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete("/api/task-groups/:taskId/:groupId", async (req, res) => {
+    const { taskId, groupId } = req.params;
+    const userId = req.user.userId; 
+
+    try {
+        const result = await pool.query(
+            `DELETE FROM task_groups
+             WHERE task_id = $1 
+             AND group_id = $2 
+             AND task_id IN (SELECT id FROM tasks WHERE user_id = $3)
+             AND group_id IN (SELECT id FROM groups WHERE user_id = $3)
+             RETURNING *`,
+             [taskId, groupId, userId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "Connection not found" })
+        }
+
+        res.json({ message: "Connection deleted", connection: result.rows[0] })
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: err.message });
