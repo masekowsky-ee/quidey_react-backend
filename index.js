@@ -90,7 +90,7 @@ app.get("/api/groups/:id/tasks", async (req, res) => {
 
     try {
         const result = await pool.query(
-            `SELECT tasks.id, tasks.name, tasks.description
+            `SELECT tasks.id, tasks.name, tasks.description, tasks.due, tasks.prio, tasks.done
             FROM tasks
             JOIN task_groups ON tasks.id = task_groups.task_id
             JOIN groups ON groups.id = task_groups.group_id
