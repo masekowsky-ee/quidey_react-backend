@@ -33,6 +33,7 @@ app.use("/api/groups", authenticateToken);
 app.use("/api/sessions", authenticateToken);
 app.use("/api/notes", authenticateToken);
 app.use("/api/task-groups", authenticateToken);
+app.use("/api/users", authenticateToken);
 
 //GET endpoints
 app.get("/api/hello", (req, res) => {
@@ -55,6 +56,21 @@ app.get("/api/tasks", async (req, res) => {
     try{
         const result = await pool.query(
             "SELECT * FROM tasks WHERE user_id = $1 ORDER BY id",
+            [userId]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get("/api/users", async (req, res) => {
+    const userId = req.user.userId;
+
+    try {
+        const result = await pool.query(
+            "SELECT users.username, users.display_name, users.birth_date, users.email FROM users WHERE id = $1",
             [userId]
         );
         res.json(result.rows);
