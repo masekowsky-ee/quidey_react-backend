@@ -337,16 +337,16 @@ app.post("/api/sessions/:sessionId/tasks/:taskId", async (req, res) => {
 });
 
 app.post("/api/register", async (req,res) => {
-    const { username, password } = req.body;
+    const { username, password, display_name, birth_date, email } = req.body;
 
     try { 
         const passwordHash = await bcrypt.hash(password, 10);
 
         const result = await pool.query(
-            `INSERT INTO users (username, password_hash)
-            VALUES ($1, $2)
+            `INSERT INTO users (username, password_hash, display_name, birth_date, email)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id, username, created_at`, 
-            [username, passwordHash]
+            [username, passwordHash, display_name, birth_date, email]
         );
 
         res.status(201).json(result.rows[0]);
