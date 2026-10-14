@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 const express = require('express');
 const cors = require("cors");
 const pool = require("./db");
@@ -138,13 +140,29 @@ app.get("/api/tasks/:taskId/notes", async (req, res) => {
     try {
        const result = await pool.query(
        `SELECT notes.*
-       FROM notes
-       JOIN tasks ON notes.task_id = tasks.id
-       WHERE notes.task_id = $1 AND tasks.user_id = $2
-       ORDER BY notes.id`,
+       WHERE notes.task_id = $1 AND notes.task_id IN (SELECT id FROM tasks WHERE user_id = $2)`,
         [taskId, userId]
     );
     res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get("/api/notes", async (req, res) => {
+    const userId = req.user.userId;
+
+    try {
+        const result = await pool.query(
+            `SELECT notes.*
+            FROM notes
+            JOIN tasks ON notes.task_id = tasks.id
+            WHERE tasks.user_id = $1
+            ORDER BY notes.id`,
+            [userId]
+        );
+        res.json(result.rows);
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: err.message });
@@ -291,7 +309,7 @@ app.post("/api/sessions", async (req, res) => {
             );
             if (groupCheck.rows.length === 0) {
                 return res.status(404).json({ error: "Group not found" });
-            }R 
+            }
         }
 
         const result = await pool.query(
