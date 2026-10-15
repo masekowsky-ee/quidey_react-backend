@@ -169,11 +169,44 @@ app.get("/api/notes", async (req, res) => {
     }
 });
 
+// sessions are returned in the shape the frontend stores them in:
+// { id, totalTime (seconds), workedTasks: [{ id, name }], group (name or 'all'), date }
+// date is cast to timestamptz so the timestamp column is read in the db's own time zone
+const SESSION_SELECT = `
+    SELECT sessions.id, sessions.time_ms, sessions.date::timestamptz AS date,
+        COALESCE(groups.name, 'all') AS group_name,
+        COALESCE(
+            json_agg(json_build_object('id', tasks.id, 'name', tasks.name) ORDER BY tasks.id)
+                FILTER (WHERE tasks.id IS NOT NULL),
+            '[]'
+        ) AS worked_tasks
+    FROM sessions
+    LEFT JOIN groups ON groups.id = sessions.group_id
+    LEFT JOIN session_tasks ON session_tasks.session_id = sessions.id
+    LEFT JOIN tasks ON tasks.id = session_tasks.task_id
+`;
+
+function toSessionResponse(row) {
+    return {
+        id: row.id,
+        totalTime: Math.round((row.time_ms ?? 0) / 1000),
+        workedTasks: row.worked_tasks,
+        group: row.group_name,
+        date: row.date,
+    };
+}
+
 app.get("/api/sessions", async (req, res) => {
     const userId = req.user.userId;
     try {
-        const result = await pool.query("SELECT * FROM sessions WHERE user_id = $1 ORDER BY id DESC", [userId]);
-        res.json(result.rows);
+        const result = await pool.query(
+            `${SESSION_SELECT}
+            WHERE sessions.user_id = $1
+            GROUP BY sessions.id, groups.name
+            ORDER BY sessions.date DESC, sessions.id DESC`,
+            [userId]
+        );
+        res.json(result.rows.map(toSessionResponse));
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: err.message });
@@ -298,30 +331,68 @@ app.post("/api/tasks/:taskId/notes", async (req, res) => {
 });
 
 app.post("/api/sessions", async (req, res) => {
-    const { group_id, time_ms } = req.body;
+    const { totalTime, workedTasks = [], group, date } = req.body;
     const userId = req.user.userId;
 
+    if (!Number.isFinite(totalTime) || totalTime < 0) {
+        return res.status(400).json({ error: "totalTime must be a non-negative number" });
+    }
+    if (!Array.isArray(workedTasks)) {
+        return res.status(400).json({ error: "workedTasks must be an array" });
+    }
+
+    // session and its task links are saved together or not at all
+    const client = await pool.connect();
     try {
-        if (group_id) {
-            const groupCheck = await pool.query(
-                "SELECT 1 FROM groups WHERE id = $1 AND user_id = $2",
-                [group_id, userId]
+        await client.query("BEGIN");
+
+        let groupId = null;
+        if (group && group !== "all") {
+            const groupResult = await client.query(
+                "SELECT id FROM groups WHERE name = $1 AND user_id = $2",
+                [group, userId]
             );
-            if (groupCheck.rows.length === 0) {
+            if (groupResult.rows.length === 0) {
+                await client.query("ROLLBACK");
                 return res.status(404).json({ error: "Group not found" });
             }
+            groupId = groupResult.rows[0].id;
         }
 
-        const result = await pool.query(
-            `INSERT INTO sessions (group_id, time_ms, user_id)
-            VALUES ($1, $2, $3)
-            RETURNING *`,
-            [group_id, time_ms, userId]
+        const sessionResult = await client.query(
+            `INSERT INTO sessions (group_id, time_ms, date, user_id)
+            VALUES ($1, $2, COALESCE($3::timestamptz, now()), $4)
+            RETURNING id`,
+            [groupId, Math.round(totalTime * 1000), date ?? null, userId]
         );
-        res.status(201).json(result.rows[0]);
+        const sessionId = sessionResult.rows[0].id;
+
+        // only link tasks that belong to the user, ignore unknown ids
+        const taskIds = workedTasks.map(task => Number(task?.id)).filter(Number.isInteger);
+        if (taskIds.length > 0) {
+            await client.query(
+                `INSERT INTO session_tasks (session_id, task_id)
+                SELECT $1, id FROM tasks WHERE id = ANY($2::int[]) AND user_id = $3
+                ON CONFLICT DO NOTHING`,
+                [sessionId, taskIds, userId]
+            );
+        }
+
+        await client.query("COMMIT");
+
+        const result = await pool.query(
+            `${SESSION_SELECT}
+            WHERE sessions.id = $1
+            GROUP BY sessions.id, groups.name`,
+            [sessionId]
+        );
+        res.status(201).json(toSessionResponse(result.rows[0]));
     } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
         console.error(err);
         res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
     }
 });
 
