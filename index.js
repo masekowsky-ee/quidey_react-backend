@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const express = require('express');
 const cors = require("cors");
+const { rateLimit } = require("express-rate-limit");
 const pool = require("./db");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
@@ -9,9 +10,41 @@ const jwt = require("jsonwebtoken");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-//allows requests from other servers (eg. localhost of quidey)
-app.use(cors());
+// Behind a reverse proxy (nginx/Caddy on the server), the client IP is in X-Forwarded-For.
+// TRUST_PROXY=1 makes Express use it, so rate limiting counts real clients, not the proxy.
+if (process.env.TRUST_PROXY) {
+    app.set("trust proxy", Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY);
+}
+
+// Only the frontend's own origins may call the API from a browser.
+// CORS_ORIGINS is a comma separated list, e.g. "https://quidey.example.com".
+// Requests without an Origin header (curl, server-to-server) are not affected by CORS.
+const allowedOrigins = (process.env.CORS_ORIGINS || "http://localhost:5173,http://localhost:4173")
+    .split(",")
+    .map(origin => origin.trim())
+    .filter(Boolean);
+
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        callback(null, false); // no CORS headers: the browser blocks the response
+    },
+}));
 app.use(express.json()); //parse json bodies
+
+// Slows down password guessing: 10 failed attempts per IP per 15 minutes on login and register.
+// Successful requests and CORS preflights (OPTIONS) don't count.
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+    skipSuccessfulRequests: true,
+    skip: (req) => req.method === "OPTIONS",
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many attempts, please try again later" },
+});
+app.use("/api/login", authLimiter);
+app.use("/api/register", authLimiter);
 
 function authenticateToken(req, res, next) {
     const authHeader = req.headers["authorization"];
@@ -38,20 +71,6 @@ app.use("/api/task-groups", authenticateToken);
 app.use("/api/users", authenticateToken);
 
 //GET endpoints
-app.get("/api/hello", (req, res) => {
-    res.json({ message: "Hello, this is the backend!" });
-});
-
-app.get("/api/db-test", async (req, res) => {
-  try {
-    const result = await pool.query("SELECT NOW()");
-    res.json({ success: true, time: result.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
 app.get("/api/tasks", async (req, res) => {
     const userId = req.user.userId;
 
@@ -445,8 +464,16 @@ app.post("/api/register", async (req,res) => {
     }
 });
 
+// Compared against when the username doesn't exist, so an unknown user takes as long
+// as a wrong password and the response time doesn't reveal which usernames exist
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync("no-such-user-placeholder", 10);
+
 app.post("/api/login", async (req, res) => {
     const { username, password } = req.body;
+
+    if (typeof username !== "string" || typeof password !== "string" || !username || !password) {
+        return res.status(400).json({ error: "Username and password are required" });
+    }
 
     try {
         const result = await pool.query(
@@ -454,15 +481,12 @@ app.post("/api/login", async (req, res) => {
             [username]
         );
 
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Invalid sign in" });
-        }
-
         const user = result.rows[0];
-        const passwordMatch = await bcrypt.compare(password, user.password_hash);
+        const passwordMatch = await bcrypt.compare(password, user?.password_hash ?? DUMMY_PASSWORD_HASH);
 
-        if(!passwordMatch) {
-            return res.status(401).json({ error: "Invalid sign in"});
+        // same status and message for "unknown user" and "wrong password"
+        if (!user || !passwordMatch) {
+            return res.status(401).json({ error: "Invalid sign in" });
         }
 
         const token = jwt.sign(
