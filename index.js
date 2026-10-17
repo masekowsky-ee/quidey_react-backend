@@ -189,13 +189,17 @@ app.get("/api/notes", async (req, res) => {
 });
 
 // sessions are returned in the shape the frontend stores them in:
-// { id, totalTime (seconds), workedTasks: [{ id, name }], group (name or 'all'), date }
+// { id, totalTime (seconds), workedTasks: [{ id, name, time (seconds) }], group (name or 'all'), date }
 // date is cast to timestamptz so the timestamp column is read in the db's own time zone
 const SESSION_SELECT = `
     SELECT sessions.id, sessions.time_ms, sessions.date::timestamptz AS date,
         COALESCE(groups.name, 'all') AS group_name,
         COALESCE(
-            json_agg(json_build_object('id', tasks.id, 'name', tasks.name) ORDER BY tasks.id)
+            json_agg(json_build_object(
+                'id', tasks.id,
+                'name', tasks.name,
+                'time', ROUND(session_tasks.time_ms / 1000.0)::int
+            ) ORDER BY tasks.id)
                 FILTER (WHERE tasks.id IS NOT NULL),
             '[]'
         ) AS worked_tasks
@@ -237,7 +241,8 @@ app.get("/api/sessions/:id/tasks", async (req, res) => {
     const userId = req.user.userId;
     try {
         const result = await pool.query(
-            `SELECT tasks.id, tasks.name, tasks.due, tasks.description, tasks.prio, tasks.done
+            `SELECT tasks.id, tasks.name, tasks.due, tasks.description, tasks.prio, tasks.done,
+                ROUND(session_tasks.time_ms / 1000.0)::int AS time
             FROM tasks
             JOIN session_tasks ON tasks.id = session_tasks.task_id
             JOIN sessions ON sessions.id = session_tasks.session_id
@@ -386,14 +391,24 @@ app.post("/api/sessions", async (req, res) => {
         );
         const sessionId = sessionResult.rows[0].id;
 
+        // time per task arrives in seconds (like totalTime); the same task twice is summed up
+        const msPerTask = new Map();
+        for (const task of workedTasks) {
+            const id = Number(task?.id);
+            if (!Number.isInteger(id)) continue;
+            const seconds = Number.isFinite(task?.time) && task.time > 0 ? task.time : 0;
+            msPerTask.set(id, (msPerTask.get(id) ?? 0) + Math.round(seconds * 1000));
+        }
+
         // only link tasks that belong to the user, ignore unknown ids
-        const taskIds = workedTasks.map(task => Number(task?.id)).filter(Number.isInteger);
-        if (taskIds.length > 0) {
+        if (msPerTask.size > 0) {
             await client.query(
-                `INSERT INTO session_tasks (session_id, task_id)
-                SELECT $1, id FROM tasks WHERE id = ANY($2::int[]) AND user_id = $3
+                `INSERT INTO session_tasks (session_id, task_id, time_ms)
+                SELECT $1, tasks.id, worked.time_ms
+                FROM unnest($2::int[], $3::int[]) AS worked(task_id, time_ms)
+                JOIN tasks ON tasks.id = worked.task_id AND tasks.user_id = $4
                 ON CONFLICT DO NOTHING`,
-                [sessionId, taskIds, userId]
+                [sessionId, [...msPerTask.keys()], [...msPerTask.values()], userId]
             );
         }
 

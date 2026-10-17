@@ -102,7 +102,8 @@ ALTER SEQUENCE public.notes_id_seq OWNED BY public.notes.id;
 
 CREATE TABLE public.session_tasks (
     session_id integer NOT NULL,
-    task_id integer NOT NULL
+    task_id integer NOT NULL,
+    time_ms integer DEFAULT 0 NOT NULL
 );
 
 --
