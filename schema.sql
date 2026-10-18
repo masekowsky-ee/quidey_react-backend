@@ -14,6 +14,8 @@
 -- PostgreSQL database dump
 --
 
+\restrict rmdq2LufIw586IbzR0nfcRSbCQTyxh17oENuc63iUGmiGPndjooEMudZ5Hk27Pa
+
 -- Dumped from database version 18.4
 -- Dumped by pg_dump version 18.4
 
@@ -37,6 +39,39 @@ SET row_security = off;
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
+
+--
+-- Name: friendships; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.friendships (
+    id integer NOT NULL,
+    requester_id integer NOT NULL,
+    addressee_id integer NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    responded_at timestamp with time zone,
+    CONSTRAINT friendships_check CHECK ((requester_id <> addressee_id)),
+    CONSTRAINT friendships_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'accepted'::text])))
+);
+
+--
+-- Name: friendships_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.friendships_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: friendships_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.friendships_id_seq OWNED BY public.friendships.id;
 
 --
 -- Name: groups; Type: TABLE; Schema: public; Owner: -
@@ -137,6 +172,99 @@ CREATE SEQUENCE public.sessions_id_seq
 ALTER SEQUENCE public.sessions_id_seq OWNED BY public.sessions.id;
 
 --
+-- Name: shared_session_members; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.shared_session_members (
+    session_id integer NOT NULL,
+    user_id integer NOT NULL,
+    status text DEFAULT 'invited'::text NOT NULL,
+    invited_by integer,
+    invited_at timestamp with time zone DEFAULT now() NOT NULL,
+    joined_at timestamp with time zone,
+    current_task_id integer,
+    last_seen_at timestamp with time zone,
+    CONSTRAINT shared_session_members_status_check CHECK ((status = ANY (ARRAY['invited'::text, 'joined'::text])))
+);
+
+--
+-- Name: shared_session_tasks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.shared_session_tasks (
+    id integer NOT NULL,
+    session_id integer NOT NULL,
+    name text NOT NULL,
+    description text,
+    done boolean DEFAULT false NOT NULL,
+    added_by integer,
+    source_task_id integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT shared_session_tasks_name_check CHECK (((length(name) >= 1) AND (length(name) <= 200)))
+);
+
+--
+-- Name: shared_session_tasks_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.shared_session_tasks_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: shared_session_tasks_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.shared_session_tasks_id_seq OWNED BY public.shared_session_tasks.id;
+
+--
+-- Name: shared_session_time; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.shared_session_time (
+    task_id integer NOT NULL,
+    user_id integer NOT NULL,
+    time_ms bigint DEFAULT 0 NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT shared_session_time_time_ms_check CHECK ((time_ms >= 0))
+);
+
+--
+-- Name: shared_sessions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.shared_sessions (
+    id integer NOT NULL,
+    name text NOT NULL,
+    owner_id integer NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    ended_at timestamp with time zone,
+    CONSTRAINT shared_sessions_name_check CHECK (((length(name) >= 1) AND (length(name) <= 100)))
+);
+
+--
+-- Name: shared_sessions_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.shared_sessions_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: shared_sessions_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.shared_sessions_id_seq OWNED BY public.shared_sessions.id;
+
+--
 -- Name: task_groups; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -211,6 +339,12 @@ CREATE SEQUENCE public.users_id_seq
 ALTER SEQUENCE public.users_id_seq OWNED BY public.users.id;
 
 --
+-- Name: friendships id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.friendships ALTER COLUMN id SET DEFAULT nextval('public.friendships_id_seq'::regclass);
+
+--
 -- Name: groups id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -229,6 +363,18 @@ ALTER TABLE ONLY public.notes ALTER COLUMN id SET DEFAULT nextval('public.notes_
 ALTER TABLE ONLY public.sessions ALTER COLUMN id SET DEFAULT nextval('public.sessions_id_seq'::regclass);
 
 --
+-- Name: shared_session_tasks id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_tasks ALTER COLUMN id SET DEFAULT nextval('public.shared_session_tasks_id_seq'::regclass);
+
+--
+-- Name: shared_sessions id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_sessions ALTER COLUMN id SET DEFAULT nextval('public.shared_sessions_id_seq'::regclass);
+
+--
 -- Name: tasks id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -239,6 +385,13 @@ ALTER TABLE ONLY public.tasks ALTER COLUMN id SET DEFAULT nextval('public.tasks_
 --
 
 ALTER TABLE ONLY public.users ALTER COLUMN id SET DEFAULT nextval('public.users_id_seq'::regclass);
+
+--
+-- Name: friendships friendships_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.friendships
+    ADD CONSTRAINT friendships_pkey PRIMARY KEY (id);
 
 --
 -- Name: groups groups_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -267,6 +420,34 @@ ALTER TABLE ONLY public.session_tasks
 
 ALTER TABLE ONLY public.sessions
     ADD CONSTRAINT sessions_pkey PRIMARY KEY (id);
+
+--
+-- Name: shared_session_members shared_session_members_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_members
+    ADD CONSTRAINT shared_session_members_pkey PRIMARY KEY (session_id, user_id);
+
+--
+-- Name: shared_session_tasks shared_session_tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_tasks
+    ADD CONSTRAINT shared_session_tasks_pkey PRIMARY KEY (id);
+
+--
+-- Name: shared_session_time shared_session_time_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_time
+    ADD CONSTRAINT shared_session_time_pkey PRIMARY KEY (task_id, user_id);
+
+--
+-- Name: shared_sessions shared_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_sessions
+    ADD CONSTRAINT shared_sessions_pkey PRIMARY KEY (id);
 
 --
 -- Name: task_groups task_groups_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -302,6 +483,56 @@ ALTER TABLE ONLY public.users
 
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_username_key UNIQUE (username);
+
+--
+-- Name: friendships_addressee_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX friendships_addressee_status_idx ON public.friendships USING btree (addressee_id, status);
+
+--
+-- Name: friendships_pair_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX friendships_pair_unique ON public.friendships USING btree (LEAST(requester_id, addressee_id), GREATEST(requester_id, addressee_id));
+
+--
+-- Name: friendships_requester_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX friendships_requester_status_idx ON public.friendships USING btree (requester_id, status);
+
+--
+-- Name: shared_session_members_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX shared_session_members_user_idx ON public.shared_session_members USING btree (user_id, status);
+
+--
+-- Name: shared_session_tasks_session_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX shared_session_tasks_session_idx ON public.shared_session_tasks USING btree (session_id);
+
+--
+-- Name: shared_session_tasks_source_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX shared_session_tasks_source_unique ON public.shared_session_tasks USING btree (session_id, source_task_id) WHERE (source_task_id IS NOT NULL);
+
+--
+-- Name: friendships friendships_addressee_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.friendships
+    ADD CONSTRAINT friendships_addressee_id_fkey FOREIGN KEY (addressee_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: friendships friendships_requester_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.friendships
+    ADD CONSTRAINT friendships_requester_id_fkey FOREIGN KEY (requester_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
 -- Name: groups groups_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -346,6 +577,76 @@ ALTER TABLE ONLY public.sessions
     ADD CONSTRAINT sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
 
 --
+-- Name: shared_session_members shared_session_members_current_task_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_members
+    ADD CONSTRAINT shared_session_members_current_task_id_fkey FOREIGN KEY (current_task_id) REFERENCES public.shared_session_tasks(id) ON DELETE SET NULL;
+
+--
+-- Name: shared_session_members shared_session_members_invited_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_members
+    ADD CONSTRAINT shared_session_members_invited_by_fkey FOREIGN KEY (invited_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+--
+-- Name: shared_session_members shared_session_members_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_members
+    ADD CONSTRAINT shared_session_members_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.shared_sessions(id) ON DELETE CASCADE;
+
+--
+-- Name: shared_session_members shared_session_members_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_members
+    ADD CONSTRAINT shared_session_members_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: shared_session_tasks shared_session_tasks_added_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_tasks
+    ADD CONSTRAINT shared_session_tasks_added_by_fkey FOREIGN KEY (added_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+--
+-- Name: shared_session_tasks shared_session_tasks_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_tasks
+    ADD CONSTRAINT shared_session_tasks_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.shared_sessions(id) ON DELETE CASCADE;
+
+--
+-- Name: shared_session_tasks shared_session_tasks_source_task_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_tasks
+    ADD CONSTRAINT shared_session_tasks_source_task_id_fkey FOREIGN KEY (source_task_id) REFERENCES public.tasks(id) ON DELETE SET NULL;
+
+--
+-- Name: shared_session_time shared_session_time_task_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_time
+    ADD CONSTRAINT shared_session_time_task_id_fkey FOREIGN KEY (task_id) REFERENCES public.shared_session_tasks(id) ON DELETE CASCADE;
+
+--
+-- Name: shared_session_time shared_session_time_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_time
+    ADD CONSTRAINT shared_session_time_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: shared_sessions shared_sessions_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_sessions
+    ADD CONSTRAINT shared_sessions_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
 -- Name: task_groups task_groups_group_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -369,3 +670,6 @@ ALTER TABLE ONLY public.tasks
 --
 -- PostgreSQL database dump complete
 --
+
+\unrestrict rmdq2LufIw586IbzR0nfcRSbCQTyxh17oENuc63iUGmiGPndjooEMudZ5Hk27Pa
+
