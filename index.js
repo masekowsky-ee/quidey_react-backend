@@ -159,6 +159,7 @@ app.use("/api/task-groups", authenticateToken);
 app.use("/api/users", authenticateToken);
 app.use("/api/friends", authenticateToken);
 app.use("/api/shared-sessions", authenticateToken);
+app.use("/api/task-shares", authenticateToken);
 
 // Closed beta: the app's data is only for pro users. Checked in the database on every request
 // (not stored in the token), so granting or taking away pro works right away.
@@ -172,7 +173,7 @@ function requirePro(req, res, next) {
 }
 
 app.use(
-    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions"],
+    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares"],
     requirePro
 );
 
@@ -229,25 +230,138 @@ const TASK_DESCRIPTION_MAX = 2000;
 const GROUP_NAME_MAX = 60;
 const GROUP_DESCRIPTION_MAX = 500;
 const NOTE_MAX = 5000;
+const TASK_LOCATION_MAX = 200;
+const TASK_LINK_MAX = 500;
+const TASK_DETAILS_MAX = 5000;
+const MINUTES_PER_WEEK = 7 * 24 * 60;
+
+// A time of day "HH:MM" (24 h); null when empty, undefined when invalid
+function cleanTime(value) {
+    if (value === undefined || value === null || value === "") return null;
+    if (typeof value !== "string") return undefined;
+    const match = value.match(/^([01]\d|2[0-3]):([0-5]\d)(:00)?$/);
+    return match ? `${match[1]}:${match[2]}` : undefined;
+}
+
+// Whole minutes between min and max (also as a string from a form field); null when empty
+function cleanMinutes(value, min, max) {
+    if (value === undefined || value === null || value === "") return null;
+    const minutes = Number(value);
+    return Number.isInteger(minutes) && minutes >= min && minutes <= max ? minutes : undefined;
+}
+
+// A web address. Only http(s): the app shows it as a link, so "javascript:" and the like
+// must never get in. null when empty, undefined when invalid
+function cleanLink(value) {
+    const text = cleanText(value, TASK_LINK_MAX);
+    if (!text) return text;
+    try {
+        const url = new URL(text);
+        return url.protocol === "http:" || url.protocol === "https:" ? url.href : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+// The optional task fields, each checked only when it was sent:
+// { values: { column: value } } or { error: field }
+const TASK_EXTRAS = {
+    due_time: cleanTime,
+    duration_minutes: (value) => cleanMinutes(value, 1, MINUTES_PER_WEEK),
+    reminder_minutes: (value) => cleanMinutes(value, 0, MINUTES_PER_WEEK),
+    location: (value) => cleanText(value, TASK_LOCATION_MAX),
+    link: cleanLink,
+    details: (value) => cleanText(value, TASK_DETAILS_MAX),
+};
+function readTaskExtras(body) {
+    const values = {};
+    for (const [field, clean] of Object.entries(TASK_EXTRAS)) {
+        if (body?.[field] === undefined) continue;
+        const value = clean(body[field]);
+        if (value === undefined) return { error: field };
+        values[field] = value;
+    }
+    return { values };
+}
+
+// Ids of the tasks a user may see and change: their own, and the ones shared with them that
+// they accepted. `param` is the query parameter holding the user id, e.g. "$2".
+const accessibleTaskIds = (param) =>
+    `SELECT id FROM tasks WHERE user_id = ${param}
+    UNION SELECT task_id FROM task_shares WHERE user_id = ${param} AND status = 'accepted'`;
+
+// Tasks in the shape the app uses, for the user in $1: the task's columns (due_time as "HH:MM"),
+// group_ids (only that user's own groups), isOwner, owner (who shared it, for a task shared
+// with me), shareId (my share of somebody else's task, to leave it) and
+// sharedWith: [{ shareId, status: 'pending' | 'accepted', user }] (everybody it was sent to).
+// Add conditions with "AND ...".
+const TASK_SELECT = `
+    SELECT tasks.id, tasks.name, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
+        tasks.duration_minutes, tasks.reminder_minutes, tasks.location, tasks.link, tasks.details,
+        tasks.description, tasks.prio, tasks.done, tasks.created_at, tasks.user_id,
+        owner.username AS owner_username, owner.display_name AS owner_display_name,
+        my_share.id AS my_share_id,
+        COALESCE((
+            SELECT array_agg(task_groups.group_id ORDER BY task_groups.group_id)
+            FROM task_groups
+            JOIN groups ON groups.id = task_groups.group_id
+            WHERE task_groups.task_id = tasks.id AND groups.user_id = $1
+        ), '{}') AS group_ids,
+        COALESCE((
+            SELECT json_agg(json_build_object(
+                'shareId', task_shares.id,
+                'status', task_shares.status,
+                'user', json_build_object('id', users.id, 'username', users.username, 'displayName', users.display_name)
+            ) ORDER BY task_shares.id)
+            FROM task_shares
+            JOIN users ON users.id = task_shares.user_id
+            WHERE task_shares.task_id = tasks.id
+        ), '[]') AS shared_with
+    FROM tasks
+    JOIN users AS owner ON owner.id = tasks.user_id
+    LEFT JOIN task_shares AS my_share
+        ON my_share.task_id = tasks.id AND my_share.user_id = $1 AND my_share.status = 'accepted'
+    WHERE (tasks.user_id = $1 OR my_share.id IS NOT NULL)`;
+
+function toTaskResponse(row, userId) {
+    const isOwner = row.user_id === userId;
+    return {
+        id: row.id,
+        name: row.name,
+        due: row.due,
+        due_time: row.due_time,
+        duration_minutes: row.duration_minutes,
+        reminder_minutes: row.reminder_minutes,
+        location: row.location,
+        link: row.link,
+        details: row.details,
+        description: row.description,
+        prio: row.prio,
+        done: row.done,
+        created_at: row.created_at,
+        user_id: row.user_id,
+        group_ids: row.group_ids,
+        isOwner,
+        owner: isOwner ? null : { id: row.user_id, username: row.owner_username, displayName: row.owner_display_name },
+        shareId: row.my_share_id,
+        sharedWith: row.shared_with,
+    };
+}
+
+// One task as the user sees it, or null when they may not see it
+async function loadTask(taskId, userId, db = pool) {
+    const result = await db.query(`${TASK_SELECT} AND tasks.id = $2`, [userId, taskId]);
+    return result.rows[0] ? toTaskResponse(result.rows[0], userId) : null;
+}
 
 //GET endpoints
 app.get("/api/tasks", async (req, res) => {
     const userId = req.user.userId;
 
     try{
-        // group_ids: the groups a task is in (for the labels on each task)
-        const result = await pool.query(
-            `SELECT tasks.*,
-                COALESCE(array_agg(task_groups.group_id ORDER BY task_groups.group_id)
-                    FILTER (WHERE task_groups.group_id IS NOT NULL), '{}') AS group_ids
-            FROM tasks
-            LEFT JOIN task_groups ON task_groups.task_id = tasks.id
-            WHERE tasks.user_id = $1
-            GROUP BY tasks.id
-            ORDER BY tasks.id`,
-            [userId]
-        );
-        res.json(result.rows);
+        // my own tasks and the ones friends shared with me (see TASK_SELECT)
+        const result = await pool.query(`${TASK_SELECT} ORDER BY tasks.id`, [userId]);
+        res.json(result.rows.map(row => toTaskResponse(row, userId)));
     } catch (err) {
         serverError(res, err);
     }
@@ -277,8 +391,8 @@ app.get("/api/tasks/:id/groups", async (req, res) => {
             `SELECT groups.id, groups.name, groups.description
             FROM groups
             JOIN task_groups ON groups.id = task_groups.group_id
-            JOIN tasks ON tasks.id = task_groups.task_id
-            WHERE task_groups.task_id = $1 AND tasks.user_id = $2`,
+            WHERE task_groups.task_id = $1 AND groups.user_id = $2
+                AND task_groups.task_id IN (${accessibleTaskIds("$2")})`,
             [id, userId]
         );
         res.json(result.rows);
@@ -294,14 +408,16 @@ app.get("/api/groups/:id/tasks", async (req, res) => {
 
     try {
         const result = await pool.query(
-            `SELECT tasks.id, tasks.name, tasks.description, tasks.due, tasks.prio, tasks.done
-            FROM tasks
-            JOIN task_groups ON tasks.id = task_groups.task_id
-            JOIN groups ON groups.id = task_groups.group_id
-            WHERE task_groups.group_id = $1 AND groups.user_id = $2`,
-            [id, userId]
+            `${TASK_SELECT}
+                AND tasks.id IN (
+                    SELECT task_groups.task_id FROM task_groups
+                    JOIN groups ON groups.id = task_groups.group_id
+                    WHERE task_groups.group_id = $2 AND groups.user_id = $1
+                )
+            ORDER BY tasks.id`,
+            [userId, id]
         );
-        res.json(result.rows);
+        res.json(result.rows.map(row => toTaskResponse(row, userId)));
     } catch (err) {
         serverError(res, err);
     }
@@ -325,7 +441,7 @@ app.get("/api/tasks/:taskId/notes", async (req, res) => {
     try {
        const result = await pool.query(
        `SELECT notes.* FROM notes
-       WHERE notes.task_id = $1 AND notes.task_id IN (SELECT id FROM tasks WHERE user_id = $2)
+       WHERE notes.task_id = $1 AND notes.task_id IN (${accessibleTaskIds("$2")})
        ORDER BY notes.id`,
         [taskId, userId]
     );
@@ -342,8 +458,7 @@ app.get("/api/notes", async (req, res) => {
         const result = await pool.query(
             `SELECT notes.*
             FROM notes
-            JOIN tasks ON notes.task_id = tasks.id
-            WHERE tasks.user_id = $1
+            WHERE notes.task_id IN (${accessibleTaskIds("$1")})
             ORDER BY notes.id`,
             [userId]
         );
@@ -499,19 +614,26 @@ app.post("/api/tasks", async (req, res) => {
     const description = cleanText(req.body?.description, TASK_DESCRIPTION_MAX);
     const due = cleanDate(req.body?.due);
     const prio = cleanPrio(req.body?.prio);
+    const extras = readTaskExtras(req.body);
     if (!name) return invalidInput(res, "name");
     if (description === undefined) return invalidInput(res, "description");
     if (due === undefined) return invalidInput(res, "due");
     if (prio === undefined) return invalidInput(res, "prio");
+    if (extras.error) return invalidInput(res, extras.error);
+    // a time of day needs a day
+    if (extras.values.due_time && !due) return invalidInput(res, "due_time");
+
+    const columns = ["name", "due", "description", "prio", "user_id", ...Object.keys(extras.values)];
+    const values = [name, due, description, prio, userId, ...Object.values(extras.values)];
 
     try {
         const result = await pool.query(
-            `INSERT INTO tasks (name, due, description, prio, user_id) 
-            VALUES ($1, $2, $3, $4, $5) 
-            RETURNING *`,
-            [name, due, description, prio, userId]
+            `INSERT INTO tasks (${columns.join(", ")})
+            VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")})
+            RETURNING id`,
+            values
         );
-        res.status(201).json(result.rows[0]);
+        res.status(201).json(await loadTask(result.rows[0].id, userId));
     } catch (err) {
         serverError(res, err);
     }
@@ -545,7 +667,7 @@ app.post("/api/tasks/:taskId/groups/:groupId", async (req, res) => {
 
     try { 
         const ownerCheck = await pool.query(
-            `SELECT 1 FROM tasks WHERE id = $1 AND user_id = $2
+            `SELECT 1 FROM (${accessibleTaskIds("$2")}) AS mine WHERE id = $1
             UNION ALL
             SELECT 1 FROM groups WHERE id = $3 AND user_id = $2`,
             [taskId, userId, groupId]
@@ -575,7 +697,7 @@ app.post("/api/tasks/:taskId/notes", async (req, res) => {
 
     try {
         const taskCheck = await pool.query(
-            "SELECT 1 FROM tasks WHERE id = $1 AND user_id = $2",
+            `SELECT 1 FROM (${accessibleTaskIds("$2")}) AS mine WHERE id = $1`,
             [taskId, userId]
         );
 
@@ -674,7 +796,8 @@ app.post("/api/sessions", async (req, res) => {
                 `INSERT INTO session_tasks (session_id, task_id, time_ms)
                 SELECT $1, tasks.id, worked.time_ms
                 FROM unnest($2::int[], $3::int[]) AS worked(task_id, time_ms)
-                JOIN tasks ON tasks.id = worked.task_id AND tasks.user_id = $4
+                JOIN tasks ON tasks.id = worked.task_id
+                WHERE tasks.id IN (${accessibleTaskIds("$4")})
                 ON CONFLICT DO NOTHING`,
                 [sessionId, [...msPerTask.keys()], [...msPerTask.values()], userId]
             );
@@ -707,7 +830,7 @@ app.post("/api/sessions/:sessionId/tasks/:taskId", async (req, res) => {
         const ownerCheck = await pool.query(
             `SELECT 1 FROM sessions WHERE id = $1 AND user_id = $2
             UNION ALL
-            SELECT 1 FROM tasks WHERE id = $3 AND user_id = $2`,
+            SELECT 1 FROM (${accessibleTaskIds("$2")}) AS mine WHERE id = $3`,
             [sessionId, userId, taskId]
         );
 
@@ -1114,26 +1237,39 @@ app.put("/api/tasks/:id", async (req, res) => {
     const due = cleanDate(req.body?.due);
     const prio = cleanPrio(req.body?.prio);
     const done = req.body?.done ?? false;
+    // the optional fields are only changed when they are sent, so older clients keep them
+    const extras = readTaskExtras(req.body);
     if (!name) return invalidInput(res, "name");
     if (description === undefined) return invalidInput(res, "description");
     if (due === undefined) return invalidInput(res, "due");
     if (prio === undefined) return invalidInput(res, "prio");
     if (typeof done !== "boolean") return invalidInput(res, "done");
+    if (extras.error) return invalidInput(res, extras.error);
+    if (extras.values.due_time && !due) return invalidInput(res, "due_time");
+
+    const values = [name, due, description, prio, done, id, userId];
+    const sets = ["name = $1", "due = $2", "description = $3", "prio = $4", "done = $5"];
+    for (const [column, value] of Object.entries(extras.values)) {
+        values.push(value);
+        sets.push(`${column} = $${values.length}`);
+    }
+    // without a day there is no time of day either
+    if (!due && !("due_time" in extras.values)) sets.push("due_time = NULL");
 
     try {
         const result = await pool.query(
             `UPDATE tasks
-            SET name = $1, due = $2, description = $3, prio = $4, done = $5
-            WHERE id = $6 AND user_id = $7
-            RETURNING *`,
-            [name, due, description, prio, done, id, userId]
+            SET ${sets.join(", ")}
+            WHERE id = $6 AND id IN (${accessibleTaskIds("$7")})
+            RETURNING id`,
+            values
         );
 
         if (result.rows.length === 0) {
             return res.status(404).json({ error: "Task not found" });
         }
 
-        res.json(result.rows[0]);
+        res.json(await loadTask(id, userId));
     } catch (err) {
         serverError(res, err);
     }
@@ -1179,7 +1315,7 @@ app.put("/api/notes/:id", async (req, res) => {
             `UPDATE notes
             SET content = $1
             WHERE id = $2
-            AND task_id IN (SELECT id FROM tasks WHERE user_id = $3)
+            AND task_id IN (${accessibleTaskIds("$3")})
             RETURNING *`,
             [content, id, userId]
         )
@@ -1248,7 +1384,7 @@ app.delete("/api/task-groups/:taskId/:groupId", async (req, res) => {
             `DELETE FROM task_groups
              WHERE task_id = $1 
              AND group_id = $2 
-             AND task_id IN (SELECT id FROM tasks WHERE user_id = $3)
+             AND task_id IN (${accessibleTaskIds("$3")})
              AND group_id IN (SELECT id FROM groups WHERE user_id = $3)
              RETURNING *`,
              [taskId, groupId, userId]
@@ -1273,7 +1409,7 @@ app.delete("/api/notes/:id", async (req, res) => {
         const result = await pool.query(
             `DELETE FROM notes
              WHERE id = $1
-            AND task_id IN (SELECT id FROM tasks WHERE user_id = $2) 
+            AND task_id IN (${accessibleTaskIds("$2")})
             RETURNING *`,
             [id, userId]
         );
@@ -1477,6 +1613,154 @@ app.delete("/api/friends/:userId", async (req, res) => {
         res.json({ userId: friendId });
     } catch (err) {
         serverError(res, err);
+    }
+});
+
+// ---------- Shared tasks ----------
+// The owner sends a task to friends; each gets an invite (status 'pending'). Accepting makes it
+// the same task for both (see accessibleTaskIds): either can change it or mark it done, each
+// keeps it in their own groups. Only the owner can delete it; a friend can leave it.
+
+// At most this many people per task
+const MAX_TASK_SHARES = 20;
+
+// Send my task to friends: { userIds: [...] }. Anybody who isn't my friend, already has it or
+// is me is skipped. Answers with the task (its sharedWith shows the new invites).
+app.post("/api/tasks/:id/shares", friendRequestLimiter, async (req, res) => {
+    const userId = req.user.userId;
+    const taskId = idParam(req.params.id);
+    const friendIds = idList(req.body?.userIds).filter(id => id !== userId);
+    if (!taskId) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
+    if (friendIds.length === 0) return invalidInput(res, "userIds");
+
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        // locks the task, so two requests at once can't go over the limit together
+        const task = await client.query("SELECT id FROM tasks WHERE id = $1 AND user_id = $2 FOR UPDATE", [taskId, userId]);
+        if (task.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
+        }
+        const existing = await client.query("SELECT count(*)::int AS count FROM task_shares WHERE task_id = $1", [taskId]);
+        if (existing.rows[0].count + friendIds.length > MAX_TASK_SHARES) {
+            await client.query("ROLLBACK");
+            return fail(res, 409, "TOO_MANY_SHARES", "This task is shared with too many people");
+        }
+        await client.query(
+            `INSERT INTO task_shares (task_id, user_id, invited_by)
+            SELECT $1, friend.id, $2
+            FROM unnest($3::int[]) AS friend(id)
+            WHERE EXISTS (
+                SELECT 1 FROM friendships
+                WHERE status = 'accepted'
+                    AND LEAST(requester_id, addressee_id) = LEAST($2::int, friend.id)
+                    AND GREATEST(requester_id, addressee_id) = GREATEST($2::int, friend.id)
+            )
+            ON CONFLICT (task_id, user_id) DO NOTHING`,
+            [taskId, userId, friendIds]
+        );
+        await client.query("COMMIT");
+        res.status(201).json(await loadTask(taskId, userId));
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        serverError(res, err);
+    } finally {
+        client.release();
+    }
+});
+
+// Tasks friends sent me that I haven't answered yet, newest first:
+// [{ id, createdAt, from: user, task: { id, name, due, due_time, duration_minutes, location, description } }]
+app.get("/api/task-shares", async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const result = await pool.query(
+            `SELECT task_shares.id, task_shares.created_at,
+                tasks.id AS task_id, tasks.name, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
+                tasks.duration_minutes, tasks.location, tasks.description,
+                users.id AS from_id, users.username AS from_username, users.display_name AS from_display_name
+            FROM task_shares
+            JOIN tasks ON tasks.id = task_shares.task_id
+            JOIN users ON users.id = tasks.user_id
+            WHERE task_shares.user_id = $1 AND task_shares.status = 'pending'
+            ORDER BY task_shares.created_at DESC, task_shares.id DESC`,
+            [userId]
+        );
+        res.json(result.rows.map(row => ({
+            id: row.id,
+            createdAt: row.created_at,
+            from: publicUser(row, "from_"),
+            task: {
+                id: row.task_id,
+                name: row.name,
+                due: row.due,
+                due_time: row.due_time,
+                duration_minutes: row.duration_minutes,
+                location: row.location,
+                description: row.description,
+            },
+        })));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Accept a task sent to me: answers with the task, which is now in my list
+app.post("/api/task-shares/:id/accept", async (req, res) => {
+    const userId = req.user.userId;
+    const shareId = idParam(req.params.id);
+    if (!shareId) return fail(res, 404, "SHARE_NOT_FOUND", "Invite not found");
+    try {
+        const result = await pool.query(
+            `UPDATE task_shares SET status = 'accepted', responded_at = now()
+            WHERE id = $1 AND user_id = $2 AND status = 'pending'
+            RETURNING task_id`,
+            [shareId, userId]
+        );
+        if (result.rows.length === 0) return fail(res, 404, "SHARE_NOT_FOUND", "Invite not found");
+        res.json(await loadTask(result.rows[0].task_id, userId));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Decline an invite, leave a task shared with me, or (as the task's owner) take it back from
+// somebody. Leaving also takes the task out of the leaver's groups.
+app.delete("/api/task-shares/:id", async (req, res) => {
+    const userId = req.user.userId;
+    const shareId = idParam(req.params.id);
+    if (!shareId) return fail(res, 404, "SHARE_NOT_FOUND", "Invite not found");
+
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const result = await client.query(
+            `DELETE FROM task_shares
+            USING tasks
+            WHERE task_shares.id = $1 AND tasks.id = task_shares.task_id
+                AND $2 IN (task_shares.user_id, tasks.user_id)
+            RETURNING task_shares.id, task_shares.task_id, task_shares.user_id`,
+            [shareId, userId]
+        );
+        if (result.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return fail(res, 404, "SHARE_NOT_FOUND", "Invite not found");
+        }
+        const share = result.rows[0];
+        await client.query(
+            `DELETE FROM task_groups
+            USING groups
+            WHERE task_groups.task_id = $1 AND groups.id = task_groups.group_id AND groups.user_id = $2`,
+            [share.task_id, share.user_id]
+        );
+        await client.query("COMMIT");
+        res.json({ id: share.id, taskId: share.task_id, userId: share.user_id });
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        serverError(res, err);
+    } finally {
+        client.release();
     }
 });
 
@@ -2229,9 +2513,11 @@ app.use((err, req, res, next) => {
     serverError(res, err);
 });
 
-//listen for requests on this url
-app.listen(PORT, () => {
-    console.log(`Server runnin on http://localhost:${PORT}`);
-});
-
 // net start postgresql-x64-18
+
+//listen for requests on this url
+app.listen(PORT, (err) => {
+    // Express 5 passes listen errors (e.g. port already in use) to this callback
+    if (err) throw err;
+    console.log(`Server running on http://localhost:${PORT}`);
+});

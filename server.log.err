@@ -1,0 +1,23 @@
+C:\Users\eesge\quidey_react-backend\index.js:2521
+    if (err) throw err;
+             ^
+
+Error: listen EADDRINUSE: address already in use :::3000
+    at Server.setupListenHandle [as _listen2] (node:net:1948:16)
+    at listenInCluster (node:net:2005:12)
+    at Server.listen (node:net:2110:7)
+    at app.listen (C:\Users\eesge\quidey_react-backend\node_modules\express\lib\application.js:605:24)
+    at Object.<anonymous> (C:\Users\eesge\quidey_react-backend\index.js:2519:5)
+    at Module._compile (node:internal/modules/cjs/loader:1812:14)
+    at Object..js (node:internal/modules/cjs/loader:1943:10)
+    at Module.load (node:internal/modules/cjs/loader:1533:32)
+    at Module._load (node:internal/modules/cjs/loader:1335:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19) {
+  code: 'EADDRINUSE',
+  errno: -4091,
+  syscall: 'listen',
+  address: '::',
+  port: 3000
+}
+
+Node.js v24.14.1

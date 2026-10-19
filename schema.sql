@@ -367,6 +367,39 @@ CREATE TABLE public.task_groups (
 );
 
 --
+-- Name: task_shares; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.task_shares (
+    id integer NOT NULL,
+    task_id integer NOT NULL,
+    user_id integer NOT NULL,
+    invited_by integer,
+    status text DEFAULT 'pending'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    responded_at timestamp with time zone,
+    CONSTRAINT task_shares_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'accepted'::text])))
+);
+
+--
+-- Name: task_shares_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.task_shares_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: task_shares_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.task_shares_id_seq OWNED BY public.task_shares.id;
+
+--
 -- Name: tasks; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -378,7 +411,16 @@ CREATE TABLE public.tasks (
     prio integer,
     done boolean DEFAULT false,
     created_at timestamp without time zone DEFAULT now(),
-    user_id integer
+    user_id integer,
+    due_time time without time zone,
+    duration_minutes integer,
+    reminder_minutes integer,
+    location text,
+    link text,
+    details text,
+    CONSTRAINT tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
+    CONSTRAINT tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080)))),
+    CONSTRAINT tasks_reminder_minutes_check CHECK (((reminder_minutes IS NULL) OR ((reminder_minutes >= 0) AND (reminder_minutes <= 10080))))
 );
 
 --
@@ -481,6 +523,12 @@ ALTER TABLE ONLY public.shared_session_tasks ALTER COLUMN id SET DEFAULT nextval
 --
 
 ALTER TABLE ONLY public.shared_sessions ALTER COLUMN id SET DEFAULT nextval('public.shared_sessions_id_seq'::regclass);
+
+--
+-- Name: task_shares id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.task_shares ALTER COLUMN id SET DEFAULT nextval('public.task_shares_id_seq'::regclass);
 
 --
 -- Name: tasks id; Type: DEFAULT; Schema: public; Owner: -
@@ -593,6 +641,20 @@ ALTER TABLE ONLY public.task_groups
     ADD CONSTRAINT task_groups_pkey PRIMARY KEY (task_id, group_id);
 
 --
+-- Name: task_shares task_shares_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.task_shares
+    ADD CONSTRAINT task_shares_pkey PRIMARY KEY (id);
+
+--
+-- Name: task_shares task_shares_task_id_user_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.task_shares
+    ADD CONSTRAINT task_shares_task_id_user_id_key UNIQUE (task_id, user_id);
+
+--
 -- Name: tasks tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -673,6 +735,12 @@ CREATE INDEX shared_session_tasks_session_idx ON public.shared_session_tasks USI
 --
 
 CREATE UNIQUE INDEX shared_session_tasks_source_unique ON public.shared_session_tasks USING btree (session_id, source_task_id) WHERE (source_task_id IS NOT NULL);
+
+--
+-- Name: task_shares_user_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX task_shares_user_status_idx ON public.task_shares USING btree (user_id, status);
 
 --
 -- Name: users_email_lower_unique; Type: INDEX; Schema: public; Owner: -
@@ -895,6 +963,27 @@ ALTER TABLE ONLY public.task_groups
 
 ALTER TABLE ONLY public.task_groups
     ADD CONSTRAINT task_groups_task_id_fkey FOREIGN KEY (task_id) REFERENCES public.tasks(id) ON DELETE CASCADE;
+
+--
+-- Name: task_shares task_shares_invited_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.task_shares
+    ADD CONSTRAINT task_shares_invited_by_fkey FOREIGN KEY (invited_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+--
+-- Name: task_shares task_shares_task_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.task_shares
+    ADD CONSTRAINT task_shares_task_id_fkey FOREIGN KEY (task_id) REFERENCES public.tasks(id) ON DELETE CASCADE;
+
+--
+-- Name: task_shares task_shares_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.task_shares
+    ADD CONSTRAINT task_shares_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
 -- Name: tasks tasks_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
