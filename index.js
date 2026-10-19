@@ -2,13 +2,49 @@ require("dotenv").config();
 
 const express = require('express');
 const cors = require("cors");
-const { rateLimit } = require("express-rate-limit");
+const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
 const pool = require("./db");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+
+// Without a long random secret anybody could make valid login tokens: don't start at all
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+    console.error("JWT_SECRET must be set to a long random string (at least 32 characters). Not starting.");
+    process.exit(1);
+}
+if (IS_PRODUCTION && !process.env.CORS_ORIGINS) {
+    console.warn("CORS_ORIGINS is not set: only the localhost dev origins are allowed, the real site will be blocked.");
+}
+
+// Rate limits can be raised for automated tests (never needed in production)
+const limitFromEnv = (name, fallback) => Number(process.env[name]) || fallback;
+
+// A server error is logged here and answered without any details (no database or stack info
+// for the client). Every route uses this instead of sending err.message.
+function serverError(res, err) {
+    console.error(err);
+    if (!res.headersSent) res.status(500).json({ error: "Something went wrong", code: "SERVER_ERROR" });
+}
+
+app.disable("x-powered-by");
+
+// The API only answers with JSON: forbid everything else a browser could do with a response
+app.use((req, res, next) => {
+    res.set({
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+        "Cache-Control": "no-store",
+    });
+    // only over HTTPS, which the production setup always uses
+    if (IS_PRODUCTION) res.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    next();
+});
 
 // Behind a reverse proxy (nginx/Caddy on the server), the client IP is in X-Forwarded-For.
 // TRUST_PROXY=1 makes Express use it, so rate limiting counts real clients, not the proxy.
@@ -30,13 +66,13 @@ app.use(cors({
         callback(null, false); // no CORS headers: the browser blocks the response
     },
 }));
-app.use(express.json()); //parse json bodies
+app.use(express.json({ limit: "100kb" })); // parse json bodies; bigger ones are refused
 
 // Slows down password guessing: 10 failed attempts per IP per 15 minutes on login and register.
 // Successful requests and CORS preflights (OPTIONS) don't count.
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    limit: 10,
+    limit: limitFromEnv("RATE_LIMIT_AUTH", 10),
     skipSuccessfulRequests: true,
     skip: (req) => req.method === "OPTIONS",
     standardHeaders: "draft-8",
@@ -46,7 +82,44 @@ const authLimiter = rateLimit({
 app.use("/api/login", authLimiter);
 app.use("/api/register", authLimiter);
 
-function authenticateToken(req, res, next) {
+// New accounts: at most 5 successful registrations per IP and hour, so a script can't create
+// masses of accounts (failed attempts are counted by authLimiter above)
+const registerLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_REGISTER", 5),
+    skipFailedRequests: true,
+    skip: (req) => req.method === "OPTIONS",
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many new accounts, please try again later", code: "RATE_LIMITED" },
+});
+
+// Wrong passwords per account (not per IP), against guessing one password from many machines
+const loginAccountLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_LOGIN_ACCOUNT", 10),
+    skipSuccessfulRequests: true,
+    skip: (req) => req.method === "OPTIONS" || typeof req.body?.username !== "string",
+    keyGenerator: (req) => `login:${req.body.username.trim().toLowerCase().slice(0, 100)}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many attempts, please try again later", code: "RATE_LIMITED" },
+});
+
+// Login tokens: HS256 only, and they carry the account's token_version (see authenticateToken)
+const TOKEN_ALGORITHM = "HS256";
+function signToken(user) {
+    return jwt.sign(
+        { userId: user.id, username: user.username, tv: user.token_version ?? 0 },
+        process.env.JWT_SECRET,
+        { algorithm: TOKEN_ALGORITHM, expiresIn: "7d" }
+    );
+}
+
+// Checks the login token and loads the account (req.user, req.account).
+// A token is only valid while its token_version matches the account's: changing the password
+// or "sign out everywhere" raises the version, and all older tokens stop working right away.
+async function authenticateToken(req, res, next) {
     const authHeader = req.headers["authorization"];
     const token = authHeader && authHeader.split(" ")[1];
 
@@ -54,13 +127,28 @@ function authenticateToken(req, res, next) {
         return res.status(401).json({ error: "No existing token" });
     }
 
-    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-        if (err) {
-            return res.status(403).json({ error: "Token invalid or expired" });
+    let payload;
+    try {
+        payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: [TOKEN_ALGORITHM] });
+    } catch {
+        return res.status(403).json({ error: "Token invalid or expired", code: "TOKEN_INVALID" });
+    }
+
+    try {
+        const result = await pool.query(
+            "SELECT id, username, is_pro, is_admin, token_version FROM users WHERE id = $1",
+            [payload.userId]
+        );
+        const account = result.rows[0];
+        if (!account || account.token_version !== (payload.tv ?? 0)) {
+            return res.status(401).json({ error: "Signed out, please sign in again", code: "TOKEN_REVOKED" });
         }
-        req.user = user;
+        req.user = { userId: account.id, username: account.username };
+        req.account = account;
         next();
-    })
+    } catch (err) {
+        serverError(res, err);
+    }
 }
 
 app.use("/api/tasks", authenticateToken);
@@ -72,19 +160,96 @@ app.use("/api/users", authenticateToken);
 app.use("/api/friends", authenticateToken);
 app.use("/api/shared-sessions", authenticateToken);
 
+// Closed beta: the app's data is only for pro users. Checked in the database on every request
+// (not stored in the token), so granting or taking away pro works right away.
+// /api/me, /api/users (own account) and /api/beta-requests stay open, for the beta screen.
+function requirePro(req, res, next) {
+    // admins always get in, so they can't lock themselves out of the admin panel
+    if (!req.account.is_pro && !req.account.is_admin) {
+        return res.status(403).json({ error: "Quidey is in closed beta", code: "PRO_REQUIRED" });
+    }
+    next();
+}
+
+app.use(
+    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions"],
+    requirePro
+);
+
+// Overall limit per account (or per IP before signing in): plenty for the app, which polls
+// every few seconds, but stops scripts from hammering the API
+app.use("/api", rateLimit({
+    windowMs: 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_API", 300),
+    skip: (req) => req.method === "OPTIONS",
+    keyGenerator: (req) => (req.user ? `user:${req.user.userId}` : ipKeyGenerator(req.ip)),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many requests, please slow down", code: "RATE_LIMITED" },
+}));
+
+// ---------- input checks ----------
+// Ids from the URL: a positive integer, or null (answered with 404 instead of a database error)
+const idParam = (value) => {
+    const id = Number(value);
+    return Number.isInteger(id) && id > 0 && id <= 2147483647 ? id : null;
+};
+
+// Text: trimmed, null when empty; undefined when it has the wrong type or is longer than max
+function cleanText(value, max) {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim();
+    if (trimmed.length > max) return undefined;
+    return trimmed === "" ? null : trimmed;
+}
+
+// A date (e.g. "2026-10-20" or an ISO timestamp); null when empty, undefined when invalid
+function cleanDate(value) {
+    if (value === undefined || value === null || value === "") return null;
+    if (typeof value !== "string" || value.length > 40) return undefined;
+    const time = Date.parse(value);
+    if (Number.isNaN(time)) return undefined;
+    const year = new Date(time).getUTCFullYear();
+    return year >= 1900 && year <= 3000 ? value : undefined;
+}
+
+// Priority: a whole number 0-1000 (also as a string from a form field), or null
+function cleanPrio(value) {
+    if (value === undefined || value === null || value === "") return null;
+    const prio = Number(value);
+    return Number.isInteger(prio) && prio >= 0 && prio <= 1000 ? prio : undefined;
+}
+
+const invalidInput = (res, field) => res.status(400).json({ error: `Invalid ${field}`, code: "INVALID_INPUT", field });
+const notFound = (res, what) => res.status(404).json({ error: `${what} not found` });
+
+const TASK_NAME_MAX = 200;
+const TASK_DESCRIPTION_MAX = 2000;
+const GROUP_NAME_MAX = 60;
+const GROUP_DESCRIPTION_MAX = 500;
+const NOTE_MAX = 5000;
+
 //GET endpoints
 app.get("/api/tasks", async (req, res) => {
     const userId = req.user.userId;
 
     try{
+        // group_ids: the groups a task is in (for the labels on each task)
         const result = await pool.query(
-            "SELECT * FROM tasks WHERE user_id = $1 ORDER BY id",
+            `SELECT tasks.*,
+                COALESCE(array_agg(task_groups.group_id ORDER BY task_groups.group_id)
+                    FILTER (WHERE task_groups.group_id IS NOT NULL), '{}') AS group_ids
+            FROM tasks
+            LEFT JOIN task_groups ON task_groups.task_id = tasks.id
+            WHERE tasks.user_id = $1
+            GROUP BY tasks.id
+            ORDER BY tasks.id`,
             [userId]
         );
         res.json(result.rows);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ success: false, error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -93,19 +258,19 @@ app.get("/api/users", async (req, res) => {
 
     try {
         const result = await pool.query(
-            "SELECT users.username, users.display_name, users.birth_date, users.email FROM users WHERE id = $1",
+            "SELECT users.username, users.display_name, users.birth_date, users.email, users.created_at FROM users WHERE id = $1",
             [userId]
         );
         res.json(result.rows);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ success: false, error: err.message });
+        serverError(res, err);
     }
 });
 
 app.get("/api/tasks/:id/groups", async (req, res) => {
-    const { id } = req.params;
+    const id = idParam(req.params.id);
     const userId = req.user.userId;
+    if (!id) return notFound(res, "Task");
 
     try {
         const result = await pool.query(
@@ -118,14 +283,14 @@ app.get("/api/tasks/:id/groups", async (req, res) => {
         );
         res.json(result.rows);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 //group tasks by id
 app.get("/api/groups/:id/tasks", async (req, res) => {
-    const { id } = req.params;
+    const id = idParam(req.params.id);
     const userId = req.user.userId;
+    if (!id) return notFound(res, "Group");
 
     try {
         const result = await pool.query(
@@ -138,8 +303,7 @@ app.get("/api/groups/:id/tasks", async (req, res) => {
         );
         res.json(result.rows);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -149,25 +313,25 @@ app.get("/api/groups", async (req, res) => {
         const result = await pool.query("SELECT * FROM groups WHERE user_id = $1 ORDER BY id", [userId]);
         res.json(result.rows);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
 app.get("/api/tasks/:taskId/notes", async (req, res) => {
-    const { taskId } = req.params;
+    const taskId = idParam(req.params.taskId);
     const userId = req.user.userId;
+    if (!taskId) return notFound(res, "Task");
 
     try {
        const result = await pool.query(
-       `SELECT notes.*
-       WHERE notes.task_id = $1 AND notes.task_id IN (SELECT id FROM tasks WHERE user_id = $2)`,
+       `SELECT notes.* FROM notes
+       WHERE notes.task_id = $1 AND notes.task_id IN (SELECT id FROM tasks WHERE user_id = $2)
+       ORDER BY notes.id`,
         [taskId, userId]
     );
     res.json(result.rows);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -185,13 +349,13 @@ app.get("/api/notes", async (req, res) => {
         );
         res.json(result.rows);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
 // sessions are returned in the shape the frontend stores them in:
-// { id, totalTime (seconds), workedTasks: [{ id, name, time (seconds) }], group (name or 'all'), date }
+// { id, totalTime (seconds), workedTasks: [{ id, name, time (seconds), shared? }], group (name or 'all'), date }
+// Tasks from shared sessions have the id "shared-<id>" and shared: { sessionId, sessionName }.
 // date is cast to timestamptz so the timestamp column is read in the db's own time zone
 const SESSION_SELECT = `
     SELECT sessions.id, sessions.time_ms, sessions.date::timestamptz AS date,
@@ -204,7 +368,19 @@ const SESSION_SELECT = `
             ) ORDER BY tasks.id)
                 FILTER (WHERE tasks.id IS NOT NULL),
             '[]'
-        ) AS worked_tasks
+        ) AS worked_tasks,
+        COALESCE((
+            SELECT json_agg(json_build_object(
+                'id', 'shared-' || shared_session_tasks.id,
+                'name', shared_session_tasks.name,
+                'time', ROUND(session_shared_tasks.time_ms / 1000.0)::int,
+                'shared', json_build_object('sessionId', shared_sessions.id, 'sessionName', shared_sessions.name)
+            ) ORDER BY shared_session_tasks.id)
+            FROM session_shared_tasks
+            JOIN shared_session_tasks ON shared_session_tasks.id = session_shared_tasks.shared_task_id
+            JOIN shared_sessions ON shared_sessions.id = shared_session_tasks.session_id
+            WHERE session_shared_tasks.session_id = sessions.id
+        ), '[]') AS shared_tasks
     FROM sessions
     LEFT JOIN groups ON groups.id = sessions.group_id
     LEFT JOIN session_tasks ON session_tasks.session_id = sessions.id
@@ -215,7 +391,7 @@ function toSessionResponse(row) {
     return {
         id: row.id,
         totalTime: Math.round((row.time_ms ?? 0) / 1000),
-        workedTasks: row.worked_tasks,
+        workedTasks: [...row.worked_tasks, ...(row.shared_tasks ?? [])],
         group: row.group_name,
         date: row.date,
     };
@@ -233,14 +409,14 @@ app.get("/api/sessions", async (req, res) => {
         );
         res.json(result.rows.map(toSessionResponse));
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
 app.get("/api/sessions/:id/tasks", async (req, res) => {
-    const { id } = req.params;
+    const id = idParam(req.params.id);
     const userId = req.user.userId;
+    if (!id) return notFound(res, "Session");
     try {
         const result = await pool.query(
             `SELECT tasks.id, tasks.name, tasks.due, tasks.description, tasks.prio, tasks.done,
@@ -253,19 +429,80 @@ app.get("/api/sessions/:id/tasks", async (req, res) => {
         );
         res.json(result.rows);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
-app.get("/api/me" , authenticateToken, (req, res) => {
-    res.json({ userId: req.user.userId, username: req.user.username })
+// Who I am and whether I may use the app:
+// { userId, username, isPro (may use the app; admins always may), isAdmin,
+//   adminPendingCount (admins only: open beta requests), betaRequest: { status, reason, createdAt } | null }
+app.get("/api/me" , authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT users.username, users.is_pro, users.is_admin,
+                beta_access_requests.status, beta_access_requests.reason, beta_access_requests.created_at,
+                CASE WHEN users.is_admin
+                    THEN (SELECT count(*) FROM beta_access_requests WHERE status = 'pending')::int END AS pending_count
+            FROM users
+            LEFT JOIN beta_access_requests ON beta_access_requests.user_id = users.id
+            WHERE users.id = $1`,
+            [req.user.userId]
+        );
+        const row = result.rows[0];
+        // the account was deleted after the token was issued
+        if (!row) return res.status(401).json({ error: "User not found" });
+        res.json({
+            userId: req.user.userId,
+            username: row.username,
+            isPro: row.is_pro || row.is_admin,
+            isAdmin: row.is_admin,
+            ...(row.is_admin ? { adminPendingCount: row.pending_count } : {}),
+            betaRequest: row.status ? { status: row.status, reason: row.reason, createdAt: row.created_at } : null,
+        });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Ask for beta access: { reason } (10-1000 characters). Only once per account.
+app.post("/api/beta-requests", authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+    if (reason.length < 10) return res.status(400).json({ error: "Please give a reason (at least 10 characters)", code: "REASON_TOO_SHORT" });
+    if (reason.length > 1000) return res.status(400).json({ error: "The reason is too long", code: "REASON_TOO_LONG" });
+
+    try {
+        const user = await pool.query("SELECT is_pro, is_admin FROM users WHERE id = $1", [userId]);
+        if (user.rows.length === 0) return res.status(401).json({ error: "User not found" });
+        if (user.rows[0].is_pro || user.rows[0].is_admin) return res.status(409).json({ error: "You already have access", code: "ALREADY_PRO" });
+
+        const result = await pool.query(
+            `INSERT INTO beta_access_requests (user_id, reason) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO NOTHING
+            RETURNING status, reason, created_at`,
+            [userId, reason]
+        );
+        if (result.rows.length === 0) {
+            return res.status(409).json({ error: "You already asked for access", code: "ALREADY_REQUESTED" });
+        }
+        const row = result.rows[0];
+        res.status(201).json({ status: row.status, reason: row.reason, createdAt: row.created_at });
+    } catch (err) {
+        serverError(res, err);
+    }
 });
 
 //POST endpoints
 app.post("/api/tasks", async (req, res) => {
-    const { name, due, description, prio } = req.body;
     const userId = req.user.userId;
+    const name = cleanText(req.body?.name, TASK_NAME_MAX);
+    const description = cleanText(req.body?.description, TASK_DESCRIPTION_MAX);
+    const due = cleanDate(req.body?.due);
+    const prio = cleanPrio(req.body?.prio);
+    if (!name) return invalidInput(res, "name");
+    if (description === undefined) return invalidInput(res, "description");
+    if (due === undefined) return invalidInput(res, "due");
+    if (prio === undefined) return invalidInput(res, "prio");
 
     try {
         const result = await pool.query(
@@ -276,14 +513,16 @@ app.post("/api/tasks", async (req, res) => {
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
-        console.log(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
 app.post("/api/groups", async (req, res) => {
-    const { name, description } = req.body;
     const userId = req.user.userId;
+    const name = cleanText(req.body?.name, GROUP_NAME_MAX);
+    const description = cleanText(req.body?.description, GROUP_DESCRIPTION_MAX);
+    if (!name) return invalidInput(res, "name");
+    if (description === undefined) return invalidInput(res, "description");
 
     try {
         const result = await pool.query(
@@ -294,14 +533,15 @@ app.post("/api/groups", async (req, res) => {
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
 app.post("/api/tasks/:taskId/groups/:groupId", async (req, res) => {
-    const { taskId, groupId } = req.params;
+    const taskId = idParam(req.params.taskId);
+    const groupId = idParam(req.params.groupId);
     const userId = req.user.userId;
+    if (!taskId || !groupId) return notFound(res, "Task or group");
 
     try { 
         const ownerCheck = await pool.query(
@@ -315,23 +555,23 @@ app.post("/api/tasks/:taskId/groups/:groupId", async (req, res) => {
             return res.status(404).json({ error: "Task or group not found" });
         }
 
-        const result = await pool.query(
-            `INSERT INTO task_groups (task_id, group_id)
-            VALUES ($1, $2)
-            RETURNING *`,
+        // already in the group: nothing to do (no duplicate-key error)
+        await pool.query(
+            `INSERT INTO task_groups (task_id, group_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
             [taskId, groupId]
         );
-        res.status(201).json(result.rows[0]);
+        res.status(201).json({ task_id: taskId, group_id: groupId });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
 app.post("/api/tasks/:taskId/notes", async (req, res) => {
-    const { taskId } = req.params;
-    const { content } = req.body;
+    const taskId = idParam(req.params.taskId);
+    const content = cleanText(req.body?.content, NOTE_MAX);
     const userId = req.user.userId;
+    if (!taskId) return notFound(res, "Task");
+    if (!content) return invalidInput(res, "content");
 
     try {
         const taskCheck = await pool.query(
@@ -351,8 +591,7 @@ app.post("/api/tasks/:taskId/notes", async (req, res) => {
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -360,12 +599,17 @@ app.post("/api/sessions", async (req, res) => {
     const { totalTime, workedTasks = [], group, date } = req.body;
     const userId = req.user.userId;
 
-    if (!Number.isFinite(totalTime) || totalTime < 0) {
-        return res.status(400).json({ error: "totalTime must be a non-negative number" });
+    // a session is at most a day long, with at most 500 tasks
+    if (!Number.isFinite(totalTime) || totalTime < 0 || totalTime > 24 * 60 * 60) {
+        return res.status(400).json({ error: "totalTime must be between 0 and 86400 seconds" });
     }
-    if (!Array.isArray(workedTasks)) {
-        return res.status(400).json({ error: "workedTasks must be an array" });
+    if (!Array.isArray(workedTasks) || workedTasks.length > 500) {
+        return res.status(400).json({ error: "workedTasks must be an array of at most 500 tasks" });
     }
+    if (group !== undefined && group !== null && (typeof group !== "string" || group.length > GROUP_NAME_MAX)) {
+        return invalidInput(res, "group");
+    }
+    if (cleanDate(date) === undefined) return invalidInput(res, "date");
 
     // session and its task links are saved together or not at all
     const client = await pool.connect();
@@ -393,13 +637,35 @@ app.post("/api/sessions", async (req, res) => {
         );
         const sessionId = sessionResult.rows[0].id;
 
-        // time per task arrives in seconds (like totalTime); the same task twice is summed up
+        // time per task arrives in seconds (like totalTime); the same task twice is summed up.
+        // Tasks from shared sessions come as { sharedTaskId, time } and are kept apart, because
+        // their ids are from another table (the time itself is booked in the shared session).
         const msPerTask = new Map();
+        const msPerSharedTask = new Map();
         for (const task of workedTasks) {
+            const seconds = Number.isFinite(task?.time) && task.time > 0 ? Math.min(task.time, 24 * 60 * 60) : 0;
+            const sharedId = Number(task?.sharedTaskId);
+            if (task?.sharedTaskId !== undefined) {
+                if (Number.isInteger(sharedId)) msPerSharedTask.set(sharedId, (msPerSharedTask.get(sharedId) ?? 0) + Math.round(seconds * 1000));
+                continue;
+            }
             const id = Number(task?.id);
             if (!Number.isInteger(id)) continue;
-            const seconds = Number.isFinite(task?.time) && task.time > 0 ? task.time : 0;
             msPerTask.set(id, (msPerTask.get(id) ?? 0) + Math.round(seconds * 1000));
+        }
+
+        // only shared tasks of sessions I am a member of; unknown ids are ignored
+        if (msPerSharedTask.size > 0) {
+            await client.query(
+                `INSERT INTO session_shared_tasks (session_id, shared_task_id, time_ms)
+                SELECT $1, shared_session_tasks.id, worked.time_ms
+                FROM unnest($2::int[], $3::int[]) AS worked(task_id, time_ms)
+                JOIN shared_session_tasks ON shared_session_tasks.id = worked.task_id
+                JOIN shared_session_members ON shared_session_members.session_id = shared_session_tasks.session_id
+                    AND shared_session_members.user_id = $4 AND shared_session_members.status = 'joined'
+                ON CONFLICT DO NOTHING`,
+                [sessionId, [...msPerSharedTask.keys()], [...msPerSharedTask.values()], userId]
+            );
         }
 
         // only link tasks that belong to the user, ignore unknown ids
@@ -425,16 +691,17 @@ app.post("/api/sessions", async (req, res) => {
         res.status(201).json(toSessionResponse(result.rows[0]));
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     } finally {
         client.release();
     }
 });
 
 app.post("/api/sessions/:sessionId/tasks/:taskId", async (req, res) => {
-    const { sessionId, taskId } = req.params;
+    const sessionId = idParam(req.params.sessionId);
+    const taskId = idParam(req.params.taskId);
     const userId = req.user.userId;
+    if (!sessionId || !taskId) return notFound(res, "Session or task");
 
     try{
         const ownerCheck = await pool.query(
@@ -448,36 +715,77 @@ app.post("/api/sessions/:sessionId/tasks/:taskId", async (req, res) => {
             return res.status(404).json({ error: "Session or task not found" });
         }
 
-        const result = await pool.query(
-            `INSERT INTO session_tasks (session_id, task_id)
-            VALUES ($1, $2)
-            RETURNING *`,
+        await pool.query(
+            `INSERT INTO session_tasks (session_id, task_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
             [sessionId, taskId]
         );
-        res.status(201).json(result.rows[0]);
+        res.status(201).json({ session_id: sessionId, task_id: taskId });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
-app.post("/api/register", async (req,res) => {
-    const { username, password, display_name, birth_date, email } = req.body;
+// Usernames: 3-30 letters, digits, "_", "." or "-" (no spaces or look-alike characters),
+// unique regardless of upper/lower case
+const USERNAME_PATTERN = /^[A-Za-z0-9_.-]{3,30}$/;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MIN_AGE = 14;
 
-    try { 
+// 8-72 characters; bcrypt only uses the first 72 bytes, so longer ones are refused, not cut off
+const validPassword = (password) =>
+    typeof password === "string" && password.length >= 8 && Buffer.byteLength(password, "utf8") <= 72;
+
+// Age in whole years on today's date, for a "YYYY-MM-DD" birth date; null when it isn't a real date
+function ageFromBirthDate(value) {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+    const [year, month, day] = value.split("-").map(Number);
+    const birth = new Date(Date.UTC(year, month - 1, day));
+    if (birth.getUTCMonth() !== month - 1 || birth.getUTCDate() !== day || year < 1900) return null;
+    const today = new Date();
+    let age = today.getUTCFullYear() - year;
+    if (today.getUTCMonth() < month - 1 || (today.getUTCMonth() === month - 1 && today.getUTCDate() < day)) age--;
+    return age;
+}
+
+app.post("/api/register", registerLimiter, async (req, res) => {
+    const { password, birth_date } = req.body ?? {};
+    const username = typeof req.body?.username === "string" ? req.body.username.trim() : "";
+    const displayName = typeof req.body?.display_name === "string" ? req.body.display_name.trim() : "";
+    const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+    const fail = (status, code, error) => res.status(status).json({ error, code });
+
+    if (!USERNAME_PATTERN.test(username)) return fail(400, "INVALID_USERNAME", "Username must be 3-30 letters, digits, _ . or -");
+    if (!validPassword(password)) return fail(400, "WEAK_PASSWORD", "Password must be 8-72 characters");
+    if (!displayName || displayName.length > 50) return fail(400, "INVALID_DISPLAY_NAME", "Display name must be 1-50 characters");
+    if (!EMAIL_PATTERN.test(email) || email.length > 254) return fail(400, "INVALID_EMAIL", "Invalid email address");
+    const age = ageFromBirthDate(birth_date);
+    if (age === null || age > 130) return fail(400, "INVALID_BIRTH_DATE", "Invalid birth date");
+    if (age < MIN_AGE) return fail(400, "TOO_YOUNG", `You must be at least ${MIN_AGE} years old`);
+
+    try {
+        const taken = await pool.query(
+            `SELECT bool_or(lower(username) = lower($1)) AS username_taken, bool_or(lower(email) = lower($2)) AS email_taken
+            FROM users WHERE lower(username) = lower($1) OR lower(email) = lower($2)`,
+            [username, email]
+        );
+        if (taken.rows[0]?.username_taken) return fail(409, "USERNAME_TAKEN", "This username is taken");
+        if (taken.rows[0]?.email_taken) return fail(409, "EMAIL_TAKEN", "This email is already registered");
+
         const passwordHash = await bcrypt.hash(password, 10);
-
         const result = await pool.query(
             `INSERT INTO users (username, password_hash, display_name, birth_date, email)
             VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, username, created_at`, 
-            [username, passwordHash, display_name, birth_date, email]
+            RETURNING id, username, created_at`,
+            [username, passwordHash, displayName, birth_date, email]
         );
-
         res.status(201).json(result.rows[0]);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message }); 
+        if (err.code === "23505") {
+            // two registrations with the same name at the same moment
+            const field = /email/.test(err.constraint ?? "") ? "EMAIL_TAKEN" : "USERNAME_TAKEN";
+            return fail(409, field, "Already registered");
+        }
+        serverError(res, err);
     }
 });
 
@@ -485,17 +793,19 @@ app.post("/api/register", async (req,res) => {
 // as a wrong password and the response time doesn't reveal which usernames exist
 const DUMMY_PASSWORD_HASH = bcrypt.hashSync("no-such-user-placeholder", 10);
 
-app.post("/api/login", async (req, res) => {
-    const { username, password } = req.body;
+app.post("/api/login", loginAccountLimiter, async (req, res) => {
+    const { username, password } = req.body ?? {};
 
-    if (typeof username !== "string" || typeof password !== "string" || !username || !password) {
+    if (typeof username !== "string" || typeof password !== "string" || !username || !password
+        || username.length > 100 || password.length > 1000) {
         return res.status(400).json({ error: "Username and password are required" });
     }
 
     try {
+        // usernames are unique regardless of case, so "ann" signs in "Ann" too
         const result = await pool.query(
-            "SELECT * FROM users WHERE username = $1",
-            [username]
+            "SELECT id, username, password_hash, token_version FROM users WHERE lower(username) = lower($1)",
+            [username.trim()]
         );
 
         const user = result.rows[0];
@@ -506,24 +816,309 @@ app.post("/api/login", async (req, res) => {
             return res.status(401).json({ error: "Invalid sign in" });
         }
 
-        const token = jwt.sign(
-            { userId: user.id, username: user.username },
-            process.env.JWT_SECRET,
-            { expiresIn: "7d" }
-        );
-
-        res.json({ token });
+        res.json({ token: signToken(user) });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
+    }
+});
+
+// ---------- Admin ----------
+// Only for users with is_admin, checked in the database on every request.
+// Every change is written to admin_actions. Admins can't change their own pro/admin status,
+// so nobody locks themselves out and there is always at least one admin left.
+
+function requireAdmin(req, res, next) {
+    if (!req.account.is_admin) return res.status(403).json({ error: "Admins only", code: "ADMIN_REQUIRED" });
+    req.admin = { id: req.account.id, username: req.account.username };
+    next();
+}
+
+app.use("/api/admin", authenticateToken, requireAdmin);
+
+const adminFail = (res, status, code, error) => res.status(status).json({ error, code });
+
+async function logAdminAction(db, admin, target, action) {
+    await db.query(
+        `INSERT INTO admin_actions (admin_id, admin_username, target_id, target_username, action)
+        VALUES ($1, $2, $3, $4, $5)`,
+        [admin.id, admin.username, target.id, target.username, action]
+    );
+}
+
+// A user as the admin panel shows them (incl. email, which only admins ever see)
+const ADMIN_USER_SELECT = `
+    SELECT users.id, users.username, users.display_name, users.email, users.created_at,
+        users.is_pro, users.is_admin,
+        beta_access_requests.status AS request_status, beta_access_requests.reason AS request_reason,
+        beta_access_requests.created_at AS request_created_at, beta_access_requests.decided_at AS request_decided_at
+    FROM users
+    LEFT JOIN beta_access_requests ON beta_access_requests.user_id = users.id
+`;
+
+const toAdminUser = (row) => ({
+    id: row.id,
+    username: row.username,
+    displayName: row.display_name,
+    email: row.email,
+    createdAt: row.created_at,
+    isPro: row.is_pro,
+    isAdmin: row.is_admin,
+    request: row.request_status ? {
+        status: row.request_status,
+        reason: row.request_reason,
+        createdAt: row.request_created_at,
+        decidedAt: row.request_decided_at,
+    } : null,
+});
+
+async function loadAdminUser(db, id) {
+    const result = await db.query(`${ADMIN_USER_SELECT} WHERE users.id = $1`, [id]);
+    return result.rows[0] ? toAdminUser(result.rows[0]) : null;
+}
+
+// Numbers for the overview and the latest admin actions
+app.get("/api/admin/overview", async (req, res) => {
+    try {
+        const [counts, actions] = await Promise.all([
+            pool.query(`SELECT
+                (SELECT count(*) FROM users)::int AS users,
+                (SELECT count(*) FROM users WHERE is_pro OR is_admin)::int AS with_access,
+                (SELECT count(*) FROM users WHERE is_admin)::int AS admins,
+                (SELECT count(*) FROM beta_access_requests WHERE status = 'pending')::int AS pending_requests,
+                (SELECT count(*) FROM users WHERE created_at > now() - interval '7 days')::int AS new_this_week,
+                (SELECT count(*) FROM shared_sessions WHERE ended_at IS NULL)::int AS open_shared_sessions`),
+            pool.query(`SELECT id, admin_username, target_username, action, created_at
+                FROM admin_actions ORDER BY id DESC LIMIT 25`),
+        ]);
+        const c = counts.rows[0];
+        res.json({
+            users: c.users,
+            withAccess: c.with_access,
+            admins: c.admins,
+            pendingRequests: c.pending_requests,
+            newThisWeek: c.new_this_week,
+            openSharedSessions: c.open_shared_sessions,
+            actions: actions.rows.map(a => ({
+                id: a.id, admin: a.admin_username, target: a.target_username, action: a.action, createdAt: a.created_at,
+            })),
+        });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Beta requests, oldest first: ?status=pending (default) | all
+app.get("/api/admin/requests", async (req, res) => {
+    const all = req.query.status === "all";
+    try {
+        const result = await pool.query(
+            `${ADMIN_USER_SELECT}
+            WHERE beta_access_requests.user_id IS NOT NULL AND ($1 OR beta_access_requests.status = 'pending')
+            ORDER BY beta_access_requests.status <> 'pending', beta_access_requests.created_at`,
+            [all]
+        );
+        res.json(result.rows.map(toAdminUser));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Approve (gives pro) or decline an open request. Answers with the updated user.
+for (const decision of ["approve", "decline"]) {
+    app.post(`/api/admin/requests/:userId/${decision}`, async (req, res) => {
+        const targetId = idParam(req.params.userId);
+        if (!targetId) return adminFail(res, 404, "REQUEST_NOT_FOUND", "Request not found");
+        const client = await pool.connect();
+        try {
+            await client.query("BEGIN");
+            const result = await client.query(
+                `UPDATE beta_access_requests SET status = $1, decided_at = now()
+                WHERE user_id = $2 AND status = 'pending'
+                RETURNING user_id`,
+                [decision === "approve" ? "approved" : "declined", targetId]
+            );
+            if (result.rows.length === 0) {
+                await client.query("ROLLBACK");
+                return adminFail(res, 404, "REQUEST_NOT_FOUND", "No open request from this user");
+            }
+            const target = await client.query("SELECT id, username FROM users WHERE id = $1", [targetId]);
+            if (decision === "approve") await client.query("UPDATE users SET is_pro = true WHERE id = $1", [targetId]);
+            await logAdminAction(client, req.admin, target.rows[0], `${decision}_request`);
+            await client.query("COMMIT");
+            res.json(await loadAdminUser(pool, targetId));
+        } catch (err) {
+            await client.query("ROLLBACK").catch(() => {});
+            serverError(res, err);
+        } finally {
+            client.release();
+        }
+    });
+}
+
+// Forget a request (e.g. declined by mistake), so the user can ask again
+app.delete("/api/admin/requests/:userId", async (req, res) => {
+    const targetId = idParam(req.params.userId);
+    if (!targetId) return adminFail(res, 404, "REQUEST_NOT_FOUND", "Request not found");
+    try {
+        const result = await pool.query("DELETE FROM beta_access_requests WHERE user_id = $1 RETURNING user_id", [targetId]);
+        if (result.rows.length === 0) return adminFail(res, 404, "REQUEST_NOT_FOUND", "Request not found");
+        const target = await pool.query("SELECT id, username FROM users WHERE id = $1", [targetId]);
+        await logAdminAction(pool, req.admin, target.rows[0], "reset_request");
+        res.json(await loadAdminUser(pool, targetId));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// All users, newest first; ?q= searches username, display name and email
+app.get("/api/admin/users", async (req, res) => {
+    const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 100) : "";
+    try {
+        const result = await pool.query(
+            `${ADMIN_USER_SELECT}
+            WHERE $1 = '' OR users.username ILIKE $2 OR users.display_name ILIKE $2 OR users.email ILIKE $2
+            ORDER BY users.created_at DESC, users.id DESC
+            LIMIT 200`,
+            [q, `%${q.replace(/[\\%_]/g, "\\$&")}%`]
+        );
+        res.json(result.rows.map(toAdminUser));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Give or take away pro / admin: { isPro?, isAdmin? }. Not for yourself.
+app.patch("/api/admin/users/:id", async (req, res) => {
+    const targetId = idParam(req.params.id);
+    const { isPro, isAdmin } = req.body ?? {};
+    if (!targetId) return adminFail(res, 404, "USER_NOT_FOUND", "User not found");
+    if (targetId === req.admin.id) return adminFail(res, 400, "SELF", "You can't change your own access");
+    if ((isPro !== undefined && typeof isPro !== "boolean") || (isAdmin !== undefined && typeof isAdmin !== "boolean")
+        || (isPro === undefined && isAdmin === undefined)) {
+        return adminFail(res, 400, "INVALID_CHANGE", "Send isPro and/or isAdmin as true or false");
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const before = await client.query("SELECT id, username, is_pro, is_admin FROM users WHERE id = $1 FOR UPDATE", [targetId]);
+        const target = before.rows[0];
+        if (!target) {
+            await client.query("ROLLBACK");
+            return adminFail(res, 404, "USER_NOT_FOUND", "User not found");
+        }
+        if (isPro !== undefined && isPro !== target.is_pro) {
+            await client.query("UPDATE users SET is_pro = $1 WHERE id = $2", [isPro, targetId]);
+            await logAdminAction(client, req.admin, target, isPro ? "grant_pro" : "revoke_pro");
+            // an open request is answered by giving pro
+            if (isPro) {
+                await client.query(
+                    "UPDATE beta_access_requests SET status = 'approved', decided_at = now() WHERE user_id = $1 AND status = 'pending'",
+                    [targetId]
+                );
+            }
+        }
+        if (isAdmin !== undefined && isAdmin !== target.is_admin) {
+            await client.query("UPDATE users SET is_admin = $1 WHERE id = $2", [isAdmin, targetId]);
+            await logAdminAction(client, req.admin, target, isAdmin ? "grant_admin" : "revoke_admin");
+        }
+        await client.query("COMMIT");
+        res.json(await loadAdminUser(pool, targetId));
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        serverError(res, err);
+    } finally {
+        client.release();
     }
 });
 
 //PUT endpoints
-app.put("/api/tasks/:id", async (req, res) => {
-    const { id } = req.params;
-    const { name, due, description, prio, done } = req.body;
+
+// Edit my profile: display name and email (the username stays fixed, friends add you by it)
+app.put("/api/users", async (req, res) => {
     const userId = req.user.userId;
+    const displayName = typeof req.body?.display_name === "string" ? req.body.display_name.trim() : "";
+    const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+
+    if (!displayName || displayName.length > 50) {
+        return res.status(400).json({ error: "Display name must be 1-50 characters", code: "INVALID_DISPLAY_NAME" });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+        return res.status(400).json({ error: "Invalid email address", code: "INVALID_EMAIL" });
+    }
+
+    try {
+        const result = await pool.query(
+            `UPDATE users SET display_name = $1, email = $2 WHERE id = $3
+            RETURNING username, display_name, birth_date, email, created_at`,
+            [displayName, email, userId]
+        );
+        res.json(result.rows[0]);
+    } catch (err) {
+        if (err.code === "23505") {
+            return res.status(409).json({ error: "Email already in use", code: "EMAIL_TAKEN" });
+        }
+        serverError(res, err);
+    }
+});
+
+// Change my password. Needs the current one, so a stolen session can't lock the owner out;
+// failed attempts count towards the same limit as logins.
+app.put("/api/users/password", authLimiter, async (req, res) => {
+    const userId = req.user.userId;
+    const { currentPassword, newPassword } = req.body ?? {};
+
+    if (!validPassword(newPassword)) {
+        // bcrypt only uses the first 72 bytes
+        return res.status(400).json({ error: "New password must be 8-72 characters", code: "WEAK_PASSWORD" });
+    }
+    if (typeof currentPassword !== "string" || !currentPassword || currentPassword.length > 1000) {
+        return res.status(400).json({ error: "Current password is required", code: "WRONG_PASSWORD" });
+    }
+
+    try {
+        const result = await pool.query("SELECT password_hash FROM users WHERE id = $1", [userId]);
+        const matches = result.rows.length > 0 && await bcrypt.compare(currentPassword, result.rows[0].password_hash);
+        if (!matches) {
+            return res.status(401).json({ error: "Current password is wrong", code: "WRONG_PASSWORD" });
+        }
+        const passwordHash = await bcrypt.hash(newPassword, 10);
+        // all other logins end; this device gets a fresh token and stays signed in
+        const updated = await pool.query(
+            `UPDATE users SET password_hash = $1, token_version = token_version + 1 WHERE id = $2
+            RETURNING id, username, token_version`,
+            [passwordHash, userId]
+        );
+        res.json({ message: "Password changed", token: signToken(updated.rows[0]) });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Sign out everywhere: every login token of this account stops working (this one too)
+app.post("/api/users/logout-all", async (req, res) => {
+    try {
+        await pool.query("UPDATE users SET token_version = token_version + 1 WHERE id = $1", [req.user.userId]);
+        res.json({ message: "Signed out everywhere" });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.put("/api/tasks/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    const userId = req.user.userId;
+    if (!id) return notFound(res, "Task");
+    const name = cleanText(req.body?.name, TASK_NAME_MAX);
+    const description = cleanText(req.body?.description, TASK_DESCRIPTION_MAX);
+    const due = cleanDate(req.body?.due);
+    const prio = cleanPrio(req.body?.prio);
+    const done = req.body?.done ?? false;
+    if (!name) return invalidInput(res, "name");
+    if (description === undefined) return invalidInput(res, "description");
+    if (due === undefined) return invalidInput(res, "due");
+    if (prio === undefined) return invalidInput(res, "prio");
+    if (typeof done !== "boolean") return invalidInput(res, "done");
 
     try {
         const result = await pool.query(
@@ -540,15 +1135,18 @@ app.put("/api/tasks/:id", async (req, res) => {
 
         res.json(result.rows[0]);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
 app.put("/api/groups/:id", async (req, res) => {
-    const { id } = req.params;
-    const { name, description } = req.body;
+    const id = idParam(req.params.id);
     const userId = req.user.userId;
+    if (!id) return notFound(res, "Group");
+    const name = cleanText(req.body?.name, GROUP_NAME_MAX);
+    const description = cleanText(req.body?.description, GROUP_DESCRIPTION_MAX);
+    if (!name) return invalidInput(res, "name");
+    if (description === undefined) return invalidInput(res, "description");
 
     try {
         const result = await pool.query(
@@ -565,15 +1163,16 @@ app.put("/api/groups/:id", async (req, res) => {
 
         res.json(result.rows[0]);
     } catch (err) { 
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
 app.put("/api/notes/:id", async (req, res) => {
-    const { id } = req.params;
-    const { content } = req.body;
+    const id = idParam(req.params.id);
+    const content = cleanText(req.body?.content, NOTE_MAX);
     const userId = req.user.userId;
+    if (!id) return notFound(res, "Note");
+    if (content === undefined) return invalidInput(res, "content");
 
     try {
         const result = await pool.query(
@@ -591,15 +1190,15 @@ app.put("/api/notes/:id", async (req, res) => {
 
         res.json(result.rows[0]);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 })
 
 //DELETE endpoints
 app.delete("/api/tasks/:id", async (req, res) => {
-    const { id } = req.params;
+    const id = idParam(req.params.id);
     const userId = req.user.userId;
+    if (!id) return notFound(res, "Task");
 
     try {
         const result = await pool.query(
@@ -613,14 +1212,14 @@ app.delete("/api/tasks/:id", async (req, res) => {
 
         res.json({ message: "Task deleted", task: result.rows[0] });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
 app.delete("/api/groups/:id", async (req, res) => {
-    const { id } = req.params;
+    const id = idParam(req.params.id);
     const userId = req.user.userId;
+    if (!id) return notFound(res, "Group");
 
     try {
         const result = await pool.query(
@@ -634,14 +1233,15 @@ app.delete("/api/groups/:id", async (req, res) => {
 
         res.json({ message: "Group deleted", group: result.rows[0] });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
 app.delete("/api/task-groups/:taskId/:groupId", async (req, res) => {
-    const { taskId, groupId } = req.params;
-    const userId = req.user.userId; 
+    const taskId = idParam(req.params.taskId);
+    const groupId = idParam(req.params.groupId);
+    const userId = req.user.userId;
+    if (!taskId || !groupId) return notFound(res, "Connection");
 
     try {
         const result = await pool.query(
@@ -660,14 +1260,14 @@ app.delete("/api/task-groups/:taskId/:groupId", async (req, res) => {
 
         res.json({ message: "Connection deleted", connection: result.rows[0] })
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
 app.delete("/api/notes/:id", async (req, res) => {
-    const { id } = req.params;
+    const id = idParam(req.params.id);
     const userId = req.user.userId;
+    if (!id) return notFound(res, "Note");
 
     try {
         const result = await pool.query(
@@ -684,20 +1284,13 @@ app.delete("/api/notes/:id", async (req, res) => {
 
         res.json({ message: "Note deleted", note: result.rows[0] });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 })
 
 // ---------- Friends ----------
 // Only public profile fields ever leave the server: never email or birth date.
 // Errors carry a `code` so the frontend can show a translated message.
-
-// Ids from the URL: a positive integer, or null (answered with 404 instead of a database error)
-const idParam = (value) => {
-    const id = Number(value);
-    return Number.isInteger(id) && id > 0 ? id : null;
-};
 
 const publicUser = (row, prefix = "") => ({
     id: row[`${prefix}id`],
@@ -731,8 +1324,7 @@ app.get("/api/friends", async (req, res) => {
         );
         res.json(result.rows.map(row => ({ ...publicUser(row), since: row.since })));
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -758,8 +1350,7 @@ app.get("/api/friends/requests", async (req, res) => {
             outgoing: result.rows.filter(row => !row.incoming).map(toRequest),
         });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -819,8 +1410,7 @@ app.post("/api/friends/requests", friendRequestLimiter, async (req, res) => {
             // both sent at the same moment: the unique pair index caught it
             return res.status(409).json({ error: "Request already exists", code: "ALREADY_REQUESTED" });
         }
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -842,8 +1432,7 @@ app.post("/api/friends/requests/:id/accept", async (req, res) => {
         const friend = await pool.query("SELECT id, username, display_name FROM users WHERE id = $1", [result.rows[0].requester_id]);
         res.json({ friend: { ...publicUser(friend.rows[0]), since: result.rows[0].responded_at } });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -864,8 +1453,7 @@ app.delete("/api/friends/requests/:id", async (req, res) => {
         }
         res.json({ id: result.rows[0].id });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -888,8 +1476,7 @@ app.delete("/api/friends/:userId", async (req, res) => {
         }
         res.json({ userId: friendId });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -906,6 +1493,9 @@ const ONLINE_SECONDS = 30;
 // Upper bound for one time report. The client reports every 10 s, but a browser
 // throttles timers in background tabs, so a report can cover a few minutes.
 const MAX_REPORT_MS = 5 * 60 * 1000;
+// A report can't book more than the time since my previous report (plus this much for
+// network delays), so nobody can inflate their time by sending reports quickly
+const REPORT_SLACK_MS = limitFromEnv("TIME_REPORT_SLACK_MS", 5000);
 
 const sessionName = (value) => typeof value === "string" ? value.trim().slice(0, 100) : "";
 
@@ -940,6 +1530,28 @@ async function requireOpenSession(req, res) {
     return { sessionId, ...membership, isOwner: membership.owner_id === req.user.userId };
 }
 
+// Adds an entry to a session's activity feed
+async function logEvent(db, sessionId, userId, type, { taskId = null, taskName = null, text = null, targetId = null } = {}) {
+    await db.query(
+        `INSERT INTO shared_session_events (session_id, user_id, type, task_id, task_name, text, target_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [sessionId, userId, type, taskId, taskName, text, targetId]
+    );
+}
+
+// How many feed entries the session page gets
+const EVENT_LIMIT = 60;
+
+// Chat messages are short; this many per person and minute is plenty for a real conversation
+const messageLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 30,
+    skip: (req) => req.method === "OPTIONS",
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many messages, please slow down", code: "RATE_LIMITED" },
+});
+
 // Invites the given users to a session, skipping anybody who isn't my friend or is already in it
 async function inviteFriends(db, sessionId, userId, friendIds) {
     if (friendIds.length === 0) return 0;
@@ -962,10 +1574,11 @@ async function inviteFriends(db, sessionId, userId, friendIds) {
 // Everything the session page shows:
 // { id, name, createdAt, endedAt, owner, isOwner, me (my user id),
 //   people: [{ user, status: 'joined' | 'invited' | 'left', isOwner, joinedAt, workingOn, totalMs }],
-//   tasks:  [{ id, name, description, done, addedBy, sourceTaskId, createdAt, totalMs, time: [{ userId, ms }] }] }
+//   tasks:  [{ id, name, description, done, addedBy, assignee, sourceTaskId, createdAt, totalMs, time: [{ userId, ms }] }],
+//   events: [{ id, type, user, target, taskId, taskName, text, createdAt }] (oldest first, the last EVENT_LIMIT) }
 // 'left' people are no longer members but booked time, so they still show up in the totals.
 async function loadSharedSession(sessionId, userId) {
-    const [session, members, tasks, times] = await Promise.all([
+    const [session, members, tasks, times, events] = await Promise.all([
         pool.query(
             `SELECT shared_sessions.id, shared_sessions.name, shared_sessions.created_at, shared_sessions.ended_at,
                 users.id AS owner_id, users.username AS owner_username, users.display_name AS owner_display_name
@@ -988,9 +1601,11 @@ async function loadSharedSession(sessionId, userId) {
         pool.query(
             `SELECT shared_session_tasks.id, shared_session_tasks.name, shared_session_tasks.description,
                 shared_session_tasks.done, shared_session_tasks.source_task_id, shared_session_tasks.created_at,
-                users.id AS adder_id, users.username AS adder_username, users.display_name AS adder_display_name
+                users.id AS adder_id, users.username AS adder_username, users.display_name AS adder_display_name,
+                assignee.id AS assignee_id, assignee.username AS assignee_username, assignee.display_name AS assignee_display_name
             FROM shared_session_tasks
             LEFT JOIN users ON users.id = shared_session_tasks.added_by
+            LEFT JOIN users AS assignee ON assignee.id = shared_session_tasks.assignee_id
             WHERE shared_session_tasks.session_id = $1
             ORDER BY shared_session_tasks.id`,
             [sessionId]
@@ -1004,6 +1619,21 @@ async function loadSharedSession(sessionId, userId) {
             WHERE shared_session_tasks.session_id = $1 AND shared_session_time.time_ms > 0
             ORDER BY shared_session_time.time_ms DESC`,
             [sessionId]
+        ),
+        pool.query(
+            `SELECT * FROM (
+                SELECT shared_session_events.id, shared_session_events.type, shared_session_events.task_id,
+                    shared_session_events.task_name, shared_session_events.text, shared_session_events.created_at,
+                    actor.id AS actor_id, actor.username AS actor_username, actor.display_name AS actor_display_name,
+                    target.id AS target_id, target.username AS target_username, target.display_name AS target_display_name
+                FROM shared_session_events
+                LEFT JOIN users AS actor ON actor.id = shared_session_events.user_id
+                LEFT JOIN users AS target ON target.id = shared_session_events.target_id
+                WHERE shared_session_events.session_id = $1
+                ORDER BY shared_session_events.id DESC
+                LIMIT $2
+            ) AS latest ORDER BY id`,
+            [sessionId, EVENT_LIMIT]
         ),
     ]);
 
@@ -1050,6 +1680,7 @@ async function loadSharedSession(sessionId, userId) {
                 description: task.description,
                 done: task.done,
                 addedBy: task.adder_id ? publicUser(task, "adder_") : null,
+                assignee: task.assignee_id ? publicUser(task, "assignee_") : null,
                 // only the person who shared it can do anything with their own task's id
                 sourceTaskId: task.adder_id === userId ? task.source_task_id : null,
                 createdAt: task.created_at,
@@ -1057,6 +1688,16 @@ async function loadSharedSession(sessionId, userId) {
                 time,
             };
         }),
+        events: events.rows.map(event => ({
+            id: event.id,
+            type: event.type,
+            user: event.actor_id ? publicUser(event, "actor_") : null,
+            target: event.target_id ? publicUser(event, "target_") : null,
+            taskId: event.task_id,
+            taskName: event.task_name,
+            text: event.text,
+            createdAt: event.created_at,
+        })),
     };
 }
 
@@ -1114,8 +1755,88 @@ app.get("/api/shared-sessions", async (req, res) => {
             })),
         });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
+    }
+});
+
+// The tasks of all running sessions I joined, for the solo home page (one group per session):
+// [{ id, name, me, tasks: [{ id, name, description, done, assignee, myMs, totalMs }] }]
+// Registered before /:id, which would otherwise take "my-tasks" for an id.
+app.get("/api/shared-sessions/my-tasks", async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const result = await pool.query(
+            `SELECT shared_sessions.id AS session_id, shared_sessions.name AS session_name,
+                shared_session_tasks.id, shared_session_tasks.name, shared_session_tasks.description, shared_session_tasks.done,
+                assignee.id AS assignee_id, assignee.username AS assignee_username, assignee.display_name AS assignee_display_name,
+                COALESCE((SELECT time_ms FROM shared_session_time
+                    WHERE task_id = shared_session_tasks.id AND user_id = $1), 0) AS my_ms,
+                COALESCE((SELECT sum(time_ms) FROM shared_session_time
+                    WHERE task_id = shared_session_tasks.id), 0) AS total_ms
+            FROM shared_session_members
+            JOIN shared_sessions ON shared_sessions.id = shared_session_members.session_id
+            LEFT JOIN shared_session_tasks ON shared_session_tasks.session_id = shared_sessions.id
+            LEFT JOIN users AS assignee ON assignee.id = shared_session_tasks.assignee_id
+            WHERE shared_session_members.user_id = $1 AND shared_session_members.status = 'joined'
+                AND shared_sessions.ended_at IS NULL
+            ORDER BY lower(shared_sessions.name), shared_sessions.id, shared_session_tasks.id`,
+            [userId]
+        );
+        const sessions = new Map();
+        for (const row of result.rows) {
+            if (!sessions.has(row.session_id)) {
+                sessions.set(row.session_id, { id: row.session_id, name: row.session_name, me: userId, tasks: [] });
+            }
+            if (row.id === null) continue; // a session without tasks yet
+            sessions.get(row.session_id).tasks.push({
+                id: row.id,
+                name: row.name,
+                description: row.description,
+                done: row.done,
+                assignee: row.assignee_id ? publicUser(row, "assignee_") : null,
+                myMs: Number(row.my_ms),
+                totalMs: Number(row.total_ms),
+            });
+        }
+        res.json([...sessions.values()]);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// My work in shared sessions for the history, newest first; also sessions I have left:
+// [{ id, name, endedAt, lastWorkedAt, myMs, tasks: [{ id, name, done, ms }] }]
+app.get("/api/shared-sessions/history", async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const result = await pool.query(
+            `SELECT shared_sessions.id AS session_id, shared_sessions.name AS session_name, shared_sessions.ended_at,
+                shared_session_tasks.id, shared_session_tasks.name, shared_session_tasks.done,
+                shared_session_time.time_ms, shared_session_time.updated_at
+            FROM shared_session_time
+            JOIN shared_session_tasks ON shared_session_tasks.id = shared_session_time.task_id
+            JOIN shared_sessions ON shared_sessions.id = shared_session_tasks.session_id
+            WHERE shared_session_time.user_id = $1 AND shared_session_time.time_ms > 0
+            ORDER BY shared_session_time.time_ms DESC`,
+            [userId]
+        );
+        const sessions = new Map();
+        for (const row of result.rows) {
+            if (!sessions.has(row.session_id)) {
+                sessions.set(row.session_id, {
+                    id: row.session_id, name: row.session_name, endedAt: row.ended_at,
+                    lastWorkedAt: row.updated_at, myMs: 0, tasks: [],
+                });
+            }
+            const entry = sessions.get(row.session_id);
+            const ms = Number(row.time_ms);
+            entry.myMs += ms;
+            if (row.updated_at > entry.lastWorkedAt) entry.lastWorkedAt = row.updated_at;
+            entry.tasks.push({ id: row.id, name: row.name, done: row.done, ms });
+        }
+        res.json([...sessions.values()].sort((a, b) => b.lastWorkedAt - a.lastWorkedAt));
+    } catch (err) {
+        serverError(res, err);
     }
 });
 
@@ -1129,8 +1850,7 @@ app.get("/api/shared-sessions/:id", async (req, res) => {
         }
         await sendSharedSession(res, sessionId, userId);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -1154,12 +1874,12 @@ app.post("/api/shared-sessions", async (req, res) => {
             [sessionId, userId]
         );
         await inviteFriends(client, sessionId, userId, idList(req.body?.friendIds));
+        await logEvent(client, sessionId, userId, "created", { text: name });
         await client.query("COMMIT");
         await sendSharedSession(res, sessionId, userId, 201);
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     } finally {
         client.release();
     }
@@ -1175,8 +1895,7 @@ app.post("/api/shared-sessions/:id/invites", async (req, res) => {
         if (invited === 0) return fail(res, 400, "NOTHING_TO_INVITE", "Nobody new to invite");
         await sendSharedSession(res, session.sessionId, userId);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -1194,10 +1913,10 @@ app.post("/api/shared-sessions/:id/join", async (req, res) => {
             [sessionId, userId]
         );
         if (result.rows.length === 0) return fail(res, 404, "INVITE_NOT_FOUND", "Invite not found");
+        await logEvent(pool, sessionId, userId, "joined");
         await sendSharedSession(res, sessionId, userId);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -1216,14 +1935,18 @@ app.delete("/api/shared-sessions/:id/members/:userId", async (req, res) => {
         if (targetId === membership.owner_id) return fail(res, 400, "OWNER_CANNOT_LEAVE", "The owner can't leave the session");
 
         const result = await pool.query(
-            "DELETE FROM shared_session_members WHERE session_id = $1 AND user_id = $2 RETURNING user_id",
+            "DELETE FROM shared_session_members WHERE session_id = $1 AND user_id = $2 RETURNING status",
             [sessionId, targetId]
         );
         if (result.rows.length === 0) return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
+        // declined or withdrawn invites don't make it into the feed
+        if (result.rows[0].status === "joined" && !membership.ended_at) {
+            if (targetId === userId) await logEvent(pool, sessionId, userId, "left");
+            else await logEvent(pool, sessionId, userId, "removed", { targetId });
+        }
         res.json({ sessionId, userId: targetId });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -1249,43 +1972,67 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
             task = { name, description, sourceTaskId: null };
         }
 
-        await pool.query(
+        const created = await pool.query(
             `INSERT INTO shared_session_tasks (session_id, name, description, added_by, source_task_id)
-            VALUES ($1, $2, $3, $4, $5)`,
+            VALUES ($1, $2, $3, $4, $5) RETURNING id`,
             [session.sessionId, task.name, task.description, userId, task.sourceTaskId]
         );
+        await logEvent(pool, session.sessionId, userId, "task_added", { taskId: created.rows[0].id, taskName: task.name });
         await sendSharedSession(res, session.sessionId, userId, 201);
     } catch (err) {
         if (err.code === "23505") {
             return fail(res, 409, "TASK_ALREADY_SHARED", "This task is already in the session");
         }
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
-// Mark a task done or not done: { done }. A task shared from someone's list is updated there too.
+// Change a task: { done?, assigneeId? (a member's id, or null for nobody) }.
+// Done is also set on the personal task it was shared from.
 app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
     const userId = req.user.userId;
     const taskId = idParam(req.params.taskId);
-    if (typeof req.body?.done !== "boolean") return fail(res, 400, "DONE_REQUIRED", "done must be true or false");
+    const { done } = req.body ?? {};
+    const changesAssignee = req.body && "assigneeId" in req.body;
+    const assigneeId = changesAssignee && req.body.assigneeId !== null ? idParam(req.body.assigneeId) : null;
+
+    if (done !== undefined && typeof done !== "boolean") return fail(res, 400, "DONE_REQUIRED", "done must be true or false");
+    if (done === undefined && !changesAssignee) return fail(res, 400, "NOTHING_TO_CHANGE", "Send done or assigneeId");
+    if (changesAssignee && req.body.assigneeId !== null && !assigneeId) return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
+
     try {
         const session = await requireOpenSession(req, res);
         if (!session) return;
-        const result = await pool.query(
-            `UPDATE shared_session_tasks SET done = $1
-            WHERE id = $2 AND session_id = $3
-            RETURNING source_task_id`,
-            [req.body.done, taskId, session.sessionId]
+
+        const before = await pool.query(
+            "SELECT name, done, assignee_id, source_task_id FROM shared_session_tasks WHERE id = $1 AND session_id = $2",
+            [taskId, session.sessionId]
         );
-        if (result.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
-        if (result.rows[0].source_task_id) {
-            await pool.query("UPDATE tasks SET done = $1 WHERE id = $2", [req.body.done, result.rows[0].source_task_id]);
+        if (before.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
+        const task = before.rows[0];
+
+        if (assigneeId) {
+            const member = await getMembership(session.sessionId, assigneeId);
+            if (member?.status !== "joined") return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
+        }
+
+        await pool.query(
+            `UPDATE shared_session_tasks
+            SET done = COALESCE($1, done), assignee_id = CASE WHEN $2 THEN $3::int ELSE assignee_id END
+            WHERE id = $4`,
+            [done ?? null, changesAssignee, assigneeId, taskId]
+        );
+
+        if (done !== undefined && done !== task.done) {
+            if (task.source_task_id) await pool.query("UPDATE tasks SET done = $1 WHERE id = $2", [done, task.source_task_id]);
+            await logEvent(pool, session.sessionId, userId, done ? "task_done" : "task_reopened", { taskId, taskName: task.name });
+        }
+        if (changesAssignee && assigneeId !== task.assignee_id) {
+            await logEvent(pool, session.sessionId, userId, "task_assigned", { taskId, taskName: task.name, targetId: assigneeId });
         }
         await sendSharedSession(res, session.sessionId, userId);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -1311,8 +2058,7 @@ app.delete("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
         await pool.query("DELETE FROM shared_session_tasks WHERE id = $1", [taskId]);
         await sendSharedSession(res, session.sessionId, userId);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -1343,23 +2089,55 @@ app.post("/api/shared-sessions/:id/activity", async (req, res) => {
             if (found.rows.length < new Set(wanted).size) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
         }
 
+        let bookedMs = 0;
         if (bookTaskId && ms > 0) {
+            const last = await pool.query(
+                `SELECT EXTRACT(EPOCH FROM (now() - last_seen_at)) * 1000 AS since_ms
+                FROM shared_session_members WHERE session_id = $1 AND user_id = $2`,
+                [session.sessionId, userId]
+            );
+            // no report yet: only the slack (the app always reports "started" before any time)
+            const sinceMs = last.rows[0]?.since_ms;
+            const passedMs = sinceMs === null || sinceMs === undefined ? 0 : Math.max(0, Math.round(Number(sinceMs)));
+            bookedMs = Math.min(ms, passedMs + REPORT_SLACK_MS);
+        }
+        if (bookedMs > 0) {
             await pool.query(
                 `INSERT INTO shared_session_time (task_id, user_id, time_ms) VALUES ($1, $2, $3)
                 ON CONFLICT (task_id, user_id)
                 DO UPDATE SET time_ms = shared_session_time.time_ms + EXCLUDED.time_ms, updated_at = now()`,
-                [bookTaskId, userId, ms]
+                [bookTaskId, userId, bookedMs]
             );
         }
-        await pool.query(
-            `UPDATE shared_session_members SET current_task_id = $1, last_seen_at = now()
-            WHERE session_id = $2 AND user_id = $3`,
-            [currentTaskId, session.sessionId, userId]
+        // the old values, to tell whether I just started on something
+        const previous = await pool.query(
+            `UPDATE shared_session_members AS m SET current_task_id = $1, last_seen_at = now()
+            FROM shared_session_members AS old
+            WHERE m.session_id = $2 AND m.user_id = $3
+                AND old.session_id = m.session_id AND old.user_id = m.user_id
+            RETURNING old.current_task_id,
+                old.last_seen_at > now() - make_interval(secs => $4) AS was_online`,
+            [currentTaskId, session.sessionId, userId, ONLINE_SECONDS]
         );
+        const was = previous.rows[0];
+        const justStarted = currentTaskId && !(was?.was_online && was.current_task_id === currentTaskId);
+        if (justStarted) {
+            // pausing and going on with the same task shouldn't flood the feed
+            const recent = await pool.query(
+                `SELECT 1 FROM shared_session_events
+                WHERE session_id = $1 AND user_id = $2 AND type = 'started' AND task_id = $3
+                    AND created_at > now() - interval '15 minutes'
+                    AND id = (SELECT max(id) FROM shared_session_events WHERE session_id = $1 AND user_id = $2)`,
+                [session.sessionId, userId, currentTaskId]
+            );
+            if (recent.rows.length === 0) {
+                const task = await pool.query("SELECT name FROM shared_session_tasks WHERE id = $1", [currentTaskId]);
+                await logEvent(pool, session.sessionId, userId, "started", { taskId: currentTaskId, taskName: task.rows[0].name });
+            }
+        }
         await sendSharedSession(res, session.sessionId, userId);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
 });
 
@@ -1377,14 +2155,50 @@ app.post("/api/shared-sessions/:id/end", async (req, res) => {
         // open invites expire, nobody is working any more
         await client.query("DELETE FROM shared_session_members WHERE session_id = $1 AND status = 'invited'", [session.sessionId]);
         await client.query("UPDATE shared_session_members SET current_task_id = NULL WHERE session_id = $1", [session.sessionId]);
+        await logEvent(client, session.sessionId, userId, "ended");
         await client.query("COMMIT");
         await sendSharedSession(res, session.sessionId, userId);
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     } finally {
         client.release();
+    }
+});
+
+// Chat: { text } goes into the activity feed
+app.post("/api/shared-sessions/:id/messages", messageLimiter, async (req, res) => {
+    const userId = req.user.userId;
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+    if (!text) return fail(res, 400, "TEXT_REQUIRED", "Message is empty");
+    if (text.length > 1000) return fail(res, 400, "TEXT_TOO_LONG", "Message is too long");
+    try {
+        const session = await requireOpenSession(req, res);
+        if (!session) return;
+        await logEvent(pool, session.sessionId, userId, "message", { text });
+        await sendSharedSession(res, session.sessionId, userId, 201);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Rename (owner): { name }
+app.patch("/api/shared-sessions/:id", async (req, res) => {
+    const userId = req.user.userId;
+    const name = sessionName(req.body?.name);
+    if (!name) return fail(res, 400, "NAME_REQUIRED", "Name is required");
+    try {
+        const session = await requireOpenSession(req, res);
+        if (!session) return;
+        if (!session.isOwner) return fail(res, 403, "NOT_OWNER", "Only the owner can rename the session");
+        const result = await pool.query(
+            "UPDATE shared_sessions SET name = $1 WHERE id = $2 AND name <> $1 RETURNING id",
+            [name, session.sessionId]
+        );
+        if (result.rows.length > 0) await logEvent(pool, session.sessionId, userId, "renamed", { text: name });
+        await sendSharedSession(res, session.sessionId, userId);
+    } catch (err) {
+        serverError(res, err);
     }
 });
 
@@ -1401,9 +2215,18 @@ app.delete("/api/shared-sessions/:id", async (req, res) => {
         if (result.rows.length === 0) return fail(res, 404, "SESSION_NOT_FOUND", "Session not found");
         res.json({ id: sessionId });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        serverError(res, err);
     }
+});
+
+// Unknown routes, and errors no route handled (e.g. invalid JSON): short JSON answers,
+// never Express's HTML page with a stack trace
+app.use((req, res) => res.status(404).json({ error: "Not found" }));
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+    if (err.type === "entity.parse.failed") return res.status(400).json({ error: "Invalid JSON", code: "INVALID_JSON" });
+    if (err.type === "entity.too.large") return res.status(413).json({ error: "Request too large", code: "TOO_LARGE" });
+    serverError(res, err);
 });
 
 //listen for requests on this url
