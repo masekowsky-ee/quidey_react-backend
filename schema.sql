@@ -86,6 +86,36 @@ CREATE TABLE public.beta_access_requests (
 );
 
 --
+-- Name: email_verification_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.email_verification_tokens (
+    id integer NOT NULL,
+    user_id integer NOT NULL,
+    token_hash text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+--
+-- Name: email_verification_tokens_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.email_verification_tokens_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: email_verification_tokens_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.email_verification_tokens_id_seq OWNED BY public.email_verification_tokens.id;
+
+--
 -- Name: friendships; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -418,7 +448,12 @@ CREATE TABLE public.tasks (
     location text,
     link text,
     details text,
+    repeat text,
+    repeat_from_id integer,
+    completed_at timestamp with time zone,
     CONSTRAINT tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
+    CONSTRAINT tasks_repeat_check CHECK (((repeat IS NULL) OR (repeat = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text, 'yearly'::text])))),
+    CONSTRAINT tasks_repeat_needs_due_check CHECK (((repeat IS NULL) OR (due IS NOT NULL))),
     CONSTRAINT tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080)))),
     CONSTRAINT tasks_reminder_minutes_check CHECK (((reminder_minutes IS NULL) OR ((reminder_minutes >= 0) AND (reminder_minutes <= 10080))))
 );
@@ -455,7 +490,10 @@ CREATE TABLE public.users (
     email text,
     is_pro boolean DEFAULT false NOT NULL,
     is_admin boolean DEFAULT false NOT NULL,
-    token_version integer DEFAULT 0 NOT NULL
+    token_version integer DEFAULT 0 NOT NULL,
+    email_verified boolean DEFAULT false NOT NULL,
+    terms_accepted_at timestamp with time zone,
+    privacy_accepted_at timestamp with time zone
 );
 
 --
@@ -481,6 +519,12 @@ ALTER SEQUENCE public.users_id_seq OWNED BY public.users.id;
 --
 
 ALTER TABLE ONLY public.admin_actions ALTER COLUMN id SET DEFAULT nextval('public.admin_actions_id_seq'::regclass);
+
+--
+-- Name: email_verification_tokens id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.email_verification_tokens ALTER COLUMN id SET DEFAULT nextval('public.email_verification_tokens_id_seq'::regclass);
 
 --
 -- Name: friendships id; Type: DEFAULT; Schema: public; Owner: -
@@ -555,6 +599,20 @@ ALTER TABLE ONLY public.admin_actions
 
 ALTER TABLE ONLY public.beta_access_requests
     ADD CONSTRAINT beta_access_requests_pkey PRIMARY KEY (user_id);
+
+--
+-- Name: email_verification_tokens email_verification_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.email_verification_tokens
+    ADD CONSTRAINT email_verification_tokens_pkey PRIMARY KEY (id);
+
+--
+-- Name: email_verification_tokens email_verification_tokens_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.email_verification_tokens
+    ADD CONSTRAINT email_verification_tokens_token_hash_key UNIQUE (token_hash);
 
 --
 -- Name: friendships friendships_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -695,6 +753,12 @@ CREATE INDEX admin_actions_created_idx ON public.admin_actions USING btree (crea
 CREATE INDEX beta_access_requests_status_idx ON public.beta_access_requests USING btree (status, created_at);
 
 --
+-- Name: email_verification_tokens_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX email_verification_tokens_user_idx ON public.email_verification_tokens USING btree (user_id);
+
+--
 -- Name: friendships_addressee_status_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -774,6 +838,13 @@ ALTER TABLE ONLY public.admin_actions
 
 ALTER TABLE ONLY public.beta_access_requests
     ADD CONSTRAINT beta_access_requests_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: email_verification_tokens email_verification_tokens_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.email_verification_tokens
+    ADD CONSTRAINT email_verification_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
 -- Name: friendships friendships_addressee_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -996,3 +1067,42 @@ ALTER TABLE ONLY public.tasks
 -- PostgreSQL database dump complete
 --
 
+-- 012: next occurrence of a repeating task points at the one it came from
+ALTER TABLE ONLY public.tasks
+    ADD CONSTRAINT tasks_repeat_from_id_fkey FOREIGN KEY (repeat_from_id) REFERENCES public.tasks(id) ON DELETE SET NULL;
+CREATE INDEX tasks_repeat_from_idx ON public.tasks USING btree (repeat_from_id);
+
+-- 013: inbox and admin broadcasts (same as migrations/013_inbox.sql)
+CREATE TABLE public.messages (
+    id           serial PRIMARY KEY,
+    sender_id    integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    recipient_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    body         text NOT NULL CHECK (length(body) BETWEEN 1 AND 2000),
+    created_at   timestamp with time zone NOT NULL DEFAULT now(),
+    read_at      timestamp with time zone,
+    CHECK (sender_id <> recipient_id)
+);
+CREATE INDEX messages_recipient_idx ON public.messages (recipient_id, created_at);
+CREATE INDEX messages_sender_idx ON public.messages (sender_id, created_at);
+
+CREATE TABLE public.broadcasts (
+    id              serial PRIMARY KEY,
+    admin_id        integer REFERENCES public.users(id) ON DELETE SET NULL,
+    admin_username  text,
+    title           text NOT NULL CHECK (length(title) BETWEEN 1 AND 120),
+    body            text NOT NULL CHECK (length(body) BETWEEN 1 AND 2000),
+    recipient_count integer NOT NULL DEFAULT 0,
+    created_at      timestamp with time zone NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.notifications (
+    id           serial PRIMARY KEY,
+    user_id      integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    kind         text NOT NULL CHECK (kind IN ('broadcast', 'system')),
+    title        text NOT NULL CHECK (length(title) BETWEEN 1 AND 120),
+    body         text NOT NULL CHECK (length(body) BETWEEN 1 AND 2000),
+    broadcast_id integer REFERENCES public.broadcasts(id) ON DELETE CASCADE,
+    created_at   timestamp with time zone NOT NULL DEFAULT now(),
+    read_at      timestamp with time zone
+);
+CREATE INDEX notifications_user_idx ON public.notifications (user_id, created_at);

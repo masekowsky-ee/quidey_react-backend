@@ -6,6 +6,8 @@ const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
 const pool = require("./db");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const { hashToken, createVerificationToken } = require("./utils/verificationToken");
+const { sendVerificationMail, sendContactMail, sendFeedbackMail } = require("./utils/mailer");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -92,6 +94,27 @@ const registerLimiter = rateLimit({
     standardHeaders: "draft-8",
     legacyHeaders: false,
     message: { error: "Too many new accounts, please try again later", code: "RATE_LIMITED" },
+});
+
+// Verification mails on request: at most 3 per account and hour, so nobody floods an inbox
+const verificationMailLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_VERIFICATION_MAIL", 3),
+    skip: (req) => req.method === "OPTIONS",
+    keyGenerator: (req) => `verify-mail:${req.user.userId}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many mails, please try again later", code: "RATE_LIMITED" },
+});
+
+// "Send the link again" from the sign-in screen: 3 per IP per 15 minutes
+const resendVerificationLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_VERIFICATION_MAIL", 3),
+    skip: (req) => req.method === "OPTIONS",
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many mails, please try again later", code: "RATE_LIMITED" },
 });
 
 // Wrong passwords per account (not per IP), against guessing one password from many machines
@@ -263,6 +286,9 @@ function cleanLink(value) {
     }
 }
 
+// How far the next one of a repeating task is from the last (Postgres intervals)
+const REPEAT_INTERVALS = { daily: "1 day", weekly: "7 days", monthly: "1 month", yearly: "1 year" };
+
 // The optional task fields, each checked only when it was sent:
 // { values: { column: value } } or { error: field }
 const TASK_EXTRAS = {
@@ -272,6 +298,7 @@ const TASK_EXTRAS = {
     location: (value) => cleanText(value, TASK_LOCATION_MAX),
     link: cleanLink,
     details: (value) => cleanText(value, TASK_DETAILS_MAX),
+    repeat: (value) => (value === null || value === "" ? null : Object.hasOwn(REPEAT_INTERVALS, value) ? value : undefined),
 };
 function readTaskExtras(body) {
     const values = {};
@@ -299,6 +326,7 @@ const TASK_SELECT = `
     SELECT tasks.id, tasks.name, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
         tasks.duration_minutes, tasks.reminder_minutes, tasks.location, tasks.link, tasks.details,
         tasks.description, tasks.prio, tasks.done, tasks.created_at, tasks.user_id,
+        tasks.repeat, tasks.completed_at,
         owner.username AS owner_username, owner.display_name AS owner_display_name,
         my_share.id AS my_share_id,
         COALESCE((
@@ -338,6 +366,8 @@ function toTaskResponse(row, userId) {
         description: row.description,
         prio: row.prio,
         done: row.done,
+        repeat: row.repeat,
+        completed_at: row.completed_at,
         created_at: row.created_at,
         user_id: row.user_id,
         group_ids: row.group_ids,
@@ -372,7 +402,7 @@ app.get("/api/users", async (req, res) => {
 
     try {
         const result = await pool.query(
-            "SELECT users.username, users.display_name, users.birth_date, users.email, users.created_at FROM users WHERE id = $1",
+            "SELECT users.username, users.display_name, users.birth_date, users.email, users.email_verified, users.created_at FROM users WHERE id = $1",
             [userId]
         );
         res.json(result.rows);
@@ -620,8 +650,9 @@ app.post("/api/tasks", async (req, res) => {
     if (due === undefined) return invalidInput(res, "due");
     if (prio === undefined) return invalidInput(res, "prio");
     if (extras.error) return invalidInput(res, extras.error);
-    // a time of day needs a day
+    // a time of day needs a day, and so does repeating
     if (extras.values.due_time && !due) return invalidInput(res, "due_time");
+    if (extras.values.repeat && !due) return invalidInput(res, "repeat");
 
     const columns = ["name", "due", "description", "prio", "user_id", ...Object.keys(extras.values)];
     const values = [name, due, description, prio, userId, ...Object.values(extras.values)];
@@ -884,6 +915,10 @@ app.post("/api/register", registerLimiter, async (req, res) => {
     const age = ageFromBirthDate(birth_date);
     if (age === null || age > 130) return fail(400, "INVALID_BIRTH_DATE", "Invalid birth date");
     if (age < MIN_AGE) return fail(400, "TOO_YOUNG", `You must be at least ${MIN_AGE} years old`);
+    // terms, privacy policy and age must all be confirmed; when, is stored as proof
+    if (req.body?.accept_terms !== true) return fail(400, "TERMS_REQUIRED", "The terms of use must be accepted");
+    if (req.body?.accept_privacy !== true) return fail(400, "PRIVACY_REQUIRED", "The privacy policy must be acknowledged");
+    if (req.body?.confirm_age !== true) return fail(400, "AGE_CONFIRMATION_REQUIRED", "The age must be confirmed");
 
     try {
         const taken = await pool.query(
@@ -896,18 +931,142 @@ app.post("/api/register", registerLimiter, async (req, res) => {
 
         const passwordHash = await bcrypt.hash(password, 10);
         const result = await pool.query(
-            `INSERT INTO users (username, password_hash, display_name, birth_date, email)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, username, created_at`,
+            `INSERT INTO users (username, password_hash, display_name, birth_date, email, terms_accepted_at, privacy_accepted_at)
+            VALUES ($1, $2, $3, $4, $5, now(), now())
+            RETURNING id, username, email, created_at`,
             [username, passwordHash, displayName, birth_date, email]
         );
-        res.status(201).json(result.rows[0]);
+        const user = result.rows[0];
+
+        const rawToken = await createVerificationToken(pool, user.id);
+        try {
+            await sendVerificationMail(user.email, rawToken);
+        } catch (err) {
+            // Registration still succeeds; the user can request a new mail later
+            console.error("Verification mail failed:", err);
+        }
+
+        res.status(201).json({
+            id: user.id,
+            username: user.username,
+            created_at: user.created_at,
+            message: "Registered. Please confirm your email.",
+        });
     } catch (err) {
         if (err.code === "23505") {
             // two registrations with the same name at the same moment
             const field = /email/.test(err.constraint ?? "") ? "EMAIL_TAKEN" : "USERNAME_TAKEN";
             return fail(409, field, "Already registered");
         }
+        serverError(res, err);
+    }
+});
+
+// Confirms an email address with the token from the verification link: { token }.
+// The token is used up either way; an expired one says so, so the page can offer a new mail.
+// Works without being signed in (the link may be opened on another device).
+app.post("/api/verify-email", authLimiter, async (req, res) => {
+    const token = req.body?.token;
+    if (typeof token !== "string" || !/^[0-9a-f]{64}$/.test(token)) {
+        return res.status(400).json({ error: "Invalid or used link", code: "INVALID_TOKEN" });
+    }
+
+    try {
+        // one statement: the token can't be used twice by two requests at the same moment
+        const result = await pool.query(
+            `WITH used AS (
+                DELETE FROM email_verification_tokens WHERE token_hash = $1
+                RETURNING user_id, expires_at > now() AS valid
+            ), verified AS (
+                UPDATE users SET email_verified = true
+                FROM used WHERE users.id = used.user_id AND used.valid
+                RETURNING users.id
+            )
+            SELECT valid FROM used`,
+            [hashToken(token)]
+        );
+        const row = result.rows[0];
+        if (!row) return res.status(400).json({ error: "Invalid or used link", code: "INVALID_TOKEN" });
+        if (!row.valid) return res.status(400).json({ error: "This link has expired", code: "TOKEN_EXPIRED" });
+        res.json({ verified: true });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Contact form (the second quick way to reach the operator the Impressum needs, § 5 DDG):
+// { name, email, message, website }. Works without an account. "website" is a field people
+// never see: bots fill it in, and get a normal answer without a mail being sent.
+// At most 5 messages per hour from one address; refused input (a typo in the address) doesn't count.
+const contactLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_CONTACT", 5),
+    skipFailedRequests: true,
+    skip: (req) => req.method === "OPTIONS",
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many messages, please try again later", code: "RATE_LIMITED" },
+});
+
+app.post("/api/contact", contactLimiter, async (req, res) => {
+    // one line: no line breaks in the name, which goes into the subject
+    const name = typeof req.body?.name === "string" ? req.body.name.replace(/\s+/g, " ").trim() : "";
+    const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+    const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
+    const fail = (code, error) => res.status(400).json({ error, code });
+
+    if (!name || name.length > 100) return fail("INVALID_NAME", "Name must be 1-100 characters");
+    if (!EMAIL_PATTERN.test(email) || email.length > 254) return fail("INVALID_EMAIL", "Invalid email address");
+    if (message.length < 10 || message.length > 5000) return fail("INVALID_MESSAGE", "Message must be 10-5000 characters");
+    if (req.body?.website) return res.json({ sent: true });
+
+    try {
+        await sendContactMail({ name, email, message });
+        res.json({ sent: true });
+    } catch (err) {
+        console.error("Contact mail failed:", err);
+        res.status(502).json({ error: "The message could not be sent", code: "SEND_FAILED" });
+    }
+});
+
+// A new verification link for an account that can't sign in yet: { email }.
+// Same answer whether the address exists, is verified or not, so nobody can probe for accounts;
+// the mail is sent in the background so the response time doesn't tell either.
+app.post("/api/resend-verification", resendVerificationLimiter, async (req, res) => {
+    const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+    if (!EMAIL_PATTERN.test(email) || email.length > 254) {
+        return res.status(400).json({ error: "Invalid email address", code: "INVALID_EMAIL" });
+    }
+
+    try {
+        const result = await pool.query(
+            "SELECT id, email, email_verified FROM users WHERE lower(email) = lower($1)",
+            [email]
+        );
+        const user = result.rows[0];
+        if (user && !user.email_verified) {
+            const rawToken = await createVerificationToken(pool, user.id);
+            sendVerificationMail(user.email, rawToken).catch((err) => console.error("Resend failed:", err));
+        }
+        res.json({ message: "If the account exists, a new mail has been sent." });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Sends me a new verification mail (the older links stop working).
+// Not under /api/users, so it also works before pro access is granted.
+app.post("/api/verify-email/resend", authenticateToken, verificationMailLimiter, async (req, res) => {
+    try {
+        const result = await pool.query("SELECT email, email_verified FROM users WHERE id = $1", [req.user.userId]);
+        const user = result.rows[0];
+        if (!user?.email) return res.status(400).json({ error: "No email address", code: "INVALID_EMAIL" });
+        if (user.email_verified) return res.status(409).json({ error: "Already verified", code: "ALREADY_VERIFIED" });
+
+        const rawToken = await createVerificationToken(pool, req.user.userId);
+        await sendVerificationMail(user.email, rawToken);
+        res.json({ sent: true });
+    } catch (err) {
         serverError(res, err);
     }
 });
@@ -919,16 +1078,20 @@ const DUMMY_PASSWORD_HASH = bcrypt.hashSync("no-such-user-placeholder", 10);
 app.post("/api/login", loginAccountLimiter, async (req, res) => {
     const { username, password } = req.body ?? {};
 
+    // "username" is the username or the email address; long enough for any valid address
     if (typeof username !== "string" || typeof password !== "string" || !username || !password
-        || username.length > 100 || password.length > 1000) {
+        || username.length > 254 || password.length > 1000) {
         return res.status(400).json({ error: "Username and password are required" });
     }
 
     try {
-        // usernames are unique regardless of case, so "ann" signs in "Ann" too
+        // Usernames can't contain "@" and addresses must, so the "@" tells which one was typed.
+        // Both are unique regardless of case, so "ann" signs in "Ann" too.
+        const identifier = username.trim();
+        const column = identifier.includes("@") ? "email" : "username";
         const result = await pool.query(
-            "SELECT id, username, password_hash, token_version FROM users WHERE lower(username) = lower($1)",
-            [username.trim()]
+            `SELECT id, username, password_hash, token_version, email_verified FROM users WHERE lower(${column}) = lower($1)`,
+            [identifier]
         );
 
         const user = result.rows[0];
@@ -938,8 +1101,210 @@ app.post("/api/login", loginAccountLimiter, async (req, res) => {
         if (!user || !passwordMatch) {
             return res.status(401).json({ error: "Invalid sign in" });
         }
+        // only after the password check, so this doesn't tell strangers anything about the account
+        if (!user.email_verified) {
+            return res.status(403).json({ error: "Email not verified", code: "EMAIL_NOT_VERIFIED" });
+        }
 
-        res.json({ token: signToken(user) });
+        // the real username, also when signing in with the email address
+        res.json({ token: signToken(user), username: user.username });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- Feedback ----------
+// { category, message } from a signed-in user, mailed to the operator (CONTACT_TO) with who
+// sent it, so a reply can go to their address. At most 10 per hour.
+const FEEDBACK_CATEGORIES = ["idea", "bug", "praise", "other"];
+const feedbackLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_FEEDBACK", 10),
+    skipFailedRequests: true,
+    skip: (req) => req.method === "OPTIONS",
+    keyGenerator: (req) => `feedback:${req.user?.userId ?? ipKeyGenerator(req.ip)}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too much feedback at once, please try again later", code: "RATE_LIMITED" },
+});
+
+app.post("/api/feedback", authenticateToken, feedbackLimiter, async (req, res) => {
+    const category = req.body?.category;
+    const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
+    const page = typeof req.body?.page === "string" ? req.body.page.slice(0, 200) : "";
+    if (!FEEDBACK_CATEGORIES.includes(category)) return res.status(400).json({ error: "Invalid category", code: "INVALID_CATEGORY" });
+    if (message.length < 5 || message.length > 5000) {
+        return res.status(400).json({ error: "Feedback must be 5-5000 characters", code: "INVALID_MESSAGE" });
+    }
+
+    try {
+        const user = (await pool.query("SELECT username, display_name, email FROM users WHERE id = $1", [req.user.userId])).rows[0];
+        await sendFeedbackMail({ category, message, page, user });
+        res.json({ sent: true });
+    } catch (err) {
+        console.error("Feedback mail failed:", err);
+        res.status(502).json({ error: "The feedback could not be sent", code: "SEND_FAILED" });
+    }
+});
+
+// ---------- Inbox: messages between friends, notifications ----------
+
+app.use(["/api/messages", "/api/notifications", "/api/inbox"], authenticateToken, requirePro);
+
+const MESSAGE_MAX = 2000;
+const directMessageLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_DIRECT_MESSAGES", 30),
+    skip: (req) => req.method !== "POST",
+    keyGenerator: (req) => `direct-messages:${req.user.userId}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many messages, slow down", code: "RATE_LIMITED" },
+});
+
+const areFriends = async (a, b) => (await pool.query(
+    `SELECT 1 FROM friendships WHERE status = 'accepted'
+        AND ((requester_id = $1 AND addressee_id = $2) OR (requester_id = $2 AND addressee_id = $1))`,
+    [a, b]
+)).rows.length > 0;
+
+const toMessage = (row, me) => ({
+    id: row.id,
+    fromMe: row.sender_id === me,
+    body: row.body,
+    createdAt: row.created_at,
+    readAt: row.read_at,
+});
+
+// Unread counts for the menu badge: { messages, notifications }
+app.get("/api/inbox/unread", async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT (SELECT count(*) FROM messages WHERE recipient_id = $1 AND read_at IS NULL)::int AS messages,
+                (SELECT count(*) FROM notifications WHERE user_id = $1 AND read_at IS NULL)::int AS notifications`,
+            [req.user.userId]
+        );
+        res.json(result.rows[0]);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// My conversations, newest first: [{ user, lastMessage, unread }]
+app.get("/api/messages", async (req, res) => {
+    const me = req.user.userId;
+    try {
+        const result = await pool.query(
+            `WITH mine AS (
+                SELECT *, CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END AS other_id
+                FROM messages WHERE sender_id = $1 OR recipient_id = $1
+            ), last AS (
+                SELECT DISTINCT ON (other_id) * FROM mine ORDER BY other_id, created_at DESC, id DESC
+            )
+            SELECT last.*, users.username, users.display_name,
+                (SELECT count(*) FROM mine WHERE mine.other_id = last.other_id
+                    AND mine.recipient_id = $1 AND mine.read_at IS NULL)::int AS unread
+            FROM last JOIN users ON users.id = last.other_id
+            ORDER BY last.created_at DESC`,
+            [me]
+        );
+        res.json(result.rows.map(row => ({
+            user: { id: row.other_id, username: row.username, displayName: row.display_name },
+            lastMessage: toMessage(row, me),
+            unread: row.unread,
+        })));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// The conversation with one user (the latest 200), oldest first; opening it marks it read
+app.get("/api/messages/:userId", async (req, res) => {
+    const me = req.user.userId;
+    const other = idParam(req.params.userId);
+    if (!other) return notFound(res, "User");
+    try {
+        const user = (await pool.query("SELECT id, username, display_name FROM users WHERE id = $1", [other])).rows[0];
+        if (!user) return notFound(res, "User");
+        await pool.query(
+            "UPDATE messages SET read_at = now() WHERE recipient_id = $1 AND sender_id = $2 AND read_at IS NULL",
+            [me, other]
+        );
+        const result = await pool.query(
+            `SELECT * FROM (
+                SELECT * FROM messages
+                WHERE (sender_id = $1 AND recipient_id = $2) OR (sender_id = $2 AND recipient_id = $1)
+                ORDER BY created_at DESC, id DESC LIMIT 200
+            ) AS latest ORDER BY created_at, id`,
+            [me, other]
+        );
+        res.json({
+            user: { id: user.id, username: user.username, displayName: user.display_name },
+            canWrite: await areFriends(me, other),
+            messages: result.rows.map(row => toMessage(row, me)),
+        });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Send a message to a friend: { body }
+app.post("/api/messages/:userId", directMessageLimiter, async (req, res) => {
+    const me = req.user.userId;
+    const other = idParam(req.params.userId);
+    const body = typeof req.body?.body === "string" ? req.body.body.trim() : "";
+    if (!other || other === me) return notFound(res, "User");
+    if (!body || body.length > MESSAGE_MAX) {
+        return res.status(400).json({ error: `Message must be 1-${MESSAGE_MAX} characters`, code: "INVALID_MESSAGE" });
+    }
+    try {
+        if (!await areFriends(me, other)) {
+            return res.status(403).json({ error: "You can only write to friends", code: "NOT_FRIENDS" });
+        }
+        const result = await pool.query(
+            "INSERT INTO messages (sender_id, recipient_id, body) VALUES ($1, $2, $3) RETURNING *",
+            [me, other, body]
+        );
+        res.status(201).json(toMessage(result.rows[0], me));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// My notifications (the latest 100), newest first
+app.get("/api/notifications", async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT id, kind, title, body, created_at, read_at FROM notifications
+            WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT 100`,
+            [req.user.userId]
+        );
+        res.json(result.rows.map(row => ({
+            id: row.id, kind: row.kind, title: row.title, body: row.body, createdAt: row.created_at, readAt: row.read_at,
+        })));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Mark all my notifications read
+app.post("/api/notifications/read", async (req, res) => {
+    try {
+        await pool.query("UPDATE notifications SET read_at = now() WHERE user_id = $1 AND read_at IS NULL", [req.user.userId]);
+        res.json({ read: true });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Delete one of my notifications
+app.delete("/api/notifications/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Notification");
+    try {
+        const result = await pool.query("DELETE FROM notifications WHERE id = $1 AND user_id = $2", [id, req.user.userId]);
+        if (result.rowCount === 0) return notFound(res, "Notification");
+        res.json({ deleted: true });
     } catch (err) {
         serverError(res, err);
     }
@@ -1000,6 +1365,51 @@ async function loadAdminUser(db, id) {
 }
 
 // Numbers for the overview and the latest admin actions
+// ---------- Broadcasts: a notice to every account ----------
+// { title, body }: lands in every user's inbox (Meldungen), logged in broadcasts and admin_actions.
+app.get("/api/admin/broadcasts", async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT id, admin_username, title, body, recipient_count, created_at FROM broadcasts ORDER BY created_at DESC LIMIT 50"
+        );
+        res.json(result.rows.map(row => ({
+            id: row.id, admin: row.admin_username, title: row.title, body: row.body,
+            recipientCount: row.recipient_count, createdAt: row.created_at,
+        })));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.post("/api/admin/broadcasts", async (req, res) => {
+    const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
+    const body = typeof req.body?.body === "string" ? req.body.body.trim() : "";
+    if (!title || title.length > 120) return adminFail(res, 400, "INVALID_TITLE", "Title must be 1-120 characters");
+    if (!body || body.length > 2000) return adminFail(res, 400, "INVALID_BODY", "Text must be 1-2000 characters");
+
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const broadcast = (await client.query(
+            "INSERT INTO broadcasts (admin_id, admin_username, title, body) VALUES ($1, $2, $3, $4) RETURNING id, created_at",
+            [req.admin.id, req.admin.username, title, body]
+        )).rows[0];
+        const sent = await client.query(
+            `INSERT INTO notifications (user_id, kind, title, body, broadcast_id)
+            SELECT id, 'broadcast', $1, $2, $3 FROM users`,
+            [title, body, broadcast.id]
+        );
+        await client.query("UPDATE broadcasts SET recipient_count = $1 WHERE id = $2", [sent.rowCount, broadcast.id]);
+        await client.query("COMMIT");
+        res.status(201).json({ id: broadcast.id, recipientCount: sent.rowCount, createdAt: broadcast.created_at });
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        serverError(res, err);
+    } finally {
+        client.release();
+    }
+});
+
 app.get("/api/admin/overview", async (req, res) => {
     try {
         const [counts, actions] = await Promise.all([
@@ -1157,7 +1567,8 @@ app.patch("/api/admin/users/:id", async (req, res) => {
 
 //PUT endpoints
 
-// Edit my profile: display name and email (the username stays fixed, friends add you by it)
+// Edit my profile: display name and email (the username stays fixed, friends add you by it).
+// A new email address (not only in other upper/lower case) has to be confirmed again.
 app.put("/api/users", async (req, res) => {
     const userId = req.user.userId;
     const displayName = typeof req.body?.display_name === "string" ? req.body.display_name.trim() : "";
@@ -1172,11 +1583,26 @@ app.put("/api/users", async (req, res) => {
 
     try {
         const result = await pool.query(
-            `UPDATE users SET display_name = $1, email = $2 WHERE id = $3
-            RETURNING username, display_name, birth_date, email, created_at`,
+            `UPDATE users SET display_name = $1, email = $2,
+                email_verified = users.email_verified AND coalesce(lower(old.email) = lower($2), false)
+            FROM (SELECT email FROM users WHERE id = $3) AS old
+            WHERE users.id = $3
+            RETURNING users.username, users.display_name, users.birth_date, users.email, users.email_verified,
+                users.created_at, lower(old.email) IS DISTINCT FROM lower(users.email) AS email_changed`,
             [displayName, email, userId]
         );
-        res.json(result.rows[0]);
+        const { email_changed: emailChanged, ...user } = result.rows[0];
+
+        if (emailChanged) {
+            const rawToken = await createVerificationToken(pool, userId);
+            try {
+                await sendVerificationMail(user.email, rawToken);
+            } catch (err) {
+                // the profile is saved; a new mail can be requested later
+                console.error("Verification mail failed:", err);
+            }
+        }
+        res.json(user);
     } catch (err) {
         if (err.code === "23505") {
             return res.status(409).json({ error: "Email already in use", code: "EMAIL_TAKEN" });
@@ -1228,6 +1654,52 @@ app.post("/api/users/logout-all", async (req, res) => {
     }
 });
 
+// Delete my account for good: { password }. Needs the password, so a stolen session can't do it;
+// failed attempts count towards the same limit as logins. Tasks, groups and my own sessions go
+// with it (their tables don't cascade); everything else that points at the account either
+// cascades or keeps a null in its place (admin log, shared session history).
+// The last admin can't leave, so there is always somebody to run the beta.
+app.delete("/api/users", authLimiter, async (req, res) => {
+    const userId = req.user.userId;
+    const password = req.body?.password;
+    if (typeof password !== "string" || !password || password.length > 1000) {
+        return res.status(400).json({ error: "Password is required", code: "WRONG_PASSWORD" });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const result = await client.query("SELECT password_hash, is_admin FROM users WHERE id = $1 FOR UPDATE", [userId]);
+        const user = result.rows[0];
+        if (!user || !await bcrypt.compare(password, user.password_hash)) {
+            await client.query("ROLLBACK");
+            return res.status(401).json({ error: "Password is wrong", code: "WRONG_PASSWORD" });
+        }
+        if (user.is_admin) {
+            const admins = await client.query("SELECT count(*)::int AS n FROM users WHERE is_admin");
+            if (admins.rows[0].n <= 1) {
+                await client.query("ROLLBACK");
+                return res.status(409).json({ error: "The last admin can't delete their account", code: "LAST_ADMIN" });
+            }
+        }
+
+        await client.query(
+            "DELETE FROM sessions WHERE user_id = $1 OR group_id IN (SELECT id FROM groups WHERE user_id = $1)",
+            [userId]
+        );
+        await client.query("DELETE FROM tasks WHERE user_id = $1", [userId]);
+        await client.query("DELETE FROM groups WHERE user_id = $1", [userId]);
+        await client.query("DELETE FROM users WHERE id = $1", [userId]);
+        await client.query("COMMIT");
+        res.json({ message: "Account deleted" });
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        serverError(res, err);
+    } finally {
+        client.release();
+    }
+});
+
 app.put("/api/tasks/:id", async (req, res) => {
     const id = idParam(req.params.id);
     const userId = req.user.userId;
@@ -1246,34 +1718,87 @@ app.put("/api/tasks/:id", async (req, res) => {
     if (typeof done !== "boolean") return invalidInput(res, "done");
     if (extras.error) return invalidInput(res, extras.error);
     if (extras.values.due_time && !due) return invalidInput(res, "due_time");
+    if (extras.values.repeat && !due) return invalidInput(res, "repeat");
 
     const values = [name, due, description, prio, done, id, userId];
-    const sets = ["name = $1", "due = $2", "description = $3", "prio = $4", "done = $5"];
+    // completed_at: set when the task becomes done (SET sees the old row), cleared when reopened
+    const sets = ["name = $1", "due = $2", "description = $3", "prio = $4", "done = $5",
+        "completed_at = CASE WHEN NOT $5 THEN NULL WHEN tasks.done THEN tasks.completed_at ELSE now() END"];
     for (const [column, value] of Object.entries(extras.values)) {
         values.push(value);
         sets.push(`${column} = $${values.length}`);
     }
-    // without a day there is no time of day either
+    // without a day there is no time of day and no repeating either
     if (!due && !("due_time" in extras.values)) sets.push("due_time = NULL");
+    if (!due && !("repeat" in extras.values)) sets.push("repeat = NULL");
 
+    const client = await pool.connect();
     try {
-        const result = await pool.query(
-            `UPDATE tasks
-            SET ${sets.join(", ")}
-            WHERE id = $6 AND id IN (${accessibleTaskIds("$7")})
-            RETURNING id`,
-            values
+        await client.query("BEGIN");
+        const before = await client.query(
+            `SELECT done FROM tasks WHERE id = $1 AND id IN (${accessibleTaskIds("$2")}) FOR UPDATE`,
+            [id, userId]
         );
-
-        if (result.rows.length === 0) {
+        if (before.rows.length === 0) {
+            await client.query("ROLLBACK");
             return res.status(404).json({ error: "Task not found" });
         }
 
-        res.json(await loadTask(id, userId));
+        await client.query(`UPDATE tasks SET ${sets.join(", ")} WHERE id = $6 AND id IN (${accessibleTaskIds("$7")})`, values);
+        const nextId = before.rows[0].done || !done ? null : await createNextRepeat(client, id);
+        await client.query("COMMIT");
+
+        const task = await loadTask(id, userId);
+        // a repeating task that was just done comes back with the next one
+        res.json(nextId ? { ...task, nextTask: await loadTask(nextId, userId) } : task);
     } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
+    } finally {
+        client.release();
     }
 });
+
+// The next one of a repeating task that was just done: the same task (owner, fields, groups)
+// on the first day of its rhythm that isn't in the past, linked by repeat_from_id. Nothing
+// when the task doesn't repeat or its next one already exists (done, reopened, done again).
+// Returns the new task's id or null.
+async function createNextRepeat(db, taskId) {
+    const result = await db.query(
+        `WITH source AS (
+            SELECT * FROM tasks
+            WHERE id = $1 AND repeat IS NOT NULL AND due IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM tasks AS next WHERE next.repeat_from_id = $1)
+        ), next_due AS (
+            -- n steps from the day itself (not step after step), so the 31st stays the 31st where it can
+            SELECT (source.due + n * CASE source.repeat
+                    WHEN 'daily' THEN interval '1 day' WHEN 'weekly' THEN interval '7 days'
+                    WHEN 'monthly' THEN interval '1 month' ELSE interval '1 year' END)::date AS due
+            FROM source, generate_series(1, 4000) AS n
+            WHERE (source.due + n * CASE source.repeat
+                    WHEN 'daily' THEN interval '1 day' WHEN 'weekly' THEN interval '7 days'
+                    WHEN 'monthly' THEN interval '1 month' ELSE interval '1 year' END)::date >= current_date
+            ORDER BY n
+            LIMIT 1
+        )
+        INSERT INTO tasks (name, due, description, prio, user_id, due_time, duration_minutes,
+            reminder_minutes, location, link, details, repeat, repeat_from_id)
+        SELECT source.name, next_due.due, source.description, source.prio, source.user_id, source.due_time,
+            source.duration_minutes, source.reminder_minutes, source.location, source.link, source.details,
+            source.repeat, source.id
+        FROM source, next_due
+        RETURNING id`,
+        [taskId]
+    );
+    const nextId = result.rows[0]?.id ?? null;
+    if (nextId) {
+        await db.query(
+            "INSERT INTO task_groups (task_id, group_id) SELECT $1, group_id FROM task_groups WHERE task_id = $2",
+            [nextId, taskId]
+        );
+    }
+    return nextId;
+}
 
 app.put("/api/groups/:id", async (req, res) => {
     const id = idParam(req.params.id);
@@ -2308,7 +2833,12 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
         );
 
         if (done !== undefined && done !== task.done) {
-            if (task.source_task_id) await pool.query("UPDATE tasks SET done = $1 WHERE id = $2", [done, task.source_task_id]);
+            if (task.source_task_id) {
+                await pool.query(
+                    "UPDATE tasks SET done = $1, completed_at = CASE WHEN $1 THEN COALESCE(completed_at, now()) END WHERE id = $2",
+                    [done, task.source_task_id]
+                );
+            }
             await logEvent(pool, session.sessionId, userId, done ? "task_done" : "task_reopened", { taskId, taskName: task.name });
         }
         if (changesAssignee && assigneeId !== task.assignee_id) {
