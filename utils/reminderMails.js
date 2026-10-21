@@ -9,6 +9,7 @@
 // Only verified accounts with beta access get mails.
 
 const { sendReminderMail } = require("./mailer");
+const { APP_ACCESS_SQL } = require("./access");
 
 const DEFAULT_TIMEZONE = "Europe/Berlin";
 const LATE_LIMIT = "15 minutes";
@@ -29,7 +30,7 @@ const PICK_DUE_REMINDERS = `
             AND tasks.due_time IS NOT NULL AND tasks.reminder_minutes IS NOT NULL
             -- reminders reach at most a week ahead; a day of slack either way for the time zones
             AND tasks.due BETWEEN current_date - 2 AND current_date + 9
-            AND users.email_verified AND (users.is_pro OR users.is_admin)
+            AND users.email_verified AND ${APP_ACCESS_SQL}
             AND starts.remind_at <= now() AND now() < starts.starts_at + interval '${LATE_LIMIT}'
             AND tasks.reminder_mailed_at IS DISTINCT FROM starts.remind_at
         FOR UPDATE OF tasks SKIP LOCKED

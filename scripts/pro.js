@@ -7,6 +7,8 @@
 //   npm run pro -- decline <username>   decline their request (they can't ask again)
 //   npm run pro -- admin <username>     make admin (sees the admin panel in the app)
 //   npm run pro -- unadmin <username>   take admin away
+//   npm run pro -- tester <username>    make tester (sees features not released to everyone yet)
+//   npm run pro -- untester <username>  take tester away
 //
 // Changes apply right away: the server checks pro on every request.
 process.env.DOTENV_CONFIG_QUIET = "true"; // no dotenv banner in the output
@@ -21,7 +23,7 @@ async function findUser(username) {
 
 const commands = {
     async list() {
-        const result = await pool.query("SELECT username, display_name, is_pro, is_admin FROM users WHERE is_pro OR is_admin ORDER BY lower(username)");
+        const result = await pool.query("SELECT username, display_name, is_pro, is_admin, is_tester FROM users WHERE is_pro OR is_admin OR is_tester ORDER BY lower(username)");
         if (result.rows.length === 0) return console.log("Nobody has pro or admin yet.");
         console.table(result.rows);
     },
@@ -77,12 +79,24 @@ const commands = {
         await pool.query("UPDATE users SET is_admin = false WHERE id = $1", [user.id]);
         console.log(`${user.username} is no longer admin.`);
     },
+
+    async tester(username) {
+        const user = await findUser(username);
+        await pool.query("UPDATE users SET is_tester = true WHERE id = $1", [user.id]);
+        console.log(`${user.username} is a tester now.`);
+    },
+
+    async untester(username) {
+        const user = await findUser(username);
+        await pool.query("UPDATE users SET is_tester = false WHERE id = $1", [user.id]);
+        console.log(`${user.username} is no longer a tester.`);
+    },
 };
 
 async function main() {
     const [command, arg] = process.argv.slice(2);
     if (!commands[command]) {
-        console.log("Usage: npm run pro -- list | requests [all] | grant <username> | revoke <username> | decline <username> | admin <username> | unadmin <username>");
+        console.log("Usage: npm run pro -- list | requests [all] | grant <username> | revoke <username> | decline <username> | admin <username> | unadmin <username> | tester <username> | untester <username>");
         process.exitCode = 1;
         return;
     }

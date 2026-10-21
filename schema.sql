@@ -68,7 +68,7 @@ CREATE TABLE public.admin_actions (
     target_username text NOT NULL,
     action text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT admin_actions_action_check CHECK ((action = ANY (ARRAY['grant_pro'::text, 'revoke_pro'::text, 'grant_admin'::text, 'revoke_admin'::text, 'approve_request'::text, 'decline_request'::text, 'reset_request'::text])))
+    CONSTRAINT admin_actions_action_check CHECK ((action = ANY (ARRAY['grant_pro'::text, 'revoke_pro'::text, 'grant_admin'::text, 'revoke_admin'::text, 'grant_tester'::text, 'revoke_tester'::text, 'approve_request'::text, 'decline_request'::text, 'reset_request'::text])))
 );
 
 --
@@ -115,6 +115,8 @@ CREATE TABLE public.broadcasts (
     body text NOT NULL,
     recipient_count integer DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    audience text DEFAULT 'all'::text NOT NULL,
+    CONSTRAINT broadcasts_audience_check CHECK ((audience = ANY (ARRAY['all'::text, 'testers'::text]))),
     CONSTRAINT broadcasts_body_check CHECK (((length(body) >= 1) AND (length(body) <= 2000))),
     CONSTRAINT broadcasts_title_check CHECK (((length(title) >= 1) AND (length(title) <= 120)))
 );
@@ -447,6 +449,17 @@ CREATE TABLE public.shared_session_tasks (
     source_task_id integer,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     assignee_id integer,
+    due date,
+    due_time time without time zone,
+    prio integer,
+    duration_minutes integer,
+    location text,
+    link text,
+    details text,
+    color text,
+    CONSTRAINT shared_session_tasks_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
+    CONSTRAINT shared_session_tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
+    CONSTRAINT shared_session_tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080)))),
     CONSTRAINT shared_session_tasks_name_check CHECK (((length(name) >= 1) AND (length(name) <= 200)))
 );
 
@@ -625,6 +638,7 @@ CREATE TABLE public.users (
     is_owner boolean DEFAULT false NOT NULL,
     timezone text,
     language text,
+    is_tester boolean DEFAULT false NOT NULL,
     CONSTRAINT users_language_check CHECK (((language IS NULL) OR (language = ANY (ARRAY['de'::text, 'en'::text]))))
 );
 

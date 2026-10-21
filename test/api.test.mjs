@@ -312,6 +312,72 @@ describe("task colours and reminders by mail", () => {
     });
 });
 
+describe("details of tasks in a shared session", () => {
+    let ann, bob, sessionId;
+    before(async () => {
+        ann = await member("detailann");
+        bob = await member("detailbob");
+        await befriend(ann, bob, "detailbob");
+        sessionId = (await call("POST", "/api/shared-sessions", { name: "Details", friendIds: [bob.id] }, ann.token)).data.id;
+        await call("POST", `/api/shared-sessions/${sessionId}/join`, null, bob.token);
+    });
+    const tasksPath = () => `/api/shared-sessions/${sessionId}/tasks`;
+    const find = (session, name) => session.tasks.find(task => task.name === name);
+
+    test("a name is enough; every other field is optional and checked like on own tasks", async () => {
+        const plain = find((await call("POST", tasksPath(), { name: "Nur Name" }, ann.token)).data, "Nur Name");
+        for (const field of ["description", "due", "due_time", "prio", "duration_minutes", "location", "link", "details", "color"]) {
+            assert.equal(plain[field], null, field);
+        }
+
+        const day = daysFromToday(2);
+        const full = find((await call("POST", tasksPath(), {
+            name: "Alles", description: "Kurz", due: day, due_time: "09:30", prio: 70, duration_minutes: 90,
+            location: "Bib", link: "https://example.com/folien", details: "Mehr", color: "teal",
+        }, ann.token)).data, "Alles");
+        assert.equal(iso(new Date(full.due)), day);
+        assert.deepEqual(
+            [full.description, full.due_time, full.prio, full.duration_minutes, full.location, full.link, full.details, full.color],
+            ["Kurz", "09:30", 70, 90, "Bib", "https://example.com/folien", "Mehr", "teal"]
+        );
+
+        for (const [field, value] of [["color", "chartreuse"], ["link", "javascript:alert(1)"], ["duration_minutes", 0], ["due", "kein Tag"], ["prio", 5000]]) {
+            assert.equal((await call("POST", tasksPath(), { name: "Falsch", [field]: value }, ann.token)).data.field, field);
+        }
+        assert.equal((await call("POST", tasksPath(), { name: "Ohne Tag", due_time: "10:00" }, ann.token)).data.field, "due_time");
+    });
+
+    test("every member changes them; what isn't sent stays, null clears, no day takes the time along", async () => {
+        const taskId = find((await call("POST", tasksPath(), { name: "Ändern", due: daysFromToday(1), due_time: "08:00", location: "Raum 1" }, ann.token)).data, "Ändern").id;
+
+        let task = find((await call("PATCH", `${tasksPath()}/${taskId}`, { name: "Geändert", color: "pink", prio: 10 }, bob.token)).data, "Geändert");
+        assert.deepEqual([task.color, task.prio, task.location, task.due_time], ["pink", 10, "Raum 1", "08:00"]);
+
+        task = find((await call("PATCH", `${tasksPath()}/${taskId}`, { due: null, location: null }, bob.token)).data, "Geändert");
+        assert.deepEqual([task.due, task.due_time, task.location, task.color], [null, null, null, "pink"]);
+
+        assert.equal((await call("PATCH", `${tasksPath()}/${taskId}`, { due_time: "07:00" }, bob.token)).data.field, "due_time");
+        assert.equal((await call("PATCH", `${tasksPath()}/${taskId}`, { name: "  " }, bob.token)).data.field, "name");
+        assert.equal((await call("PATCH", `${tasksPath()}/${taskId}`, {}, bob.token)).data.code, "NOTHING_TO_CHANGE");
+    });
+
+    test("one of my own tasks brings its details along", async () => {
+        const own = (await call("POST", "/api/tasks", {
+            name: "Eigene", prio: 40, due: daysFromToday(3), description: "Von mir", due_time: "14:00",
+            location: "Zuhause", color: "blue", reminder_minutes: 15, repeat: "weekly",
+        }, ann.token)).data;
+        const shared = find((await call("POST", tasksPath(), { taskId: own.id }, ann.token)).data, "Eigene");
+        assert.deepEqual(
+            [shared.description, shared.prio, shared.due_time, shared.location, shared.color, shared.sourceTaskId],
+            ["Von mir", 40, "14:00", "Zuhause", "blue", own.id]
+        );
+        assert.equal(iso(new Date(shared.due)), daysFromToday(3));
+        // reminders and repeating stay personal
+        assert.equal(shared.reminder_minutes, undefined);
+        assert.equal(shared.repeat, undefined);
+    });
+});
+
 describe("inbox: messages and notices", () => {
     let ann, bob, cleo, dan;
     before(async () => {
@@ -627,6 +693,73 @@ describe("the account check is cached, but changes still count at once", () => {
         for (const index of ["tasks_user_idx", "groups_user_idx", "task_groups_group_idx", "messages_unread_idx", "notifications_unread_idx"]) {
             assert.ok(names.includes(index), index);
         }
+    });
+});
+
+describe("testers", () => {
+    test("admins make testers; a broadcast can go only to testers and admins", async () => {
+        const boss = await member("testboss", { admin: true });
+        const tina = await member("testtina");
+        const paul = await member("testpaul");
+
+        assert.equal((await call("GET", "/api/me", null, tina.token)).data.isTester, false);
+        assert.equal((await call("GET", "/api/me", null, boss.token)).data.isTester, true, "admins always count as testers");
+        assert.equal((await call("PATCH", `/api/admin/users/${tina.id}`, { isTester: true }, paul.token)).status, 403);
+        assert.equal((await call("PATCH", `/api/admin/users/${tina.id}`, { isTester: "yes" }, boss.token)).status, 400);
+
+        const made = await call("PATCH", `/api/admin/users/${tina.id}`, { isTester: true }, boss.token);
+        assert.equal(made.status, 200);
+        assert.equal(made.data.isTester, true);
+        assert.equal((await call("GET", "/api/me", null, tina.token)).data.isTester, true);
+        const overview = (await call("GET", "/api/admin/overview", null, boss.token)).data;
+        assert.ok(overview.testers >= 1);
+        assert.equal(overview.actions[0].action, "grant_tester");
+
+        assert.equal((await call("POST", "/api/admin/broadcasts", { title: "Beta", body: "Neu", audience: "friends" }, boss.token)).status, 400);
+        const expected = (await sql("SELECT count(*)::int AS n FROM users WHERE is_tester OR is_admin"))[0].n;
+        const sent = (await call("POST", "/api/admin/broadcasts", { title: "Nur Tester", body: "Probier das aus.", audience: "testers" }, boss.token)).data;
+        assert.equal(sent.audience, "testers");
+        assert.equal(sent.recipientCount, expected);
+        assert.equal((await call("GET", "/api/admin/broadcasts", null, boss.token)).data[0].audience, "testers");
+        assert.ok((await call("GET", "/api/notifications", null, tina.token)).data.some(n => n.title === "Nur Tester"));
+        assert.ok(!(await call("GET", "/api/notifications", null, paul.token)).data.some(n => n.title === "Nur Tester"));
+
+        await call("PATCH", `/api/admin/users/${tina.id}`, { isTester: false }, boss.token);
+        assert.equal((await call("GET", "/api/me", null, tina.token)).data.isTester, false);
+    });
+
+    test("being a tester is enough to use the app, without pro", async () => {
+        const boss = await member("accessboss", { admin: true });
+        const tom = await member("accesstom", { pro: false });
+        assert.equal((await call("GET", "/api/tasks", null, tom.token)).data.code, "PRO_REQUIRED");
+        assert.equal((await call("POST", "/api/beta-requests", { reason: "Ich möchte gern mittesten." }, tom.token)).status, 201);
+
+        const made = (await call("PATCH", `/api/admin/users/${tom.id}`, { isTester: true }, boss.token)).data;
+        assert.equal(made.request.status, "approved", "an open request is answered");
+        assert.equal((await call("GET", "/api/tasks", null, tom.token)).status, 200);
+        const me = (await call("GET", "/api/me", null, tom.token)).data;
+        assert.equal(me.isPro, true, "may use the app");
+        assert.equal(me.isTester, true);
+        assert.equal((await call("GET", "/api/admin/users", null, tom.token)).status, 403, "still no admin");
+
+        await call("PATCH", `/api/admin/users/${tom.id}`, { isTester: false }, boss.token);
+        assert.equal((await call("GET", "/api/tasks", null, tom.token)).data.code, "PRO_REQUIRED");
+        assert.equal((await call("GET", "/api/me", null, tom.token)).data.isPro, false);
+    });
+
+    test("routes under /api/tester are only for testers and admins", async () => {
+        const boss = await member("routeboss", { admin: true });
+        const rita = await member("routerita", { pro: false });
+        const pia = await member("routepia");
+        await sql("UPDATE users SET is_tester = true WHERE username = 'routerita'");
+
+        assert.equal((await call("GET", "/api/tester/anything")).status, 401);
+        const refused = await call("GET", "/api/tester/anything", null, pia.token);
+        assert.equal(refused.status, 403, "pro alone isn't enough");
+        assert.equal(refused.data.code, "TESTER_REQUIRED");
+        // past the check (there is no such route yet)
+        assert.equal((await call("GET", "/api/tester/anything", null, rita.token)).status, 404);
+        assert.equal((await call("GET", "/api/tester/anything", null, boss.token)).status, 404);
     });
 });
 

@@ -26,6 +26,7 @@
 const { Server } = require("socket.io");
 const jwt = require("jsonwebtoken");
 const pool = require("./db");
+const { hasAppAccess } = require("./utils/access");
 
 // how many session rooms one socket can be in (a page shows one session at a time)
 const MAX_SESSION_ROOMS = 5;
@@ -45,12 +46,12 @@ async function accountFor(token, algorithm) {
         return null;
     }
     const result = await pool.query(
-        "SELECT id, is_pro, is_admin, token_version FROM users WHERE id = $1",
+        "SELECT id, is_pro, is_tester, is_admin, token_version FROM users WHERE id = $1",
         [payload.userId]
     );
     const account = result.rows[0];
     if (!account || account.token_version !== (payload.tv ?? 0)) return null;
-    if (!account.is_pro && !account.is_admin) return null;
+    if (!hasAppAccess(account)) return null;
     return account;
 }
 

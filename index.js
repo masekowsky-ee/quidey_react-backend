@@ -11,6 +11,7 @@ const { sendVerificationMail, sendContactMail, sendFeedbackMail } = require("./u
 const { startReminderMails } = require("./utils/reminderMails");
 const http = require("node:http");
 const realtime = require("./realtime");
+const { hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -157,7 +158,7 @@ async function loadAccount(userId) {
     const cached = accountCache.get(userId);
     if (cached && Date.now() - cached.at < ACCOUNT_CACHE_MS) return cached.account;
     const result = await pool.query(
-        "SELECT id, username, is_pro, is_admin, token_version FROM users WHERE id = $1",
+        "SELECT id, username, is_pro, is_tester, is_admin, token_version FROM users WHERE id = $1",
         [userId]
     );
     const account = result.rows[0] ?? null;
@@ -213,12 +214,12 @@ app.use("/api/friends", authenticateToken);
 app.use("/api/shared-sessions", authenticateToken);
 app.use("/api/task-shares", authenticateToken);
 
-// Closed beta: the app's data is only for pro users. Checked against the account on every request
-// (not stored in the token; see loadAccount), so granting or taking away pro works right away.
+// Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
+// Checked against the account on every request (not stored in the token; see loadAccount), so
+// granting or taking away pro / tester works right away.
 // /api/me, /api/users (own account) and /api/beta-requests stay open, for the beta screen.
 function requirePro(req, res, next) {
-    // admins always get in, so they can't lock themselves out of the admin panel
-    if (!req.account.is_pro && !req.account.is_admin) {
+    if (!hasAppAccess(req.account)) {
         return res.status(403).json({ error: "Quidey is in closed beta", code: "PRO_REQUIRED" });
     }
     next();
@@ -228,6 +229,18 @@ app.use(
     ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares"],
     requirePro
 );
+
+// Features not released to everyone yet: only testers (and admins). Every route under
+// /api/tester/... is protected by this; for a single route elsewhere use
+// app.get("/api/x", authenticateToken, requireTester, handler).
+function requireTester(req, res, next) {
+    if (!hasTesterAccess(req.account)) {
+        return res.status(403).json({ error: "Only for testers", code: "TESTER_REQUIRED" });
+    }
+    next();
+}
+
+app.use("/api/tester", authenticateToken, requireTester);
 
 // Overall limit per account (or per IP before signing in): plenty for the app, which polls
 // every few seconds, but stops scripts from hammering the API
@@ -335,9 +348,9 @@ const TASK_EXTRAS = {
     // also remind by mail (only the owner can change it, see PUT /api/tasks/:id)
     reminder_email: (value) => (typeof value === "boolean" ? value : undefined),
 };
-function readTaskExtras(body) {
+function readTaskExtras(body, fields = TASK_EXTRAS) {
     const values = {};
-    for (const [field, clean] of Object.entries(TASK_EXTRAS)) {
+    for (const [field, clean] of Object.entries(fields)) {
         if (body?.[field] === undefined) continue;
         const value = clean(body[field]);
         if (value === undefined) return { error: field };
@@ -345,6 +358,20 @@ function readTaskExtras(body) {
     }
     return { values };
 }
+
+// The optional fields of a task in a shared session: the same as on one's own tasks, except
+// the personal ones (reminders and repeating). Read with readTaskExtras(body, SHARED_TASK_FIELDS).
+const SHARED_TASK_FIELDS = {
+    description: (value) => cleanText(value, TASK_DESCRIPTION_MAX),
+    due: cleanDate,
+    prio: cleanPrio,
+    due_time: TASK_EXTRAS.due_time,
+    duration_minutes: TASK_EXTRAS.duration_minutes,
+    location: TASK_EXTRAS.location,
+    link: TASK_EXTRAS.link,
+    details: TASK_EXTRAS.details,
+    color: TASK_EXTRAS.color,
+};
 
 // Ids of the tasks a user may see and change: their own, and the ones shared with them that
 // they accepted. `param` is the query parameter holding the user id, e.g. "$2".
@@ -631,12 +658,13 @@ app.get("/api/sessions/:id/tasks", async (req, res) => {
 });
 
 // Who I am and whether I may use the app:
-// { userId, username, isPro (may use the app; admins always may), isAdmin,
+// { userId, username, isPro (may use the app: pro, tester or admin), isAdmin,
+//   isTester (sees features not released to everyone yet; admins always do),
 //   adminPendingCount (admins only: open beta requests), betaRequest: { status, reason, createdAt } | null }
 app.get("/api/me" , authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
-            `SELECT users.username, users.is_pro, users.is_admin,
+            `SELECT users.username, users.is_pro, users.is_admin, users.is_tester,
                 beta_access_requests.status, beta_access_requests.reason, beta_access_requests.created_at,
                 CASE WHEN users.is_admin
                     THEN (SELECT count(*) FROM beta_access_requests WHERE status = 'pending')::int END AS pending_count
@@ -651,8 +679,9 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
         res.json({
             userId: req.user.userId,
             username: row.username,
-            isPro: row.is_pro || row.is_admin,
+            isPro: hasAppAccess(row),
             isAdmin: row.is_admin,
+            isTester: hasTesterAccess(row),
             ...(row.is_admin ? { adminPendingCount: row.pending_count } : {}),
             betaRequest: row.status ? { status: row.status, reason: row.reason, createdAt: row.created_at } : null,
         });
@@ -669,9 +698,9 @@ app.post("/api/beta-requests", authenticateToken, async (req, res) => {
     if (reason.length > 1000) return res.status(400).json({ error: "The reason is too long", code: "REASON_TOO_LONG" });
 
     try {
-        const user = await pool.query("SELECT is_pro, is_admin FROM users WHERE id = $1", [userId]);
+        const user = await pool.query("SELECT is_pro, is_tester, is_admin FROM users WHERE id = $1", [userId]);
         if (user.rows.length === 0) return res.status(401).json({ error: "User not found" });
-        if (user.rows[0].is_pro || user.rows[0].is_admin) return res.status(409).json({ error: "You already have access", code: "ALREADY_PRO" });
+        if (hasAppAccess(user.rows[0])) return res.status(409).json({ error: "You already have access", code: "ALREADY_PRO" });
 
         const result = await pool.query(
             `INSERT INTO beta_access_requests (user_id, reason) VALUES ($1, $2)
@@ -1443,7 +1472,7 @@ async function logAdminAction(db, admin, target, action) {
 // A user as the admin panel shows them (incl. email, which only admins ever see)
 const ADMIN_USER_SELECT = `
     SELECT users.id, users.username, users.display_name, users.email, users.created_at,
-        users.is_pro, users.is_admin,
+        users.is_pro, users.is_admin, users.is_tester,
         beta_access_requests.status AS request_status, beta_access_requests.reason AS request_reason,
         beta_access_requests.created_at AS request_created_at, beta_access_requests.decided_at AS request_decided_at
     FROM users
@@ -1458,6 +1487,7 @@ const toAdminUser = (row) => ({
     createdAt: row.created_at,
     isPro: row.is_pro,
     isAdmin: row.is_admin,
+    isTester: row.is_tester,
     request: row.request_status ? {
         status: row.request_status,
         reason: row.request_reason,
@@ -1472,15 +1502,18 @@ async function loadAdminUser(db, id) {
 }
 
 // Numbers for the overview and the latest admin actions
-// ---------- Broadcasts: a notice to every account ----------
-// { title, body }: lands in every user's inbox (Meldungen), logged in broadcasts and admin_actions.
+// ---------- Broadcasts: a notice to every account (or only the testers) ----------
+// { title, body, audience: 'all' (default) | 'testers' }: lands in the inbox (Meldungen) of every
+// user, or of the testers and admins only; logged in broadcasts.
+const BROADCAST_AUDIENCES = ["all", "testers"];
+
 app.get("/api/admin/broadcasts", async (req, res) => {
     try {
         const result = await pool.query(
-            "SELECT id, admin_username, title, body, recipient_count, created_at FROM broadcasts ORDER BY created_at DESC LIMIT 50"
+            "SELECT id, admin_username, title, body, audience, recipient_count, created_at FROM broadcasts ORDER BY created_at DESC LIMIT 50"
         );
         res.json(result.rows.map(row => ({
-            id: row.id, admin: row.admin_username, title: row.title, body: row.body,
+            id: row.id, admin: row.admin_username, title: row.title, body: row.body, audience: row.audience,
             recipientCount: row.recipient_count, createdAt: row.created_at,
         })));
     } catch (err) {
@@ -1493,23 +1526,26 @@ app.post("/api/admin/broadcasts", async (req, res) => {
     const body = typeof req.body?.body === "string" ? req.body.body.trim() : "";
     if (!title || title.length > 120) return adminFail(res, 400, "INVALID_TITLE", "Title must be 1-120 characters");
     if (!body || body.length > 2000) return adminFail(res, 400, "INVALID_BODY", "Text must be 1-2000 characters");
+    const audience = req.body?.audience ?? "all";
+    if (!BROADCAST_AUDIENCES.includes(audience)) return adminFail(res, 400, "INVALID_AUDIENCE", "Audience must be 'all' or 'testers'");
 
     const client = await pool.connect();
     try {
         await client.query("BEGIN");
         const broadcast = (await client.query(
-            "INSERT INTO broadcasts (admin_id, admin_username, title, body) VALUES ($1, $2, $3, $4) RETURNING id, created_at",
-            [req.admin.id, req.admin.username, title, body]
+            "INSERT INTO broadcasts (admin_id, admin_username, title, body, audience) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at",
+            [req.admin.id, req.admin.username, title, body, audience]
         )).rows[0];
         const sent = await client.query(
             `INSERT INTO notifications (user_id, kind, title, body, broadcast_id)
             SELECT id, 'broadcast', $1, $2, $3 FROM users
+            WHERE $4 = 'all' OR is_tester OR is_admin
             RETURNING id, user_id, kind, title, body, created_at`,
-            [title, body, broadcast.id]
+            [title, body, broadcast.id, audience]
         );
         await client.query("UPDATE broadcasts SET recipient_count = $1 WHERE id = $2", [sent.rowCount, broadcast.id]);
         await client.query("COMMIT");
-        res.status(201).json({ id: broadcast.id, recipientCount: sent.rowCount, createdAt: broadcast.created_at });
+        res.status(201).json({ id: broadcast.id, audience, recipientCount: sent.rowCount, createdAt: broadcast.created_at });
 
         // everybody who has the app open sees it right away (each with their own notification id)
         for (const row of sent.rows) {
@@ -1530,8 +1566,9 @@ app.get("/api/admin/overview", async (req, res) => {
         const [counts, actions] = await Promise.all([
             pool.query(`SELECT
                 (SELECT count(*) FROM users)::int AS users,
-                (SELECT count(*) FROM users WHERE is_pro OR is_admin)::int AS with_access,
+                (SELECT count(*) FROM users WHERE ${APP_ACCESS_SQL})::int AS with_access,
                 (SELECT count(*) FROM users WHERE is_admin)::int AS admins,
+                (SELECT count(*) FROM users WHERE is_tester)::int AS testers,
                 (SELECT count(*) FROM beta_access_requests WHERE status = 'pending')::int AS pending_requests,
                 (SELECT count(*) FROM users WHERE created_at > now() - interval '7 days')::int AS new_this_week,
                 (SELECT count(*) FROM shared_sessions WHERE ended_at IS NULL)::int AS open_shared_sessions`),
@@ -1543,6 +1580,7 @@ app.get("/api/admin/overview", async (req, res) => {
             users: c.users,
             withAccess: c.with_access,
             admins: c.admins,
+            testers: c.testers,
             pendingRequests: c.pending_requests,
             newThisWeek: c.new_this_week,
             openSharedSessions: c.open_shared_sessions,
@@ -1636,21 +1674,21 @@ app.get("/api/admin/users", async (req, res) => {
     }
 });
 
-// Give or take away pro / admin: { isPro?, isAdmin? }. Not for yourself, and owners keep admin.
+// Give or take away pro / admin / tester: { isPro?, isAdmin?, isTester? }. Not for yourself, and owners keep admin.
 app.patch("/api/admin/users/:id", async (req, res) => {
     const targetId = idParam(req.params.id);
-    const { isPro, isAdmin } = req.body ?? {};
+    const { isPro, isAdmin, isTester } = req.body ?? {};
     if (!targetId) return adminFail(res, 404, "USER_NOT_FOUND", "User not found");
     if (targetId === req.admin.id) return adminFail(res, 400, "SELF", "You can't change your own access");
-    if ((isPro !== undefined && typeof isPro !== "boolean") || (isAdmin !== undefined && typeof isAdmin !== "boolean")
-        || (isPro === undefined && isAdmin === undefined)) {
-        return adminFail(res, 400, "INVALID_CHANGE", "Send isPro and/or isAdmin as true or false");
+    const changes = [isPro, isAdmin, isTester];
+    if (changes.some(value => value !== undefined && typeof value !== "boolean") || changes.every(value => value === undefined)) {
+        return adminFail(res, 400, "INVALID_CHANGE", "Send isPro, isAdmin and/or isTester as true or false");
     }
 
     const client = await pool.connect();
     try {
         await client.query("BEGIN");
-        const before = await client.query("SELECT id, username, is_pro, is_admin, is_owner FROM users WHERE id = $1 FOR UPDATE", [targetId]);
+        const before = await client.query("SELECT id, username, is_pro, is_admin, is_tester, is_owner FROM users WHERE id = $1 FOR UPDATE", [targetId]);
         const target = before.rows[0];
         if (!target) {
             await client.query("ROLLBACK");
@@ -1664,22 +1702,26 @@ app.patch("/api/admin/users/:id", async (req, res) => {
         if (isPro !== undefined && isPro !== target.is_pro) {
             await client.query("UPDATE users SET is_pro = $1 WHERE id = $2", [isPro, targetId]);
             await logAdminAction(client, req.admin, target, isPro ? "grant_pro" : "revoke_pro");
-            // an open request is answered by giving pro
-            if (isPro) {
-                await client.query(
-                    "UPDATE beta_access_requests SET status = 'approved', decided_at = now() WHERE user_id = $1 AND status = 'pending'",
-                    [targetId]
-                );
-            }
         }
         if (isAdmin !== undefined && isAdmin !== target.is_admin) {
             await client.query("UPDATE users SET is_admin = $1 WHERE id = $2", [isAdmin, targetId]);
             await logAdminAction(client, req.admin, target, isAdmin ? "grant_admin" : "revoke_admin");
         }
+        if (isTester !== undefined && isTester !== target.is_tester) {
+            await client.query("UPDATE users SET is_tester = $1 WHERE id = $2", [isTester, targetId]);
+            await logAdminAction(client, req.admin, target, isTester ? "grant_tester" : "revoke_tester");
+        }
+        // giving pro or tester answers an open request
+        if (isPro || isTester) {
+            await client.query(
+                "UPDATE beta_access_requests SET status = 'approved', decided_at = now() WHERE user_id = $1 AND status = 'pending'",
+                [targetId]
+            );
+        }
         await client.query("COMMIT");
         forgetAccount(targetId);
-        // without pro (and not admin) the sockets lose access too; with it they connect again
-        if (isPro === false || isAdmin === false) realtime.disconnectUser(targetId);
+        // without access the sockets lose it too; whoever still has it connects again
+        if (isPro === false || isAdmin === false || isTester === false) realtime.disconnectUser(targetId);
         res.json(await loadAdminUser(pool, targetId));
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
@@ -2624,6 +2666,9 @@ async function loadSharedSession(sessionId, userId) {
         pool.query(
             `SELECT shared_session_tasks.id, shared_session_tasks.name, shared_session_tasks.description,
                 shared_session_tasks.done, shared_session_tasks.source_task_id, shared_session_tasks.created_at,
+                shared_session_tasks.due, to_char(shared_session_tasks.due_time, 'HH24:MI') AS due_time,
+                shared_session_tasks.prio, shared_session_tasks.duration_minutes, shared_session_tasks.location,
+                shared_session_tasks.link, shared_session_tasks.details, shared_session_tasks.color,
                 users.id AS adder_id, users.username AS adder_username, users.display_name AS adder_display_name,
                 assignee.id AS assignee_id, assignee.username AS assignee_username, assignee.display_name AS assignee_display_name
             FROM shared_session_tasks
@@ -2702,6 +2747,14 @@ async function loadSharedSession(sessionId, userId) {
                 name: task.name,
                 description: task.description,
                 done: task.done,
+                due: task.due,
+                due_time: task.due_time,
+                prio: task.prio,
+                duration_minutes: task.duration_minutes,
+                location: task.location,
+                link: task.link,
+                details: task.details,
+                color: task.color,
                 addedBy: task.adder_id ? publicUser(task, "adder_") : null,
                 assignee: task.assignee_id ? publicUser(task, "assignee_") : null,
                 // only the person who shared it can do anything with their own task's id
@@ -2981,7 +3034,8 @@ app.delete("/api/shared-sessions/:id/members/:userId", async (req, res) => {
     }
 });
 
-// Add a task: { taskId } shares one of my own tasks, { name, description } creates a new one
+// Add a task: { taskId } shares one of my own tasks (with its details), { name, ... } creates
+// a new one; besides the name every field of SHARED_TASK_FIELDS is optional.
 app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
     const userId = req.user.userId;
     try {
@@ -2991,22 +3045,30 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
         let task;
         if (req.body?.taskId !== undefined) {
             const own = await pool.query(
-                "SELECT id, name, description FROM tasks WHERE id = $1 AND user_id = $2",
+                `SELECT id, name, description, due, to_char(due_time, 'HH24:MI') AS due_time, prio,
+                    duration_minutes, location, link, details, color
+                FROM tasks WHERE id = $1 AND user_id = $2`,
                 [idParam(req.body.taskId), userId]
             );
             if (own.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
-            task = { name: own.rows[0].name, description: own.rows[0].description, sourceTaskId: own.rows[0].id };
+            const { id, name, ...fields } = own.rows[0];
+            // older tasks may have a priority above what the form allows; it comes along as it is
+            task = { name, fields, sourceTaskId: id };
         } else {
-            const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, 200) : "";
+            const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, TASK_NAME_MAX) : "";
             if (!name) return fail(res, 400, "NAME_REQUIRED", "Name is required");
-            const description = typeof req.body?.description === "string" ? req.body.description.trim() || null : null;
-            task = { name, description, sourceTaskId: null };
+            const fields = readTaskExtras(req.body, SHARED_TASK_FIELDS);
+            if (fields.error) return invalidInput(res, fields.error);
+            if (fields.values.due_time && !fields.values.due) return invalidInput(res, "due_time");
+            task = { name, fields: fields.values, sourceTaskId: null };
         }
 
+        const columns = ["session_id", "name", "added_by", "source_task_id", ...Object.keys(task.fields)];
+        const values = [session.sessionId, task.name, userId, task.sourceTaskId, ...Object.values(task.fields)];
         const created = await pool.query(
-            `INSERT INTO shared_session_tasks (session_id, name, description, added_by, source_task_id)
-            VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-            [session.sessionId, task.name, task.description, userId, task.sourceTaskId]
+            `INSERT INTO shared_session_tasks (${columns.join(", ")})
+            VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING id`,
+            values
         );
         await logEvent(pool, session.sessionId, userId, "task_added", { taskId: created.rows[0].id, taskName: task.name });
         await sendSharedSession(res, session.sessionId, userId, 201);
@@ -3019,17 +3081,24 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
     }
 });
 
-// Change a task: { done?, assigneeId? (a member's id, or null for nobody) }.
-// Done is also set on the personal task it was shared from.
+// Change a task: { done?, assigneeId? (a member's id, or null for nobody), name?, and any of
+// SHARED_TASK_FIELDS (null clears one) }; what isn't sent stays as it is. Every member may change
+// them. Done is also set on the personal task it was shared from, the details are not.
 app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
     const userId = req.user.userId;
     const taskId = idParam(req.params.taskId);
     const { done } = req.body ?? {};
     const changesAssignee = req.body && "assigneeId" in req.body;
     const assigneeId = changesAssignee && req.body.assigneeId !== null ? idParam(req.body.assigneeId) : null;
+    const name = req.body?.name === undefined ? undefined : cleanText(req.body.name, TASK_NAME_MAX);
+    const fields = readTaskExtras(req.body, SHARED_TASK_FIELDS);
 
     if (done !== undefined && typeof done !== "boolean") return fail(res, 400, "DONE_REQUIRED", "done must be true or false");
-    if (done === undefined && !changesAssignee) return fail(res, 400, "NOTHING_TO_CHANGE", "Send done or assigneeId");
+    if (name === null || (req.body?.name !== undefined && name === undefined)) return invalidInput(res, "name");
+    if (fields.error) return invalidInput(res, fields.error);
+    if (done === undefined && !changesAssignee && name === undefined && Object.keys(fields.values).length === 0) {
+        return fail(res, 400, "NOTHING_TO_CHANGE", "Send done, assigneeId or a field");
+    }
     if (changesAssignee && req.body.assigneeId !== null && !assigneeId) return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
 
     try {
@@ -3037,23 +3106,31 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
         if (!session) return;
 
         const before = await pool.query(
-            "SELECT name, done, assignee_id, source_task_id FROM shared_session_tasks WHERE id = $1 AND session_id = $2",
+            "SELECT name, done, assignee_id, source_task_id, due FROM shared_session_tasks WHERE id = $1 AND session_id = $2",
             [taskId, session.sessionId]
         );
         if (before.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
         const task = before.rows[0];
+
+        // a time of day needs a day; taking the day away takes the time along
+        const due = "due" in fields.values ? fields.values.due : task.due;
+        if (fields.values.due_time && !due) return invalidInput(res, "due_time");
+        if (!due && !("due_time" in fields.values)) fields.values.due_time = null;
 
         if (assigneeId) {
             const member = await getMembership(session.sessionId, assigneeId);
             if (member?.status !== "joined") return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
         }
 
-        await pool.query(
-            `UPDATE shared_session_tasks
-            SET done = COALESCE($1, done), assignee_id = CASE WHEN $2 THEN $3::int ELSE assignee_id END
-            WHERE id = $4`,
-            [done ?? null, changesAssignee, assigneeId, taskId]
-        );
+        const values = [done ?? null, changesAssignee, assigneeId, taskId, name ?? null];
+        const sets = ["done = COALESCE($1, done)", "assignee_id = CASE WHEN $2 THEN $3::int ELSE assignee_id END",
+            "name = COALESCE($5, name)"];
+        for (const [column, value] of Object.entries(fields.values)) {
+            values.push(value);
+            sets.push(`${column} = $${values.length}`);
+        }
+        await pool.query(`UPDATE shared_session_tasks SET ${sets.join(", ")} WHERE id = $4`, values);
+        if (name) task.name = name;
 
         if (done !== undefined && done !== task.done) {
             if (task.source_task_id) {
