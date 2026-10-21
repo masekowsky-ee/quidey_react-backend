@@ -26,6 +26,8 @@
 
 set -euo pipefail
 
+cd /   # the app user can't enter the caller's home directory (find warns otherwise)
+
 QUIDEY_DIR="${QUIDEY_DIR:-/srv/quidey/backend}"
 QUIDEY_DB="${QUIDEY_DB:-quidey}"
 APP_USER="${APP_USER:-quidey}"
