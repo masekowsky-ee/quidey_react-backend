@@ -34,6 +34,24 @@ SET row_security = off;
 
 -- *not* creating schema, since initdb creates it
 
+--
+-- Name: users_protect_owner(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.users_protect_owner() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.is_owner IS DISTINCT FROM (CASE WHEN TG_OP = 'INSERT' THEN false ELSE OLD.is_owner END)
+        AND current_setting('is_superuser') <> 'on' THEN
+        RAISE EXCEPTION 'is_owner can only be changed by hand as a database superuser';
+    END IF;
+    IF NEW.is_owner THEN
+        NEW.is_admin := true;
+    END IF;
+    RETURN NEW;
+END $$;
+
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
@@ -84,6 +102,40 @@ CREATE TABLE public.beta_access_requests (
     CONSTRAINT beta_access_requests_reason_check CHECK (((length(reason) >= 10) AND (length(reason) <= 1000))),
     CONSTRAINT beta_access_requests_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'declined'::text])))
 );
+
+--
+-- Name: broadcasts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.broadcasts (
+    id integer NOT NULL,
+    admin_id integer,
+    admin_username text,
+    title text NOT NULL,
+    body text NOT NULL,
+    recipient_count integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT broadcasts_body_check CHECK (((length(body) >= 1) AND (length(body) <= 2000))),
+    CONSTRAINT broadcasts_title_check CHECK (((length(title) >= 1) AND (length(title) <= 120)))
+);
+
+--
+-- Name: broadcasts_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.broadcasts_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: broadcasts_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.broadcasts_id_seq OWNED BY public.broadcasts.id;
 
 --
 -- Name: email_verification_tokens; Type: TABLE; Schema: public; Owner: -
@@ -178,6 +230,39 @@ CREATE SEQUENCE public.groups_id_seq
 ALTER SEQUENCE public.groups_id_seq OWNED BY public.groups.id;
 
 --
+-- Name: messages; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.messages (
+    id integer NOT NULL,
+    sender_id integer NOT NULL,
+    recipient_id integer NOT NULL,
+    body text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    read_at timestamp with time zone,
+    CONSTRAINT messages_body_check CHECK (((length(body) >= 1) AND (length(body) <= 2000))),
+    CONSTRAINT messages_check CHECK ((sender_id <> recipient_id))
+);
+
+--
+-- Name: messages_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.messages_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: messages_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.messages_id_seq OWNED BY public.messages.id;
+
+--
 -- Name: notes; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -205,6 +290,43 @@ CREATE SEQUENCE public.notes_id_seq
 --
 
 ALTER SEQUENCE public.notes_id_seq OWNED BY public.notes.id;
+
+--
+-- Name: notifications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notifications (
+    id integer NOT NULL,
+    user_id integer NOT NULL,
+    kind text NOT NULL,
+    title text NOT NULL,
+    body text NOT NULL,
+    broadcast_id integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    read_at timestamp with time zone,
+    data jsonb,
+    CONSTRAINT notifications_body_check CHECK (((length(body) >= 1) AND (length(body) <= 2000))),
+    CONSTRAINT notifications_kind_check CHECK ((kind = ANY (ARRAY['broadcast'::text, 'system'::text, 'task_assigned'::text]))),
+    CONSTRAINT notifications_title_check CHECK (((length(title) >= 1) AND (length(title) <= 120)))
+);
+
+--
+-- Name: notifications_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.notifications_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: notifications_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.notifications_id_seq OWNED BY public.notifications.id;
 
 --
 -- Name: session_shared_tasks; Type: TABLE; Schema: public; Owner: -
@@ -451,11 +573,15 @@ CREATE TABLE public.tasks (
     repeat text,
     repeat_from_id integer,
     completed_at timestamp with time zone,
+    color text,
+    reminder_email boolean DEFAULT false NOT NULL,
+    reminder_mailed_at timestamp with time zone,
+    CONSTRAINT tasks_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
     CONSTRAINT tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
-    CONSTRAINT tasks_repeat_check CHECK (((repeat IS NULL) OR (repeat = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text, 'yearly'::text])))),
-    CONSTRAINT tasks_repeat_needs_due_check CHECK (((repeat IS NULL) OR (due IS NOT NULL))),
     CONSTRAINT tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080)))),
-    CONSTRAINT tasks_reminder_minutes_check CHECK (((reminder_minutes IS NULL) OR ((reminder_minutes >= 0) AND (reminder_minutes <= 10080))))
+    CONSTRAINT tasks_reminder_minutes_check CHECK (((reminder_minutes IS NULL) OR ((reminder_minutes >= 0) AND (reminder_minutes <= 10080)))),
+    CONSTRAINT tasks_repeat_check CHECK (((repeat IS NULL) OR (repeat = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text, 'yearly'::text])))),
+    CONSTRAINT tasks_repeat_needs_due_check CHECK (((repeat IS NULL) OR (due IS NOT NULL)))
 );
 
 --
@@ -487,13 +613,17 @@ CREATE TABLE public.users (
     created_at timestamp without time zone DEFAULT now(),
     display_name text,
     birth_date date,
-    email text,
+    email text NOT NULL,
     is_pro boolean DEFAULT false NOT NULL,
     is_admin boolean DEFAULT false NOT NULL,
     token_version integer DEFAULT 0 NOT NULL,
     email_verified boolean DEFAULT false NOT NULL,
     terms_accepted_at timestamp with time zone,
-    privacy_accepted_at timestamp with time zone
+    privacy_accepted_at timestamp with time zone,
+    is_owner boolean DEFAULT false NOT NULL,
+    timezone text,
+    language text,
+    CONSTRAINT users_language_check CHECK (((language IS NULL) OR (language = ANY (ARRAY['de'::text, 'en'::text]))))
 );
 
 --
@@ -521,6 +651,12 @@ ALTER SEQUENCE public.users_id_seq OWNED BY public.users.id;
 ALTER TABLE ONLY public.admin_actions ALTER COLUMN id SET DEFAULT nextval('public.admin_actions_id_seq'::regclass);
 
 --
+-- Name: broadcasts id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.broadcasts ALTER COLUMN id SET DEFAULT nextval('public.broadcasts_id_seq'::regclass);
+
+--
 -- Name: email_verification_tokens id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -539,10 +675,22 @@ ALTER TABLE ONLY public.friendships ALTER COLUMN id SET DEFAULT nextval('public.
 ALTER TABLE ONLY public.groups ALTER COLUMN id SET DEFAULT nextval('public.groups_id_seq'::regclass);
 
 --
+-- Name: messages id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.messages ALTER COLUMN id SET DEFAULT nextval('public.messages_id_seq'::regclass);
+
+--
 -- Name: notes id; Type: DEFAULT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.notes ALTER COLUMN id SET DEFAULT nextval('public.notes_id_seq'::regclass);
+
+--
+-- Name: notifications id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications ALTER COLUMN id SET DEFAULT nextval('public.notifications_id_seq'::regclass);
 
 --
 -- Name: sessions id; Type: DEFAULT; Schema: public; Owner: -
@@ -601,6 +749,13 @@ ALTER TABLE ONLY public.beta_access_requests
     ADD CONSTRAINT beta_access_requests_pkey PRIMARY KEY (user_id);
 
 --
+-- Name: broadcasts broadcasts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.broadcasts
+    ADD CONSTRAINT broadcasts_pkey PRIMARY KEY (id);
+
+--
 -- Name: email_verification_tokens email_verification_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -629,11 +784,25 @@ ALTER TABLE ONLY public.groups
     ADD CONSTRAINT groups_pkey PRIMARY KEY (id);
 
 --
+-- Name: messages messages_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.messages
+    ADD CONSTRAINT messages_pkey PRIMARY KEY (id);
+
+--
 -- Name: notes notes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.notes
     ADD CONSTRAINT notes_pkey PRIMARY KEY (id);
+
+--
+-- Name: notifications notifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_pkey PRIMARY KEY (id);
 
 --
 -- Name: session_shared_tasks session_shared_tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -777,6 +946,24 @@ CREATE UNIQUE INDEX friendships_pair_unique ON public.friendships USING btree (L
 CREATE INDEX friendships_requester_status_idx ON public.friendships USING btree (requester_id, status);
 
 --
+-- Name: messages_recipient_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX messages_recipient_idx ON public.messages USING btree (recipient_id, created_at);
+
+--
+-- Name: messages_sender_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX messages_sender_idx ON public.messages USING btree (sender_id, created_at);
+
+--
+-- Name: notifications_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notifications_user_idx ON public.notifications USING btree (user_id, created_at);
+
+--
 -- Name: shared_session_events_session_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -807,6 +994,12 @@ CREATE UNIQUE INDEX shared_session_tasks_source_unique ON public.shared_session_
 CREATE INDEX task_shares_user_status_idx ON public.task_shares USING btree (user_id, status);
 
 --
+-- Name: tasks_repeat_from_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tasks_repeat_from_idx ON public.tasks USING btree (repeat_from_id);
+
+--
 -- Name: users_email_lower_unique; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -817,6 +1010,12 @@ CREATE UNIQUE INDEX users_email_lower_unique ON public.users USING btree (lower(
 --
 
 CREATE UNIQUE INDEX users_username_lower_unique ON public.users USING btree (lower(username));
+
+--
+-- Name: users users_protect_owner; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER users_protect_owner BEFORE INSERT OR UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.users_protect_owner();
 
 --
 -- Name: admin_actions admin_actions_admin_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -838,6 +1037,13 @@ ALTER TABLE ONLY public.admin_actions
 
 ALTER TABLE ONLY public.beta_access_requests
     ADD CONSTRAINT beta_access_requests_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: broadcasts broadcasts_admin_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.broadcasts
+    ADD CONSTRAINT broadcasts_admin_id_fkey FOREIGN KEY (admin_id) REFERENCES public.users(id) ON DELETE SET NULL;
 
 --
 -- Name: email_verification_tokens email_verification_tokens_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -868,11 +1074,39 @@ ALTER TABLE ONLY public.groups
     ADD CONSTRAINT groups_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
 
 --
+-- Name: messages messages_recipient_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.messages
+    ADD CONSTRAINT messages_recipient_id_fkey FOREIGN KEY (recipient_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: messages messages_sender_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.messages
+    ADD CONSTRAINT messages_sender_id_fkey FOREIGN KEY (sender_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
 -- Name: notes notes_task_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.notes
     ADD CONSTRAINT notes_task_id_fkey FOREIGN KEY (task_id) REFERENCES public.tasks(id) ON DELETE CASCADE;
+
+--
+-- Name: notifications notifications_broadcast_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_broadcast_id_fkey FOREIGN KEY (broadcast_id) REFERENCES public.broadcasts(id) ON DELETE CASCADE;
+
+--
+-- Name: notifications notifications_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
 -- Name: session_shared_tasks session_shared_tasks_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -1057,6 +1291,13 @@ ALTER TABLE ONLY public.task_shares
     ADD CONSTRAINT task_shares_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
+-- Name: tasks tasks_repeat_from_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tasks
+    ADD CONSTRAINT tasks_repeat_from_id_fkey FOREIGN KEY (repeat_from_id) REFERENCES public.tasks(id) ON DELETE SET NULL;
+
+--
 -- Name: tasks tasks_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1064,45 +1305,29 @@ ALTER TABLE ONLY public.tasks
     ADD CONSTRAINT tasks_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
 
 --
+-- Indexes from migration 015 (performance)
+--
+
+CREATE INDEX tasks_user_idx ON public.tasks USING btree (user_id);
+CREATE INDEX groups_user_idx ON public.groups USING btree (user_id);
+CREATE INDEX notes_task_idx ON public.notes USING btree (task_id);
+CREATE INDEX sessions_user_idx ON public.sessions USING btree (user_id);
+CREATE INDEX sessions_group_idx ON public.sessions USING btree (group_id);
+CREATE INDEX session_tasks_task_idx ON public.session_tasks USING btree (task_id);
+CREATE INDEX task_groups_group_idx ON public.task_groups USING btree (group_id);
+CREATE INDEX shared_sessions_owner_idx ON public.shared_sessions USING btree (owner_id);
+CREATE INDEX shared_session_time_user_idx ON public.shared_session_time USING btree (user_id);
+CREATE INDEX messages_unread_idx ON public.messages USING btree (recipient_id, sender_id) WHERE (read_at IS NULL);
+CREATE INDEX notifications_unread_idx ON public.notifications USING btree (user_id) WHERE (read_at IS NULL);
+
+--
+-- Index from migration 016 (reminder mails)
+--
+
+CREATE INDEX tasks_reminder_email_idx ON public.tasks USING btree (due) WHERE (reminder_email AND (NOT done));
+
+
+--
 -- PostgreSQL database dump complete
 --
 
--- 012: next occurrence of a repeating task points at the one it came from
-ALTER TABLE ONLY public.tasks
-    ADD CONSTRAINT tasks_repeat_from_id_fkey FOREIGN KEY (repeat_from_id) REFERENCES public.tasks(id) ON DELETE SET NULL;
-CREATE INDEX tasks_repeat_from_idx ON public.tasks USING btree (repeat_from_id);
-
--- 013: inbox and admin broadcasts (same as migrations/013_inbox.sql)
-CREATE TABLE public.messages (
-    id           serial PRIMARY KEY,
-    sender_id    integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-    recipient_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-    body         text NOT NULL CHECK (length(body) BETWEEN 1 AND 2000),
-    created_at   timestamp with time zone NOT NULL DEFAULT now(),
-    read_at      timestamp with time zone,
-    CHECK (sender_id <> recipient_id)
-);
-CREATE INDEX messages_recipient_idx ON public.messages (recipient_id, created_at);
-CREATE INDEX messages_sender_idx ON public.messages (sender_id, created_at);
-
-CREATE TABLE public.broadcasts (
-    id              serial PRIMARY KEY,
-    admin_id        integer REFERENCES public.users(id) ON DELETE SET NULL,
-    admin_username  text,
-    title           text NOT NULL CHECK (length(title) BETWEEN 1 AND 120),
-    body            text NOT NULL CHECK (length(body) BETWEEN 1 AND 2000),
-    recipient_count integer NOT NULL DEFAULT 0,
-    created_at      timestamp with time zone NOT NULL DEFAULT now()
-);
-
-CREATE TABLE public.notifications (
-    id           serial PRIMARY KEY,
-    user_id      integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-    kind         text NOT NULL CHECK (kind IN ('broadcast', 'system')),
-    title        text NOT NULL CHECK (length(title) BETWEEN 1 AND 120),
-    body         text NOT NULL CHECK (length(body) BETWEEN 1 AND 2000),
-    broadcast_id integer REFERENCES public.broadcasts(id) ON DELETE CASCADE,
-    created_at   timestamp with time zone NOT NULL DEFAULT now(),
-    read_at      timestamp with time zone
-);
-CREATE INDEX notifications_user_idx ON public.notifications (user_id, created_at);

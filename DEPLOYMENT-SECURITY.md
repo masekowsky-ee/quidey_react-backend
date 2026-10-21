@@ -48,6 +48,21 @@ going live, and again when the setup changes.
   everybody); wrong in the other, attackers can fake their IP and dodge the limits.
   Check: sign in with a wrong password 11 times from your phone's mobile network; your
   laptop on Wi-Fi must still be able to sign in.
+- **Live connection (Socket.IO on `/socket.io/`, same port as the API):** the proxy must pass
+  WebSocket upgrades through. Caddy's `reverse_proxy` does that by itself; nginx needs, in the
+  location for the API:
+  `proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";`
+  and a `proxy_read_timeout` above 60 s. Cloudflare passes WebSockets on its own. The socket uses
+  `CORS_ORIGINS` like the API. Without upgrades it still works (long polling), just slower.
+  Run a single Node process: with several (pm2 cluster) the live events need the Socket.IO
+  Redis adapter and sticky sessions (and the account cache in index.js would no longer hear
+  about changes made by the other processes).
+- **Compression:** let the proxy gzip/brotli the JSON answers (Caddy: `encode zstd gzip`;
+  nginx: `gzip on; gzip_types application/json;`), Node doesn't do it itself.
+- **Account cache:** pro/admin changes and sign-outs made in the app count at once. Changes made
+  with `npm run pro` or psql take up to 15 s (`ACCOUNT_CACHE_MS`), because they bypass the server.
+- **Migrations:** run `migrations/015_performance_indexes.sql` once on a database created before
+  it (the indexes make the everyday queries fast as the tables grow).
 
 ## 4. The frontend (Cloudflare)
 

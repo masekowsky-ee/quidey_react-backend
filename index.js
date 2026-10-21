@@ -8,6 +8,9 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { hashToken, createVerificationToken } = require("./utils/verificationToken");
 const { sendVerificationMail, sendContactMail, sendFeedbackMail } = require("./utils/mailer");
+const { startReminderMails } = require("./utils/reminderMails");
+const http = require("node:http");
+const realtime = require("./realtime");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -33,6 +36,8 @@ function serverError(res, err) {
 }
 
 app.disable("x-powered-by");
+// every answer is Cache-Control: no-store, so an ETag (a hash of each body) would only cost time
+app.set("etag", false);
 
 // The API only answers with JSON: forbid everything else a browser could do with a response
 app.use((req, res, next) => {
@@ -139,6 +144,34 @@ function signToken(user) {
     );
 }
 
+// The account fields every request needs, kept for a few seconds per user: the app sends several
+// requests at once (and a running stopwatch reports regularly), and each would otherwise ask the
+// database for the same row. Everything in this process that changes them (password, sign out
+// everywhere, pro/admin, deleting the account) calls forgetAccount, so those take effect at
+// once; only changes made outside it (scripts/pro.js, psql) wait up to ACCOUNT_CACHE_MS.
+const ACCOUNT_CACHE_MS = limitFromEnv("ACCOUNT_CACHE_MS", 15 * 1000);
+const ACCOUNT_CACHE_MAX = 5000;
+const accountCache = new Map(); // userId -> { account, at }
+
+async function loadAccount(userId) {
+    const cached = accountCache.get(userId);
+    if (cached && Date.now() - cached.at < ACCOUNT_CACHE_MS) return cached.account;
+    const result = await pool.query(
+        "SELECT id, username, is_pro, is_admin, token_version FROM users WHERE id = $1",
+        [userId]
+    );
+    const account = result.rows[0] ?? null;
+    // a simple bound: the oldest entry goes first (a Map keeps insertion order)
+    accountCache.delete(userId);
+    if (accountCache.size >= ACCOUNT_CACHE_MAX) accountCache.delete(accountCache.keys().next().value);
+    if (account) accountCache.set(userId, { account, at: Date.now() });
+    return account;
+}
+
+function forgetAccount(userId) {
+    accountCache.delete(userId);
+}
+
 // Checks the login token and loads the account (req.user, req.account).
 // A token is only valid while its token_version matches the account's: changing the password
 // or "sign out everywhere" raises the version, and all older tokens stop working right away.
@@ -158,11 +191,7 @@ async function authenticateToken(req, res, next) {
     }
 
     try {
-        const result = await pool.query(
-            "SELECT id, username, is_pro, is_admin, token_version FROM users WHERE id = $1",
-            [payload.userId]
-        );
-        const account = result.rows[0];
+        const account = await loadAccount(payload.userId);
         if (!account || account.token_version !== (payload.tv ?? 0)) {
             return res.status(401).json({ error: "Signed out, please sign in again", code: "TOKEN_REVOKED" });
         }
@@ -184,8 +213,8 @@ app.use("/api/friends", authenticateToken);
 app.use("/api/shared-sessions", authenticateToken);
 app.use("/api/task-shares", authenticateToken);
 
-// Closed beta: the app's data is only for pro users. Checked in the database on every request
-// (not stored in the token), so granting or taking away pro works right away.
+// Closed beta: the app's data is only for pro users. Checked against the account on every request
+// (not stored in the token; see loadAccount), so granting or taking away pro works right away.
 // /api/me, /api/users (own account) and /api/beta-requests stay open, for the beta screen.
 function requirePro(req, res, next) {
     // admins always get in, so they can't lock themselves out of the admin panel
@@ -286,6 +315,9 @@ function cleanLink(value) {
     }
 }
 
+// The colours a task can have (the app draws them); null is the default look
+const TASK_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
+
 // How far the next one of a repeating task is from the last (Postgres intervals)
 const REPEAT_INTERVALS = { daily: "1 day", weekly: "7 days", monthly: "1 month", yearly: "1 year" };
 
@@ -299,6 +331,9 @@ const TASK_EXTRAS = {
     link: cleanLink,
     details: (value) => cleanText(value, TASK_DETAILS_MAX),
     repeat: (value) => (value === null || value === "" ? null : Object.hasOwn(REPEAT_INTERVALS, value) ? value : undefined),
+    color: (value) => (value === null || value === "" ? null : TASK_COLORS.includes(value) ? value : undefined),
+    // also remind by mail (only the owner can change it, see PUT /api/tasks/:id)
+    reminder_email: (value) => (typeof value === "boolean" ? value : undefined),
 };
 function readTaskExtras(body) {
     const values = {};
@@ -326,7 +361,7 @@ const TASK_SELECT = `
     SELECT tasks.id, tasks.name, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
         tasks.duration_minutes, tasks.reminder_minutes, tasks.location, tasks.link, tasks.details,
         tasks.description, tasks.prio, tasks.done, tasks.created_at, tasks.user_id,
-        tasks.repeat, tasks.completed_at,
+        tasks.repeat, tasks.completed_at, tasks.color, tasks.reminder_email,
         owner.username AS owner_username, owner.display_name AS owner_display_name,
         my_share.id AS my_share_id,
         COALESCE((
@@ -367,6 +402,9 @@ function toTaskResponse(row, userId) {
         prio: row.prio,
         done: row.done,
         repeat: row.repeat,
+        color: row.color,
+        // the owner's setting: a mail reaches only them
+        reminder_email: row.reminder_email,
         completed_at: row.completed_at,
         created_at: row.created_at,
         user_id: row.user_id,
@@ -382,6 +420,20 @@ function toTaskResponse(row, userId) {
 async function loadTask(taskId, userId, db = pool) {
     const result = await db.query(`${TASK_SELECT} AND tasks.id = $2`, [userId, taskId]);
     return result.rows[0] ? toTaskResponse(result.rows[0], userId) : null;
+}
+
+// Everybody who has a task: its owner and the people it was sent to (pending or accepted), without `except`
+async function taskPeople(taskId, except) {
+    const result = await pool.query(
+        "SELECT user_id FROM tasks WHERE id = $1 UNION SELECT user_id FROM task_shares WHERE task_id = $1",
+        [taskId]
+    );
+    return result.rows.map(row => row.user_id).filter(id => id !== except);
+}
+
+// The others see a shared task change right away: their task list and invites load again
+function notifyTaskPeople(people, taskId) {
+    for (const id of people) realtime.toUser(id, "tasks:changed", { taskId });
 }
 
 //GET endpoints
@@ -885,6 +937,24 @@ const USERNAME_PATTERN = /^[A-Za-z0-9_.-]{3,30}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_AGE = 14;
 
+const LANGUAGES = ["de", "en"];
+
+// A time zone both Node and Postgres know (IANA name, e.g. "Europe/Berlin"). Postgres reads its
+// list from disk (slow), so the zones it knows are asked once and kept.
+let postgresTimezones = null;
+async function validTimezone(value) {
+    if (typeof value !== "string" || !/^[A-Za-z0-9_+\-/]{1,64}$/.test(value)) return false;
+    try {
+        new Intl.DateTimeFormat("en", { timeZone: value });
+    } catch {
+        return false;
+    }
+    postgresTimezones ??= pool.query("SELECT name FROM pg_timezone_names")
+        .then(result => new Set(result.rows.map(row => row.name)))
+        .catch(err => { postgresTimezones = null; throw err; });
+    return (await postgresTimezones).has(value);
+}
+
 // 8-72 characters; bcrypt only uses the first 72 bytes, so longer ones are refused, not cut off
 const validPassword = (password) =>
     typeof password === "string" && password.length >= 8 && Buffer.byteLength(password, "utf8") <= 72;
@@ -906,6 +976,8 @@ app.post("/api/register", registerLimiter, async (req, res) => {
     const username = typeof req.body?.username === "string" ? req.body.username.trim() : "";
     const displayName = typeof req.body?.display_name === "string" ? req.body.display_name.trim() : "";
     const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+    // the app's language, for the mails (optional)
+    const language = LANGUAGES.includes(req.body?.language) ? req.body.language : null;
     const fail = (status, code, error) => res.status(status).json({ error, code });
 
     if (!USERNAME_PATTERN.test(username)) return fail(400, "INVALID_USERNAME", "Username must be 3-30 letters, digits, _ . or -");
@@ -931,16 +1003,16 @@ app.post("/api/register", registerLimiter, async (req, res) => {
 
         const passwordHash = await bcrypt.hash(password, 10);
         const result = await pool.query(
-            `INSERT INTO users (username, password_hash, display_name, birth_date, email, terms_accepted_at, privacy_accepted_at)
-            VALUES ($1, $2, $3, $4, $5, now(), now())
-            RETURNING id, username, email, created_at`,
-            [username, passwordHash, displayName, birth_date, email]
+            `INSERT INTO users (username, password_hash, display_name, birth_date, email, language, terms_accepted_at, privacy_accepted_at)
+            VALUES ($1, $2, $3, $4, $5, $6, now(), now())
+            RETURNING id, username, email, language, created_at`,
+            [username, passwordHash, displayName, birth_date, email, language]
         );
         const user = result.rows[0];
 
         const rawToken = await createVerificationToken(pool, user.id);
         try {
-            await sendVerificationMail(user.email, rawToken);
+            await sendVerificationMail(user.email, rawToken, user.language);
         } catch (err) {
             // Registration still succeeds; the user can request a new mail later
             console.error("Verification mail failed:", err);
@@ -1040,13 +1112,13 @@ app.post("/api/resend-verification", resendVerificationLimiter, async (req, res)
 
     try {
         const result = await pool.query(
-            "SELECT id, email, email_verified FROM users WHERE lower(email) = lower($1)",
+            "SELECT id, email, email_verified, language FROM users WHERE lower(email) = lower($1)",
             [email]
         );
         const user = result.rows[0];
         if (user && !user.email_verified) {
             const rawToken = await createVerificationToken(pool, user.id);
-            sendVerificationMail(user.email, rawToken).catch((err) => console.error("Resend failed:", err));
+            sendVerificationMail(user.email, rawToken, user.language).catch((err) => console.error("Resend failed:", err));
         }
         res.json({ message: "If the account exists, a new mail has been sent." });
     } catch (err) {
@@ -1058,13 +1130,13 @@ app.post("/api/resend-verification", resendVerificationLimiter, async (req, res)
 // Not under /api/users, so it also works before pro access is granted.
 app.post("/api/verify-email/resend", authenticateToken, verificationMailLimiter, async (req, res) => {
     try {
-        const result = await pool.query("SELECT email, email_verified FROM users WHERE id = $1", [req.user.userId]);
+        const result = await pool.query("SELECT email, email_verified, language FROM users WHERE id = $1", [req.user.userId]);
         const user = result.rows[0];
         if (!user?.email) return res.status(400).json({ error: "No email address", code: "INVALID_EMAIL" });
         if (user.email_verified) return res.status(409).json({ error: "Already verified", code: "ALREADY_VERIFIED" });
 
         const rawToken = await createVerificationToken(pool, req.user.userId);
-        await sendVerificationMail(user.email, rawToken);
+        await sendVerificationMail(user.email, rawToken, user.language);
         res.json({ sent: true });
     } catch (err) {
         serverError(res, err);
@@ -1176,6 +1248,15 @@ const toMessage = (row, me) => ({
     readAt: row.read_at,
 });
 
+// Marks what `other` sent me as read; my other tabs update their badges
+async function markConversationRead(me, other) {
+    const result = await pool.query(
+        "UPDATE messages SET read_at = now() WHERE recipient_id = $1 AND sender_id = $2 AND read_at IS NULL",
+        [me, other]
+    );
+    if (result.rowCount > 0) realtime.toUser(me, "inbox:read", { userId: other });
+}
+
 // Unread counts for the menu badge: { messages, notifications }
 app.get("/api/inbox/unread", async (req, res) => {
     try {
@@ -1226,10 +1307,7 @@ app.get("/api/messages/:userId", async (req, res) => {
     try {
         const user = (await pool.query("SELECT id, username, display_name FROM users WHERE id = $1", [other])).rows[0];
         if (!user) return notFound(res, "User");
-        await pool.query(
-            "UPDATE messages SET read_at = now() WHERE recipient_id = $1 AND sender_id = $2 AND read_at IS NULL",
-            [me, other]
-        );
+        await markConversationRead(me, other);
         const result = await pool.query(
             `SELECT * FROM (
                 SELECT * FROM messages
@@ -1265,23 +1343,47 @@ app.post("/api/messages/:userId", directMessageLimiter, async (req, res) => {
             "INSERT INTO messages (sender_id, recipient_id, body) VALUES ($1, $2, $3) RETURNING *",
             [me, other, body]
         );
-        res.status(201).json(toMessage(result.rows[0], me));
+        const row = result.rows[0];
+        res.status(201).json(toMessage(row, me));
+
+        // right away to the friend, and to my other tabs
+        const people = await pool.query("SELECT id, username, display_name FROM users WHERE id = ANY($1::int[])", [[me, other]]);
+        const byId = new Map(people.rows.map(user => [user.id, { id: user.id, username: user.username, displayName: user.display_name }]));
+        realtime.toUser(other, "message:new", { user: byId.get(me), message: toMessage(row, other) });
+        realtime.toUser(me, "message:new", { user: byId.get(other), message: toMessage(row, me) });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// The conversation is open and a new message came in: mark it read without loading it again
+app.post("/api/messages/:userId/read", async (req, res) => {
+    const other = idParam(req.params.userId);
+    if (!other) return notFound(res, "User");
+    try {
+        await markConversationRead(req.user.userId, other);
+        res.json({ read: true });
     } catch (err) {
         serverError(res, err);
     }
 });
 
 // My notifications (the latest 100), newest first
+// A notification as the app gets it (list and live); data only for kinds that have some
+// (task_assigned: { sessionId, taskId, by })
+const toNotice = (row) => ({
+    id: row.id, kind: row.kind, title: row.title, body: row.body, createdAt: row.created_at, readAt: row.read_at,
+    ...(row.data && { data: row.data }),
+});
+
 app.get("/api/notifications", async (req, res) => {
     try {
         const result = await pool.query(
-            `SELECT id, kind, title, body, created_at, read_at FROM notifications
+            `SELECT id, kind, title, body, data, created_at, read_at FROM notifications
             WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT 100`,
             [req.user.userId]
         );
-        res.json(result.rows.map(row => ({
-            id: row.id, kind: row.kind, title: row.title, body: row.body, createdAt: row.created_at, readAt: row.read_at,
-        })));
+        res.json(result.rows.map(toNotice));
     } catch (err) {
         serverError(res, err);
     }
@@ -1290,7 +1392,8 @@ app.get("/api/notifications", async (req, res) => {
 // Mark all my notifications read
 app.post("/api/notifications/read", async (req, res) => {
     try {
-        await pool.query("UPDATE notifications SET read_at = now() WHERE user_id = $1 AND read_at IS NULL", [req.user.userId]);
+        const result = await pool.query("UPDATE notifications SET read_at = now() WHERE user_id = $1 AND read_at IS NULL", [req.user.userId]);
+        if (result.rowCount > 0) realtime.toUser(req.user.userId, "inbox:read", {});
         res.json({ read: true });
     } catch (err) {
         serverError(res, err);
@@ -1304,6 +1407,7 @@ app.delete("/api/notifications/:id", async (req, res) => {
     try {
         const result = await pool.query("DELETE FROM notifications WHERE id = $1 AND user_id = $2", [id, req.user.userId]);
         if (result.rowCount === 0) return notFound(res, "Notification");
+        realtime.toUser(req.user.userId, "inbox:read", {});
         res.json({ deleted: true });
     } catch (err) {
         serverError(res, err);
@@ -1311,7 +1415,7 @@ app.delete("/api/notifications/:id", async (req, res) => {
 });
 
 // ---------- Admin ----------
-// Only for users with is_admin, checked in the database on every request.
+// Only for users with is_admin, checked against the account on every request (see loadAccount).
 // Every change is written to admin_actions. Admins can't change their own pro/admin status,
 // so nobody locks themselves out and there is always at least one admin left.
 
@@ -1396,12 +1500,20 @@ app.post("/api/admin/broadcasts", async (req, res) => {
         )).rows[0];
         const sent = await client.query(
             `INSERT INTO notifications (user_id, kind, title, body, broadcast_id)
-            SELECT id, 'broadcast', $1, $2, $3 FROM users`,
+            SELECT id, 'broadcast', $1, $2, $3 FROM users
+            RETURNING id, user_id, kind, title, body, created_at`,
             [title, body, broadcast.id]
         );
         await client.query("UPDATE broadcasts SET recipient_count = $1 WHERE id = $2", [sent.rowCount, broadcast.id]);
         await client.query("COMMIT");
         res.status(201).json({ id: broadcast.id, recipientCount: sent.rowCount, createdAt: broadcast.created_at });
+
+        // everybody who has the app open sees it right away (each with their own notification id)
+        for (const row of sent.rows) {
+            realtime.toUser(row.user_id, "notification:new", {
+                id: row.id, kind: row.kind, title: row.title, body: row.body, createdAt: row.created_at, readAt: null,
+            });
+        }
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
@@ -1478,6 +1590,7 @@ for (const decision of ["approve", "decline"]) {
             if (decision === "approve") await client.query("UPDATE users SET is_pro = true WHERE id = $1", [targetId]);
             await logAdminAction(client, req.admin, target.rows[0], `${decision}_request`);
             await client.query("COMMIT");
+            forgetAccount(targetId);
             res.json(await loadAdminUser(pool, targetId));
         } catch (err) {
             await client.query("ROLLBACK").catch(() => {});
@@ -1520,7 +1633,7 @@ app.get("/api/admin/users", async (req, res) => {
     }
 });
 
-// Give or take away pro / admin: { isPro?, isAdmin? }. Not for yourself.
+// Give or take away pro / admin: { isPro?, isAdmin? }. Not for yourself, and owners keep admin.
 app.patch("/api/admin/users/:id", async (req, res) => {
     const targetId = idParam(req.params.id);
     const { isPro, isAdmin } = req.body ?? {};
@@ -1534,11 +1647,16 @@ app.patch("/api/admin/users/:id", async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query("BEGIN");
-        const before = await client.query("SELECT id, username, is_pro, is_admin FROM users WHERE id = $1 FOR UPDATE", [targetId]);
+        const before = await client.query("SELECT id, username, is_pro, is_admin, is_owner FROM users WHERE id = $1 FOR UPDATE", [targetId]);
         const target = before.rows[0];
         if (!target) {
             await client.query("ROLLBACK");
             return adminFail(res, 404, "USER_NOT_FOUND", "User not found");
+        }
+        // owners stay admin (the database would switch it back on anyway)
+        if (isAdmin === false && target.is_owner) {
+            await client.query("ROLLBACK");
+            return adminFail(res, 403, "OWNER", "This admin can't be removed");
         }
         if (isPro !== undefined && isPro !== target.is_pro) {
             await client.query("UPDATE users SET is_pro = $1 WHERE id = $2", [isPro, targetId]);
@@ -1556,6 +1674,9 @@ app.patch("/api/admin/users/:id", async (req, res) => {
             await logAdminAction(client, req.admin, target, isAdmin ? "grant_admin" : "revoke_admin");
         }
         await client.query("COMMIT");
+        forgetAccount(targetId);
+        // without pro (and not admin) the sockets lose access too; with it they connect again
+        if (isPro === false || isAdmin === false) realtime.disconnectUser(targetId);
         res.json(await loadAdminUser(pool, targetId));
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
@@ -1588,15 +1709,15 @@ app.put("/api/users", async (req, res) => {
             FROM (SELECT email FROM users WHERE id = $3) AS old
             WHERE users.id = $3
             RETURNING users.username, users.display_name, users.birth_date, users.email, users.email_verified,
-                users.created_at, lower(old.email) IS DISTINCT FROM lower(users.email) AS email_changed`,
+                users.created_at, users.language, lower(old.email) IS DISTINCT FROM lower(users.email) AS email_changed`,
             [displayName, email, userId]
         );
-        const { email_changed: emailChanged, ...user } = result.rows[0];
+        const { email_changed: emailChanged, language, ...user } = result.rows[0];
 
         if (emailChanged) {
             const rawToken = await createVerificationToken(pool, userId);
             try {
-                await sendVerificationMail(user.email, rawToken);
+                await sendVerificationMail(user.email, rawToken, language);
             } catch (err) {
                 // the profile is saved; a new mail can be requested later
                 console.error("Verification mail failed:", err);
@@ -1607,6 +1728,23 @@ app.put("/api/users", async (req, res) => {
         if (err.code === "23505") {
             return res.status(409).json({ error: "Email already in use", code: "EMAIL_TAKEN" });
         }
+        serverError(res, err);
+    }
+});
+
+// The app tells where I am and which language I use: { timezone ("Europe/Berlin"), language ("de" | "en") },
+// both optional. Reminder mails use them (a task at 09:00 is reminded at 09:00 there, in my language).
+app.put("/api/users/locale", async (req, res) => {
+    const { timezone, language } = req.body ?? {};
+    if (timezone !== undefined && !(await validTimezone(timezone))) return invalidInput(res, "timezone");
+    if (language !== undefined && !LANGUAGES.includes(language)) return invalidInput(res, "language");
+    try {
+        await pool.query(
+            "UPDATE users SET timezone = COALESCE($1, timezone), language = COALESCE($2, language) WHERE id = $3",
+            [timezone ?? null, language ?? null, req.user.userId]
+        );
+        res.json({ timezone: timezone ?? null, language: language ?? null });
+    } catch (err) {
         serverError(res, err);
     }
 });
@@ -1638,6 +1776,9 @@ app.put("/api/users/password", authLimiter, async (req, res) => {
             RETURNING id, username, token_version`,
             [passwordHash, userId]
         );
+        forgetAccount(userId);
+        // open sockets used the old token; this device connects again with the new one
+        realtime.disconnectUser(userId);
         res.json({ message: "Password changed", token: signToken(updated.rows[0]) });
     } catch (err) {
         serverError(res, err);
@@ -1648,6 +1789,8 @@ app.put("/api/users/password", authLimiter, async (req, res) => {
 app.post("/api/users/logout-all", async (req, res) => {
     try {
         await pool.query("UPDATE users SET token_version = token_version + 1 WHERE id = $1", [req.user.userId]);
+        forgetAccount(req.user.userId);
+        realtime.disconnectUser(req.user.userId);
         res.json({ message: "Signed out everywhere" });
     } catch (err) {
         serverError(res, err);
@@ -1691,6 +1834,8 @@ app.delete("/api/users", authLimiter, async (req, res) => {
         await client.query("DELETE FROM groups WHERE user_id = $1", [userId]);
         await client.query("DELETE FROM users WHERE id = $1", [userId]);
         await client.query("COMMIT");
+        forgetAccount(userId);
+        realtime.disconnectUser(userId);
         res.json({ message: "Account deleted" });
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
@@ -1726,7 +1871,10 @@ app.put("/api/tasks/:id", async (req, res) => {
         "completed_at = CASE WHEN NOT $5 THEN NULL WHEN tasks.done THEN tasks.completed_at ELSE now() END"];
     for (const [column, value] of Object.entries(extras.values)) {
         values.push(value);
-        sets.push(`${column} = $${values.length}`);
+        // mails go to the owner, so only the owner turns them on or off ($7: me)
+        sets.push(column === "reminder_email"
+            ? `${column} = CASE WHEN tasks.user_id = $7 THEN $${values.length} ELSE tasks.reminder_email END`
+            : `${column} = $${values.length}`);
     }
     // without a day there is no time of day and no repeating either
     if (!due && !("due_time" in extras.values)) sets.push("due_time = NULL");
@@ -1751,6 +1899,7 @@ app.put("/api/tasks/:id", async (req, res) => {
         const task = await loadTask(id, userId);
         // a repeating task that was just done comes back with the next one
         res.json(nextId ? { ...task, nextTask: await loadTask(nextId, userId) } : task);
+        if (task.sharedWith.length > 0 || !task.isOwner) notifyTaskPeople(await taskPeople(id, userId), id);
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
@@ -1782,10 +1931,10 @@ async function createNextRepeat(db, taskId) {
             LIMIT 1
         )
         INSERT INTO tasks (name, due, description, prio, user_id, due_time, duration_minutes,
-            reminder_minutes, location, link, details, repeat, repeat_from_id)
+            reminder_minutes, location, link, details, repeat, repeat_from_id, color, reminder_email)
         SELECT source.name, next_due.due, source.description, source.prio, source.user_id, source.due_time,
             source.duration_minutes, source.reminder_minutes, source.location, source.link, source.details,
-            source.repeat, source.id
+            source.repeat, source.id, source.color, source.reminder_email
         FROM source, next_due
         RETURNING id`,
         [taskId]
@@ -1862,6 +2011,8 @@ app.delete("/api/tasks/:id", async (req, res) => {
     if (!id) return notFound(res, "Task");
 
     try {
+        // who else had it, asked before it's gone
+        const others = await taskPeople(id, userId);
         const result = await pool.query(
             "DELETE FROM tasks WHERE id = $1 AND user_id = $2 RETURNING *",
             [id, userId]
@@ -1872,6 +2023,7 @@ app.delete("/api/tasks/:id", async (req, res) => {
         }
 
         res.json({ message: "Task deleted", task: result.rows[0] });
+        notifyTaskPeople(others, id);
     } catch (err) {
         serverError(res, err);
     }
@@ -2055,6 +2207,7 @@ app.post("/api/friends/requests", friendRequestLimiter, async (req, res) => {
                 WHERE id = $1 RETURNING responded_at`,
                 [pair.id]
             );
+            realtime.toUser(other.id, "friends:changed", {});
             return res.json({ status: "accepted", friend: { ...publicUser(other), since: accepted.rows[0].responded_at } });
         }
 
@@ -2062,6 +2215,7 @@ app.post("/api/friends/requests", friendRequestLimiter, async (req, res) => {
             `INSERT INTO friendships (requester_id, addressee_id) VALUES ($1, $2) RETURNING id, created_at`,
             [userId, other.id]
         );
+        realtime.toUser(other.id, "friends:changed", {});
         res.status(201).json({
             status: "pending",
             request: { id: created.rows[0].id, user: publicUser(other), createdAt: created.rows[0].created_at },
@@ -2091,6 +2245,7 @@ app.post("/api/friends/requests/:id/accept", async (req, res) => {
             return res.status(404).json({ error: "Request not found", code: "REQUEST_NOT_FOUND" });
         }
         const friend = await pool.query("SELECT id, username, display_name FROM users WHERE id = $1", [result.rows[0].requester_id]);
+        realtime.toUser(result.rows[0].requester_id, "friends:changed", {});
         res.json({ friend: { ...publicUser(friend.rows[0]), since: result.rows[0].responded_at } });
     } catch (err) {
         serverError(res, err);
@@ -2106,12 +2261,13 @@ app.delete("/api/friends/requests/:id", async (req, res) => {
         const result = await pool.query(
             `DELETE FROM friendships
             WHERE id = $1 AND status = 'pending' AND $2 IN (requester_id, addressee_id)
-            RETURNING id`,
+            RETURNING id, CASE WHEN requester_id = $2 THEN addressee_id ELSE requester_id END AS other_id`,
             [requestId, userId]
         );
         if (result.rows.length === 0) {
             return res.status(404).json({ error: "Request not found", code: "REQUEST_NOT_FOUND" });
         }
+        realtime.toUser(result.rows[0].other_id, "friends:changed", {});
         res.json({ id: result.rows[0].id });
     } catch (err) {
         serverError(res, err);
@@ -2135,6 +2291,7 @@ app.delete("/api/friends/:userId", async (req, res) => {
         if (result.rows.length === 0) {
             return res.status(404).json({ error: "Friend not found", code: "FRIEND_NOT_FOUND" });
         }
+        realtime.toUser(friendId, "friends:changed", {});
         res.json({ userId: friendId });
     } catch (err) {
         serverError(res, err);
@@ -2187,6 +2344,7 @@ app.post("/api/tasks/:id/shares", friendRequestLimiter, async (req, res) => {
         );
         await client.query("COMMIT");
         res.status(201).json(await loadTask(taskId, userId));
+        notifyTaskPeople(await taskPeople(taskId, userId), taskId);
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
@@ -2203,7 +2361,7 @@ app.get("/api/task-shares", async (req, res) => {
         const result = await pool.query(
             `SELECT task_shares.id, task_shares.created_at,
                 tasks.id AS task_id, tasks.name, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
-                tasks.duration_minutes, tasks.location, tasks.description,
+                tasks.duration_minutes, tasks.location, tasks.description, tasks.color,
                 users.id AS from_id, users.username AS from_username, users.display_name AS from_display_name
             FROM task_shares
             JOIN tasks ON tasks.id = task_shares.task_id
@@ -2224,6 +2382,7 @@ app.get("/api/task-shares", async (req, res) => {
                 duration_minutes: row.duration_minutes,
                 location: row.location,
                 description: row.description,
+                color: row.color,
             },
         })));
     } catch (err) {
@@ -2244,7 +2403,9 @@ app.post("/api/task-shares/:id/accept", async (req, res) => {
             [shareId, userId]
         );
         if (result.rows.length === 0) return fail(res, 404, "SHARE_NOT_FOUND", "Invite not found");
-        res.json(await loadTask(result.rows[0].task_id, userId));
+        const taskId = result.rows[0].task_id;
+        res.json(await loadTask(taskId, userId));
+        notifyTaskPeople(await taskPeople(taskId, userId), taskId);
     } catch (err) {
         serverError(res, err);
     }
@@ -2281,6 +2442,10 @@ app.delete("/api/task-shares/:id", async (req, res) => {
         );
         await client.query("COMMIT");
         res.json({ id: share.id, taskId: share.task_id, userId: share.user_id });
+        // the others who still have it, and the one who no longer does
+        const others = await taskPeople(share.task_id, userId);
+        if (share.user_id !== userId) others.push(share.user_id);
+        notifyTaskPeople(others, share.task_id);
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
@@ -2297,9 +2462,11 @@ app.delete("/api/task-shares/:id", async (req, res) => {
 
 const fail = (res, status, code, error) => res.status(status).json({ error, code });
 
-// A member counts as working right now if they reported within this time
-const ONLINE_SECONDS = 30;
-// Upper bound for one time report. The client reports every 10 s, but a browser
+// A member counts as working right now if they reported within this time. The client reports
+// every 30 s (the others' clocks run on in their browsers in between), so this leaves room for
+// one late report before somebody counts as gone.
+const ONLINE_SECONDS = 75;
+// Upper bound for one time report. The client reports every 30 s, but a browser
 // throttles timers in background tabs, so a report can cover a few minutes.
 const MAX_REPORT_MS = 5 * 60 * 1000;
 // A report can't book more than the time since my previous report (plus this much for
@@ -2339,13 +2506,14 @@ async function requireOpenSession(req, res) {
     return { sessionId, ...membership, isOwner: membership.owner_id === req.user.userId };
 }
 
-// Adds an entry to a session's activity feed
+// Adds an entry to a session's activity feed; resolves to its id
 async function logEvent(db, sessionId, userId, type, { taskId = null, taskName = null, text = null, targetId = null } = {}) {
-    await db.query(
+    const result = await db.query(
         `INSERT INTO shared_session_events (session_id, user_id, type, task_id, task_name, text, target_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
         [sessionId, userId, type, taskId, taskName, text, targetId]
     );
+    return result.rows[0].id;
 }
 
 // How many feed entries the session page gets
@@ -2361,7 +2529,8 @@ const messageLimiter = rateLimit({
     message: { error: "Too many messages, please slow down", code: "RATE_LIMITED" },
 });
 
-// Invites the given users to a session, skipping anybody who isn't my friend or is already in it
+// Invites the given users to a session, skipping anybody who isn't my friend or is already in it.
+// Resolves to the ids of the people invited now.
 async function inviteFriends(db, sessionId, userId, friendIds) {
     if (friendIds.length === 0) return 0;
     const result = await db.query(
@@ -2374,10 +2543,48 @@ async function inviteFriends(db, sessionId, userId, friendIds) {
                 AND LEAST(requester_id, addressee_id) = LEAST($2::int, invitee.id)
                 AND GREATEST(requester_id, addressee_id) = GREATEST($2::int, invitee.id)
         )
-        ON CONFLICT DO NOTHING`,
+        ON CONFLICT DO NOTHING
+        RETURNING user_id`,
         [sessionId, userId, friendIds]
     );
-    return result.rowCount;
+    return result.rows.map(row => row.user_id);
+}
+
+// Tells the joined members (and `also`) that a session changed; their open pages load it again
+async function notifySession(sessionId, also = []) {
+    const result = await pool.query(
+        "SELECT user_id FROM shared_session_members WHERE session_id = $1 AND status = 'joined'",
+        [sessionId]
+    );
+    for (const id of new Set([...result.rows.map(row => row.user_id), ...also])) {
+        realtime.toUser(id, "session:changed", { sessionId });
+    }
+}
+
+// A notice in the assignee's inbox: who gave them which task in which session. Title and body
+// are the task's and the session's names; the app words it in the reader's language from data.
+// A failure here doesn't undo the assignment (that's already answered).
+async function noticeTaskAssigned(sessionId, taskId, taskName, byId, assigneeId) {
+    try {
+        const result = await pool.query(
+            `INSERT INTO notifications (user_id, kind, title, body, data)
+            SELECT $1, 'task_assigned', left($2, 120), shared_sessions.name,
+                jsonb_build_object('sessionId', shared_sessions.id, 'taskId', $3::int,
+                    'by', jsonb_build_object('id', users.id, 'username', users.username, 'displayName', users.display_name))
+            FROM shared_sessions, users
+            WHERE shared_sessions.id = $4 AND users.id = $5
+            RETURNING id, kind, title, body, data, created_at, read_at`,
+            [assigneeId, taskName, taskId, sessionId, byId]
+        );
+        if (result.rows[0]) realtime.toUser(assigneeId, "notification:new", toNotice(result.rows[0]));
+    } catch (err) {
+        console.error(err);
+    }
+}
+
+// Somebody got a session invite or lost one: their list of invites loads again
+function notifyInvites(userIds) {
+    for (const id of userIds) realtime.toUser(id, "invites:changed", {});
 }
 
 // Everything the session page shows:
@@ -2682,10 +2889,11 @@ app.post("/api/shared-sessions", async (req, res) => {
             VALUES ($1, $2, 'joined', $2, now())`,
             [sessionId, userId]
         );
-        await inviteFriends(client, sessionId, userId, idList(req.body?.friendIds));
+        const invited = await inviteFriends(client, sessionId, userId, idList(req.body?.friendIds));
         await logEvent(client, sessionId, userId, "created", { text: name });
         await client.query("COMMIT");
         await sendSharedSession(res, sessionId, userId, 201);
+        notifyInvites(invited);
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
@@ -2701,8 +2909,10 @@ app.post("/api/shared-sessions/:id/invites", async (req, res) => {
         const session = await requireOpenSession(req, res);
         if (!session) return;
         const invited = await inviteFriends(pool, session.sessionId, userId, idList(req.body?.userIds));
-        if (invited === 0) return fail(res, 400, "NOTHING_TO_INVITE", "Nobody new to invite");
+        if (invited.length === 0) return fail(res, 400, "NOTHING_TO_INVITE", "Nobody new to invite");
         await sendSharedSession(res, session.sessionId, userId);
+        await notifySession(session.sessionId);
+        notifyInvites(invited);
     } catch (err) {
         serverError(res, err);
     }
@@ -2724,6 +2934,7 @@ app.post("/api/shared-sessions/:id/join", async (req, res) => {
         if (result.rows.length === 0) return fail(res, 404, "INVITE_NOT_FOUND", "Invite not found");
         await logEvent(pool, sessionId, userId, "joined");
         await sendSharedSession(res, sessionId, userId);
+        await notifySession(sessionId);
     } catch (err) {
         serverError(res, err);
     }
@@ -2753,7 +2964,11 @@ app.delete("/api/shared-sessions/:id/members/:userId", async (req, res) => {
             if (targetId === userId) await logEvent(pool, sessionId, userId, "left");
             else await logEvent(pool, sessionId, userId, "removed", { targetId });
         }
+        realtime.leaveSession(sessionId, targetId);
         res.json({ sessionId, userId: targetId });
+        // the one who left (or was removed) too, so their page notices
+        await notifySession(sessionId, [targetId]);
+        if (result.rows[0].status === "invited") notifyInvites([targetId]);
     } catch (err) {
         serverError(res, err);
     }
@@ -2788,6 +3003,7 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
         );
         await logEvent(pool, session.sessionId, userId, "task_added", { taskId: created.rows[0].id, taskName: task.name });
         await sendSharedSession(res, session.sessionId, userId, 201);
+        await notifySession(session.sessionId);
     } catch (err) {
         if (err.code === "23505") {
             return fail(res, 409, "TASK_ALREADY_SHARED", "This task is already in the session");
@@ -2841,10 +3057,14 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
             }
             await logEvent(pool, session.sessionId, userId, done ? "task_done" : "task_reopened", { taskId, taskName: task.name });
         }
+        const assignedToOther = changesAssignee && assigneeId !== task.assignee_id && assigneeId && assigneeId !== userId;
         if (changesAssignee && assigneeId !== task.assignee_id) {
             await logEvent(pool, session.sessionId, userId, "task_assigned", { taskId, taskName: task.name, targetId: assigneeId });
         }
         await sendSharedSession(res, session.sessionId, userId);
+        await notifySession(session.sessionId);
+        // the one who got it finds it in their inbox (not when I take a task myself)
+        if (assignedToOther) await noticeTaskAssigned(session.sessionId, taskId, task.name, userId, assigneeId);
     } catch (err) {
         serverError(res, err);
     }
@@ -2871,6 +3091,7 @@ app.delete("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
         if (task.rows[0].has_time) return fail(res, 409, "TASK_HAS_TIME", "Somebody already worked on this task");
         await pool.query("DELETE FROM shared_session_tasks WHERE id = $1", [taskId]);
         await sendSharedSession(res, session.sessionId, userId);
+        await notifySession(session.sessionId);
     } catch (err) {
         serverError(res, err);
     }
@@ -2934,6 +3155,7 @@ app.post("/api/shared-sessions/:id/activity", async (req, res) => {
             [currentTaskId, session.sessionId, userId, ONLINE_SECONDS]
         );
         const was = previous.rows[0];
+        const workingChanged = (was?.was_online ? was.current_task_id : null) !== currentTaskId;
         const justStarted = currentTaskId && !(was?.was_online && was.current_task_id === currentTaskId);
         if (justStarted) {
             // pausing and going on with the same task shouldn't flood the feed
@@ -2950,6 +3172,8 @@ app.post("/api/shared-sessions/:id/activity", async (req, res) => {
             }
         }
         await sendSharedSession(res, session.sessionId, userId);
+        // the others only hear about it when what they see changed, not with every time report
+        if (workingChanged) await notifySession(session.sessionId);
     } catch (err) {
         serverError(res, err);
     }
@@ -2967,11 +3191,16 @@ app.post("/api/shared-sessions/:id/end", async (req, res) => {
         await client.query("BEGIN");
         await client.query("UPDATE shared_sessions SET ended_at = now() WHERE id = $1", [session.sessionId]);
         // open invites expire, nobody is working any more
-        await client.query("DELETE FROM shared_session_members WHERE session_id = $1 AND status = 'invited'", [session.sessionId]);
+        const expired = await client.query(
+            "DELETE FROM shared_session_members WHERE session_id = $1 AND status = 'invited' RETURNING user_id",
+            [session.sessionId]
+        );
         await client.query("UPDATE shared_session_members SET current_task_id = NULL WHERE session_id = $1", [session.sessionId]);
         await logEvent(client, session.sessionId, userId, "ended");
         await client.query("COMMIT");
         await sendSharedSession(res, session.sessionId, userId);
+        await notifySession(session.sessionId);
+        notifyInvites(expired.rows.map(row => row.user_id));
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
@@ -2989,8 +3218,13 @@ app.post("/api/shared-sessions/:id/messages", messageLimiter, async (req, res) =
     try {
         const session = await requireOpenSession(req, res);
         if (!session) return;
-        await logEvent(pool, session.sessionId, userId, "message", { text });
-        await sendSharedSession(res, session.sessionId, userId, 201);
+        const eventId = await logEvent(pool, session.sessionId, userId, "message", { text });
+        const loaded = await loadSharedSession(session.sessionId, userId);
+        if (!loaded) return fail(res, 404, "SESSION_NOT_FOUND", "Session not found");
+        res.status(201).json(loaded);
+        // the other members (and my other tabs) get it right away
+        const event = loaded.events.find(e => e.id === eventId);
+        if (event) realtime.toSession(session.sessionId, "session:event", { sessionId: session.sessionId, event });
     } catch (err) {
         serverError(res, err);
     }
@@ -3011,6 +3245,7 @@ app.patch("/api/shared-sessions/:id", async (req, res) => {
         );
         if (result.rows.length > 0) await logEvent(pool, session.sessionId, userId, "renamed", { text: name });
         await sendSharedSession(res, session.sessionId, userId);
+        await notifySession(session.sessionId);
     } catch (err) {
         serverError(res, err);
     }
@@ -3022,12 +3257,23 @@ app.delete("/api/shared-sessions/:id", async (req, res) => {
     const sessionId = idParam(req.params.id);
     if (!sessionId) return fail(res, 404, "SESSION_NOT_FOUND", "Session not found");
     try {
+        // who was in it or invited, asked before it's gone
+        const members = await pool.query(
+            `SELECT shared_session_members.user_id, shared_session_members.status FROM shared_session_members
+            JOIN shared_sessions ON shared_sessions.id = shared_session_members.session_id
+            WHERE shared_session_members.session_id = $1 AND shared_sessions.owner_id = $2`,
+            [sessionId, userId]
+        );
         const result = await pool.query(
             "DELETE FROM shared_sessions WHERE id = $1 AND owner_id = $2 RETURNING id",
             [sessionId, userId]
         );
         if (result.rows.length === 0) return fail(res, 404, "SESSION_NOT_FOUND", "Session not found");
+        realtime.closeSession(sessionId);
         res.json({ id: sessionId });
+        for (const member of members.rows) {
+            realtime.toUser(member.user_id, member.status === "invited" ? "invites:changed" : "session:changed", { sessionId });
+        }
     } catch (err) {
         serverError(res, err);
     }
@@ -3045,9 +3291,11 @@ app.use((err, req, res, next) => {
 
 // net start postgresql-x64-18
 
-//listen for requests on this url
-app.listen(PORT, (err) => {
-    // Express 5 passes listen errors (e.g. port already in use) to this callback
-    if (err) throw err;
+//listen for requests on this url; Socket.IO (realtime.js) shares the same server and port
+const server = http.createServer(app);
+realtime.initRealtime(server, { allowedOrigins, tokenAlgorithm: TOKEN_ALGORITHM });
+// reminders by mail, checked once a minute
+startReminderMails(pool, limitFromEnv("REMINDER_CHECK_MS", 60 * 1000));
+server.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
 });

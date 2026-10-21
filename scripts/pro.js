@@ -72,6 +72,8 @@ const commands = {
 
     async unadmin(username) {
         const user = await findUser(username);
+        const owner = await pool.query("SELECT is_owner FROM users WHERE id = $1", [user.id]);
+        if (owner.rows[0].is_owner) throw new Error(`${user.username} is an owner and stays admin (only changeable by hand in the database).`);
         await pool.query("UPDATE users SET is_admin = false WHERE id = $1", [user.id]);
         console.log(`${user.username} is no longer admin.`);
     },
