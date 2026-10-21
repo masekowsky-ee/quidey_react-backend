@@ -208,7 +208,9 @@ CREATE TABLE public.groups (
     id integer NOT NULL,
     name text NOT NULL,
     description text,
-    user_id integer
+    user_id integer,
+    color text,
+    CONSTRAINT groups_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text]))))
 );
 
 --
@@ -946,6 +948,12 @@ CREATE UNIQUE INDEX friendships_pair_unique ON public.friendships USING btree (L
 CREATE INDEX friendships_requester_status_idx ON public.friendships USING btree (requester_id, status);
 
 --
+-- Name: groups_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX groups_user_idx ON public.groups USING btree (user_id);
+
+--
 -- Name: messages_recipient_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -958,10 +966,46 @@ CREATE INDEX messages_recipient_idx ON public.messages USING btree (recipient_id
 CREATE INDEX messages_sender_idx ON public.messages USING btree (sender_id, created_at);
 
 --
+-- Name: messages_unread_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX messages_unread_idx ON public.messages USING btree (recipient_id, sender_id) WHERE (read_at IS NULL);
+
+--
+-- Name: notes_task_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notes_task_idx ON public.notes USING btree (task_id);
+
+--
+-- Name: notifications_unread_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notifications_unread_idx ON public.notifications USING btree (user_id) WHERE (read_at IS NULL);
+
+--
 -- Name: notifications_user_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX notifications_user_idx ON public.notifications USING btree (user_id, created_at);
+
+--
+-- Name: session_tasks_task_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX session_tasks_task_idx ON public.session_tasks USING btree (task_id);
+
+--
+-- Name: sessions_group_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX sessions_group_idx ON public.sessions USING btree (group_id);
+
+--
+-- Name: sessions_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX sessions_user_idx ON public.sessions USING btree (user_id);
 
 --
 -- Name: shared_session_events_session_idx; Type: INDEX; Schema: public; Owner: -
@@ -988,16 +1032,46 @@ CREATE INDEX shared_session_tasks_session_idx ON public.shared_session_tasks USI
 CREATE UNIQUE INDEX shared_session_tasks_source_unique ON public.shared_session_tasks USING btree (session_id, source_task_id) WHERE (source_task_id IS NOT NULL);
 
 --
+-- Name: shared_session_time_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX shared_session_time_user_idx ON public.shared_session_time USING btree (user_id);
+
+--
+-- Name: shared_sessions_owner_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX shared_sessions_owner_idx ON public.shared_sessions USING btree (owner_id);
+
+--
+-- Name: task_groups_group_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX task_groups_group_idx ON public.task_groups USING btree (group_id);
+
+--
 -- Name: task_shares_user_status_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX task_shares_user_status_idx ON public.task_shares USING btree (user_id, status);
 
 --
+-- Name: tasks_reminder_email_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tasks_reminder_email_idx ON public.tasks USING btree (due) WHERE (reminder_email AND (NOT done));
+
+--
 -- Name: tasks_repeat_from_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX tasks_repeat_from_idx ON public.tasks USING btree (repeat_from_id);
+
+--
+-- Name: tasks_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tasks_user_idx ON public.tasks USING btree (user_id);
 
 --
 -- Name: users_email_lower_unique; Type: INDEX; Schema: public; Owner: -
@@ -1303,29 +1377,6 @@ ALTER TABLE ONLY public.tasks
 
 ALTER TABLE ONLY public.tasks
     ADD CONSTRAINT tasks_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
-
---
--- Indexes from migration 015 (performance)
---
-
-CREATE INDEX tasks_user_idx ON public.tasks USING btree (user_id);
-CREATE INDEX groups_user_idx ON public.groups USING btree (user_id);
-CREATE INDEX notes_task_idx ON public.notes USING btree (task_id);
-CREATE INDEX sessions_user_idx ON public.sessions USING btree (user_id);
-CREATE INDEX sessions_group_idx ON public.sessions USING btree (group_id);
-CREATE INDEX session_tasks_task_idx ON public.session_tasks USING btree (task_id);
-CREATE INDEX task_groups_group_idx ON public.task_groups USING btree (group_id);
-CREATE INDEX shared_sessions_owner_idx ON public.shared_sessions USING btree (owner_id);
-CREATE INDEX shared_session_time_user_idx ON public.shared_session_time USING btree (user_id);
-CREATE INDEX messages_unread_idx ON public.messages USING btree (recipient_id, sender_id) WHERE (read_at IS NULL);
-CREATE INDEX notifications_unread_idx ON public.notifications USING btree (user_id) WHERE (read_at IS NULL);
-
---
--- Index from migration 016 (reminder mails)
---
-
-CREATE INDEX tasks_reminder_email_idx ON public.tasks USING btree (due) WHERE (reminder_email AND (NOT done));
-
 
 --
 -- PostgreSQL database dump complete

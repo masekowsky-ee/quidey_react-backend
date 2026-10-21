@@ -470,7 +470,7 @@ app.get("/api/tasks/:id/groups", async (req, res) => {
 
     try {
         const result = await pool.query(
-            `SELECT groups.id, groups.name, groups.description
+            `SELECT groups.id, groups.name, groups.description, groups.color
             FROM groups
             JOIN task_groups ON groups.id = task_groups.group_id
             WHERE task_groups.task_id = $1 AND groups.user_id = $2
@@ -722,19 +722,22 @@ app.post("/api/tasks", async (req, res) => {
     }
 });
 
+// { name, description, color? } (color: one of TASK_COLORS or null)
 app.post("/api/groups", async (req, res) => {
     const userId = req.user.userId;
     const name = cleanText(req.body?.name, GROUP_NAME_MAX);
     const description = cleanText(req.body?.description, GROUP_DESCRIPTION_MAX);
+    const color = req.body?.color === undefined ? null : TASK_EXTRAS.color(req.body.color);
     if (!name) return invalidInput(res, "name");
     if (description === undefined) return invalidInput(res, "description");
+    if (color === undefined) return invalidInput(res, "color");
 
     try {
         const result = await pool.query(
-            `INSERT INTO groups (name, description, user_id)
-            VALUES ($1, $2, $3)
+            `INSERT INTO groups (name, description, user_id, color)
+            VALUES ($1, $2, $3, $4)
             RETURNING *`,
-            [name, description, userId]
+            [name, description, userId, color]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -1949,22 +1952,26 @@ async function createNextRepeat(db, taskId) {
     return nextId;
 }
 
+// { name, description, color? }; without color the colour stays as it is
 app.put("/api/groups/:id", async (req, res) => {
     const id = idParam(req.params.id);
     const userId = req.user.userId;
     if (!id) return notFound(res, "Group");
     const name = cleanText(req.body?.name, GROUP_NAME_MAX);
     const description = cleanText(req.body?.description, GROUP_DESCRIPTION_MAX);
+    const keepColor = req.body?.color === undefined;
+    const color = keepColor ? null : TASK_EXTRAS.color(req.body.color);
     if (!name) return invalidInput(res, "name");
     if (description === undefined) return invalidInput(res, "description");
+    if (color === undefined) return invalidInput(res, "color");
 
     try {
         const result = await pool.query(
             `UPDATE groups
-            SET name = $1, description = $2
+            SET name = $1, description = $2, color = CASE WHEN $5 THEN color ELSE $6 END
             WHERE id = $3 AND user_id = $4
             RETURNING *`,
-            [name, description, id, userId]
+            [name, description, id, userId, keepColor, color]
         );
 
         if(result.rows.length === 0) {

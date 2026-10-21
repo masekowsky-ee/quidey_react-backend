@@ -248,6 +248,18 @@ describe("task colours and reminders by mail", () => {
         assert.equal(cleared.color, null);
     });
 
+    test("a group's colour: same colours, kept when a change leaves it out, can be cleared", async () => {
+        assert.equal((await call("POST", "/api/groups", { name: "Bunt", description: "", color: "chartreuse" }, ann.token)).status, 400);
+        assert.equal((await call("POST", "/api/groups", { name: "Grau", description: "" }, ann.token)).data.color, null);
+        const group = (await call("POST", "/api/groups", { name: "Bunt", description: "", color: "violet" }, ann.token)).data;
+        assert.equal(group.color, "violet");
+        assert.equal((await call("PUT", `/api/groups/${group.id}`, { name: "Bunt", description: "neu" }, ann.token)).data.color, "violet");
+        assert.equal((await call("PUT", `/api/groups/${group.id}`, { name: "Bunt", description: "", color: "pink" }, ann.token)).data.color, "pink");
+        assert.equal((await call("PUT", `/api/groups/${group.id}`, { name: "Bunt", description: "", color: "beige" }, ann.token)).status, 400);
+        assert.equal((await call("PUT", `/api/groups/${group.id}`, { name: "Bunt", description: "", color: null }, ann.token)).data.color, null);
+        assert.equal((await call("PUT", `/api/groups/${group.id}`, { name: "Bunt", description: "", color: "teal" }, ben.token)).status, 404, "not someone else's");
+    });
+
     test("the app's time zone and language are checked and stored", async () => {
         assert.equal((await call("PUT", "/api/users/locale", { timezone: "Mars/Olympus" }, ann.token)).status, 400);
         assert.equal((await call("PUT", "/api/users/locale", { timezone: "'; DROP TABLE users; --" }, ann.token)).status, 400);
