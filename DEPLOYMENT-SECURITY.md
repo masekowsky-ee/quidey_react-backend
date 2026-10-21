@@ -15,8 +15,36 @@ going live, and again when the setup changes.
   ```
 
   Then in the server's `.env`: `DB_USER=quidey_app` and that password.
-  Migrations keep running as `postgres` (`psql -U postgres -d quidey -f migrations/00X_….sql`);
-  tables they create are granted to `quidey_app` automatically.
+  Migrations keep running as `postgres`; tables they create are granted to `quidey_app`
+  automatically. See **Migrations** below.
+
+### Migrations
+
+`scripts/migrate.sh` applies every `migrations/NNN_*.sql` that hasn't run yet, in order, and
+records each one in the table `schema_migrations`. Every file runs in one transaction together
+with its record: either all of it is applied, or nothing. The first error stops the run.
+Never run migration files by hand with `psql` any more, or the record misses them.
+
+Install it once as a root-owned copy (the app user must not be able to change what root runs),
+and again whenever `scripts/migrate.sh` changes:
+
+```sh
+sudo install -o root -g root -m 755 /srv/quidey/backend/scripts/migrate.sh /usr/local/sbin/quidey-migrate
+```
+
+```sh
+sudo quidey-migrate status        # applied / pending, changes nothing
+sudo quidey-migrate               # apply what's pending (call this in the deploy, after git pull)
+sudo quidey-migrate baseline 017  # once: record 001..017 as applied WITHOUT running them
+```
+
+- **A database created from `schema.sql`** already contains every migration: run
+  `baseline` with the highest number in `migrations/` right after creating it.
+- **Rules for new files** (also checked by `npm test`): `NNN_lower_case_name.sql`, every number
+  only once, nothing that can't run inside a transaction (`CREATE INDEX CONCURRENTLY`, `VACUUM`,
+  `COMMIT`). Never edit or rename a file after it ran on the server; write a new one instead.
+- Settings via environment: `QUIDEY_DIR` (default `/srv/quidey/backend`), `QUIDEY_DB`
+  (`quidey`), `APP_USER` (`quidey`), `PG_SUPERUSER` (`postgres`).
 - **Only reachable from the server itself.** In `postgresql.conf`:
   `listen_addresses = 'localhost'` (on the dev machine it is currently `*`).
   In `pg_hba.conf`, only `host … 127.0.0.1/32 scram-sha-256` and `::1/128` lines; no `0.0.0.0/0`.
@@ -61,8 +89,8 @@ going live, and again when the setup changes.
   nginx: `gzip on; gzip_types application/json;`), Node doesn't do it itself.
 - **Account cache:** pro/admin changes and sign-outs made in the app count at once. Changes made
   with `npm run pro` or psql take up to 15 s (`ACCOUNT_CACHE_MS`), because they bypass the server.
-- **Migrations:** run `migrations/015_performance_indexes.sql` once on a database created before
-  it (the indexes make the everyday queries fast as the tables grow).
+- **Migrations:** `sudo quidey-migrate` after every `git pull`, before restarting the service
+  (see section 1).
 
 ## 4. The frontend (Cloudflare)
 
