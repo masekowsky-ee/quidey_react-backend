@@ -793,6 +793,151 @@ describe("owners", () => {
     });
 });
 
+describe("profiles and statistics", () => {
+    // a session on a day relative to today, at noon in Berlin (stored like the app stores them)
+    const sessionOn = (userId, daysAgo, ms) => sql(
+        `INSERT INTO sessions (user_id, time_ms, date)
+        VALUES ($1, $2, (((now() AT TIME ZONE 'Europe/Berlin')::date - $3::int) + time '12:00') AT TIME ZONE 'Europe/Berlin')`,
+        [userId, ms, daysAgo]
+    );
+
+    test("I set up my profile; wrong values are refused", async () => {
+        const pam = await member("profpam");
+        const saved = await call("PUT", "/api/profile", {
+            bio: "  Ich lerne gern früh.  ", status: "Mathe-Klausur am Freitag", study: "Informatik, 3. Semester",
+            interests: ["Mathe", "mathe", " Physik ", ""], color: "teal", banner: "aurora", emoji: "📚", showStats: true,
+        }, pam.token);
+        assert.equal(saved.status, 200, JSON.stringify(saved.data));
+        assert.equal(saved.data.relation, "self");
+        assert.equal(saved.data.bio, "Ich lerne gern früh.");
+        assert.deepEqual(saved.data.interests, ["Mathe", "Physik"], "trimmed, empty and doubled tags dropped");
+        assert.equal(saved.data.color, "teal");
+        assert.equal(saved.data.banner, "aurora");
+        assert.equal(saved.data.emoji, "📚");
+        assert.equal(saved.data.showStats, true);
+        assert.ok(saved.data.stats, "I always see my own numbers");
+
+        for (const [body, field] of [
+            [{ color: "black" }, "color"], [{ banner: "photo" }, "banner"], [{ emoji: "X" }, "emoji"],
+            [{ bio: "x".repeat(281) }, "bio"], [{ status: 5 }, "status"],
+            [{ interests: ["a", "b", "c", "d", "e", "f", "g"] }, "interests"], [{ interests: "Mathe" }, "interests"],
+            [{ interests: ["x".repeat(25)] }, "interests"], [{ showStats: "yes" }, "showStats"],
+        ]) {
+            const r = await call("PUT", "/api/profile", body, pam.token);
+            assert.equal(r.status, 400, JSON.stringify(body));
+            assert.equal(r.data.field, field);
+        }
+
+        // only what is sent changes; null and "" clear
+        const partial = (await call("PUT", "/api/profile", { study: "", color: null }, pam.token)).data;
+        assert.equal(partial.study, null);
+        assert.equal(partial.color, null);
+        assert.equal(partial.bio, "Ich lerne gern früh.");
+        assert.equal((await call("GET", "/api/profile", null, pam.token)).data.banner, "aurora");
+    });
+
+    test("strangers only see the names, friends see the profile, mutual friends and statistics", async () => {
+        const pia = await member("profpia");
+        const quinn = await member("profquinn");
+        const viktor = await member("profviktor");
+        const rex = await member("profrex");
+        await befriend(pia, quinn, "profquinn");
+        await befriend(pia, viktor, "profviktor");
+        await befriend(quinn, viktor, "profviktor");
+        await call("PUT", "/api/profile", { bio: "Hallo!", status: "Lernt Bio", emoji: "🦊", color: "violet", banner: "dots" }, pia.token);
+
+        const stranger = await call("GET", "/api/profiles/PROFPIA", null, rex.token);
+        assert.equal(stranger.status, 200, "the username is found in any case");
+        assert.deepEqual(Object.keys(stranger.data).sort(), ["displayName", "id", "relation", "username"]);
+        assert.equal(stranger.data.relation, "none");
+
+        const friend = (await call("GET", "/api/profiles/@profpia", null, quinn.token)).data;
+        assert.equal(friend.relation, "friend");
+        assert.equal(friend.bio, "Hallo!");
+        assert.equal(friend.emoji, "🦊");
+        assert.ok(friend.friendsSince);
+        assert.ok(friend.stats);
+        assert.equal(friend.showStats, undefined, "the switch itself stays mine");
+        assert.equal(friend.mutualFriendCount, 1);
+        assert.deepEqual(friend.mutualFriends.map(m => m.username), ["profviktor"]);
+        for (const data of [stranger.data, friend]) {
+            const text = JSON.stringify(data);
+            assert.ok(!text.includes("@example.com") && !text.includes("1995"), "never email or birth date");
+        }
+
+        // the friends list carries the avatar and status, for the rows on the Social page
+        const listed = (await call("GET", "/api/friends", null, quinn.token)).data.find(f => f.username === "profpia");
+        assert.deepEqual([listed.emoji, listed.color, listed.status], ["🦊", "violet", "Lernt Bio"]);
+
+        // an open request shows from both sides, with its id
+        const sent = await call("POST", "/api/friends/requests", { username: "profpia" }, rex.token);
+        const out = (await call("GET", "/api/profiles/profpia", null, rex.token)).data;
+        assert.deepEqual([out.relation, out.requestId, out.bio], ["outgoing", sent.data.request.id, undefined]);
+        const incoming = (await call("GET", "/api/profiles/profrex", null, pia.token)).data;
+        assert.deepEqual([incoming.relation, incoming.requestId, incoming.stats], ["incoming", sent.data.request.id, undefined]);
+
+        // statistics can be hidden from friends
+        await call("PUT", "/api/profile", { showStats: false }, pia.token);
+        assert.equal((await call("GET", "/api/profiles/profpia", null, quinn.token)).data.stats, null);
+        const own = (await call("GET", "/api/profile", null, pia.token)).data;
+        assert.equal(own.showStats, false);
+        assert.ok(own.stats);
+    });
+
+    test("statistics count days in the user's timezone: streaks, best day, groups", async () => {
+        const sam = await member("profsam");
+        await sql("UPDATE users SET timezone = 'Europe/Berlin' WHERE id = $1", [sam.id]);
+        await sessionOn(sam.id, 0, 1_500_000);
+        await sessionOn(sam.id, 1, 900_000);
+        await sessionOn(sam.id, 3, 1_200_000);
+        await sessionOn(sam.id, 3, 1_800_000);
+        await call("POST", "/api/groups", { name: "Mathe", description: "" }, sam.token);
+        assert.equal((await call("POST", "/api/sessions", { totalTime: 600, workedTasks: [], group: "Mathe" }, sam.token)).status, 201);
+        await sql("INSERT INTO tasks (name, user_id, done, completed_at) VALUES ('Blatt 3', $1, true, now())", [sam.id]);
+
+        const stats = (await call("GET", "/api/profile", null, sam.token)).data.stats;
+        assert.equal(stats.totalMs, 6_000_000);
+        assert.equal(stats.sessions, 5);
+        assert.equal(stats.activeDays, 3);
+        assert.equal(stats.currentStreak, 2);
+        assert.equal(stats.longestStreak, 2);
+        assert.equal(stats.longestSessionMs, 1_800_000);
+        assert.equal(stats.avgSessionMs, 1_200_000);
+        assert.equal(stats.todayMs, 2_100_000);
+        assert.equal(stats.weekMs, 6_000_000);
+        assert.equal(stats.lastWeekMs, 0);
+        assert.equal(stats.daily.length, 182);
+        assert.equal(stats.daily.at(-1), 2_100_000);
+        assert.equal(stats.daily.at(-4), 3_000_000);
+        assert.equal(stats.bestDay.ms, 3_000_000);
+        assert.equal(stats.weekdays.reduce((a, b) => a + b, 0), 6_000_000);
+        assert.notEqual(stats.favoriteTime, null);
+        assert.deepEqual(stats.topGroups.map(g => [g.name, g.ms]), [["Mathe", 600_000]]);
+        assert.equal(stats.tasksDone, 1);
+        assert.equal(stats.tasksDoneWeek, 1);
+
+        // a streak that ended yesterday still counts today; after a gap it's gone
+        const tim = await member("proftim");
+        await sessionOn(tim.id, 1, 60_000);
+        await sessionOn(tim.id, 2, 60_000);
+        assert.equal((await call("GET", "/api/profile", null, tim.token)).data.stats.currentStreak, 2);
+        await sql("DELETE FROM sessions WHERE user_id = $1", [tim.id]);
+        await sessionOn(tim.id, 2, 60_000);
+        const later = (await call("GET", "/api/profile", null, tim.token)).data.stats;
+        assert.deepEqual([later.currentStreak, later.longestStreak], [0, 1]);
+    });
+
+    test("needs a login and app access; unknown names are 404", async () => {
+        const una = await member("profuna");
+        const out = await member("profout", { pro: false });
+        assert.equal((await call("GET", "/api/profiles/profuna")).status, 401);
+        assert.equal((await call("GET", "/api/profiles/profuna", null, out.token)).data.code, "PRO_REQUIRED");
+        assert.equal((await call("PUT", "/api/profile", { bio: "x" }, out.token)).data.code, "PRO_REQUIRED");
+        const missing = await call("GET", "/api/profiles/nobody_here", null, una.token);
+        assert.deepEqual([missing.status, missing.data.code], [404, "USER_NOT_FOUND"]);
+    });
+});
+
 describe("deleting an account", () => {
     test("needs the password; the last admin can't leave", async () => {
         const solo = await member("lastadmin", { admin: true });

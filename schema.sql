@@ -639,7 +639,22 @@ CREATE TABLE public.users (
     timezone text,
     language text,
     is_tester boolean DEFAULT false NOT NULL,
-    CONSTRAINT users_language_check CHECK (((language IS NULL) OR (language = ANY (ARRAY['de'::text, 'en'::text]))))
+    bio text,
+    status_text text,
+    study text,
+    interests text[] DEFAULT '{}'::text[] NOT NULL,
+    profile_color text,
+    banner text,
+    avatar_emoji text,
+    show_stats boolean DEFAULT true NOT NULL,
+    CONSTRAINT users_avatar_emoji_check CHECK (((avatar_emoji IS NULL) OR (length(avatar_emoji) <= 16))),
+    CONSTRAINT users_banner_check CHECK (((banner IS NULL) OR (banner = ANY (ARRAY['gradient'::text, 'aurora'::text, 'dots'::text, 'stripes'::text, 'grid'::text, 'glow'::text])))),
+    CONSTRAINT users_bio_check CHECK (((bio IS NULL) OR (length(bio) <= 280))),
+    CONSTRAINT users_interests_check CHECK ((cardinality(interests) <= 6)),
+    CONSTRAINT users_language_check CHECK (((language IS NULL) OR (language = ANY (ARRAY['de'::text, 'en'::text])))),
+    CONSTRAINT users_profile_color_check CHECK (((profile_color IS NULL) OR (profile_color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
+    CONSTRAINT users_status_text_check CHECK (((status_text IS NULL) OR (length(status_text) <= 80))),
+    CONSTRAINT users_study_check CHECK (((study IS NULL) OR (length(study) <= 60)))
 );
 
 --

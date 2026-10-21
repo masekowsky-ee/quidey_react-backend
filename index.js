@@ -213,6 +213,8 @@ app.use("/api/users", authenticateToken);
 app.use("/api/friends", authenticateToken);
 app.use("/api/shared-sessions", authenticateToken);
 app.use("/api/task-shares", authenticateToken);
+app.use("/api/profiles", authenticateToken);
+app.use("/api/profile", authenticateToken);
 
 // Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
 // Checked against the account on every request (not stored in the token; see loadAccount), so
@@ -226,7 +228,7 @@ function requirePro(req, res, next) {
 }
 
 app.use(
-    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares"],
+    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile"],
     requirePro
 );
 
@@ -2175,7 +2177,8 @@ app.get("/api/friends", async (req, res) => {
     const userId = req.user.userId;
     try {
         const result = await pool.query(
-            `SELECT users.id, users.username, users.display_name, friendships.responded_at AS since
+            `SELECT users.id, users.username, users.display_name, friendships.responded_at AS since,
+                users.avatar_emoji, users.profile_color, users.status_text
             FROM friendships
             JOIN users ON users.id = CASE WHEN friendships.requester_id = $1
                 THEN friendships.addressee_id ELSE friendships.requester_id END
@@ -2184,7 +2187,11 @@ app.get("/api/friends", async (req, res) => {
             ORDER BY lower(COALESCE(users.display_name, users.username))`,
             [userId]
         );
-        res.json(result.rows.map(row => ({ ...publicUser(row), since: row.since })));
+        // friends also see each other's avatar and status (see /api/profiles)
+        res.json(result.rows.map(row => ({
+            ...publicUser(row), since: row.since,
+            emoji: row.avatar_emoji, color: row.profile_color, status: row.status_text,
+        })));
     } catch (err) {
         serverError(res, err);
     }
@@ -2342,6 +2349,290 @@ app.delete("/api/friends/:userId", async (req, res) => {
         }
         realtime.toUser(friendId, "friends:changed", {});
         res.json({ userId: friendId });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- Profiles ----------
+// Anybody signed in can open a profile by username, but only sees username and display name
+// (what a friend request reveals anyway). Friends and I myself also see what I set up for my
+// profile (bio, status, colour, banner, ...), our mutual friends and, unless I switched it off
+// (show_stats), my focus statistics. Email, birth date and timezone never leave the server.
+
+// The same lists as in the frontend (src/features/profile/profileOptions.js)
+const PROFILE_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
+const PROFILE_BANNERS = ["gradient", "aurora", "dots", "stripes", "grid", "glow"];
+const PROFILE_EMOJIS = [
+    "📚", "✏️", "🎧", "☕", "🌱", "🔥", "⭐", "🚀", "🧠", "🎯",
+    "🌙", "☀️", "🐱", "🐶", "🦊", "🐼", "🐸", "🦉", "🌸", "🍀",
+    "🎨", "🎸", "⚽", "💻", "🧪", "📐", "🌍", "🎮", "🍕", "🦄",
+];
+const BIO_MAX = 280;
+const STATUS_MAX = 80;
+const STUDY_MAX = 60;
+const INTERESTS_MAX = 6;
+const INTEREST_MAX = 24;
+const MUTUAL_FRIENDS_MAX = 24;
+// the heat map on the profile: 26 weeks up to today
+const STATS_DAYS = 182;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Opening profiles answers "does this username exist?", so it is limited per account
+const profileLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_PROFILE", 300),
+    skip: (req) => req.method === "OPTIONS",
+    keyGenerator: (req) => `user:${req.user.userId}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many requests, please try again later", code: "RATE_LIMITED" },
+});
+
+// Ids of my accepted friends, as SQL for `IN (...)`; `param` is the placeholder of my id
+const friendIdsOf = (param) => `
+    SELECT CASE WHEN requester_id = ${param} THEN addressee_id ELSE requester_id END
+    FROM friendships WHERE status = 'accepted' AND ${param} IN (requester_id, addressee_id)`;
+
+// Focus statistics of one user. Days are counted in their own timezone (users.timezone, as for
+// reminder mails): a session at 23:30 in Berlin belongs to that day, not the next one.
+async function loadStats(userId) {
+    const result = await pool.query(
+        `WITH me AS (SELECT COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = $1),
+        local AS (
+            SELECT (sessions.date AT TIME ZONE current_setting('TimeZone')) AT TIME ZONE me.tz AS at,
+                COALESCE(sessions.time_ms, 0)::bigint AS ms
+            FROM sessions, me
+            WHERE sessions.user_id = $1 AND sessions.date IS NOT NULL
+        )
+        SELECT
+            (SELECT to_char((now() AT TIME ZONE tz)::date, 'YYYY-MM-DD') FROM me) AS today,
+            (SELECT COALESCE(json_agg(json_build_object('day', day, 'ms', ms, 'sessions', n, 'longest', longest) ORDER BY day), '[]')
+                FROM (SELECT to_char(at::date, 'YYYY-MM-DD') AS day, sum(ms) AS ms, count(*) AS n, max(ms) AS longest
+                    FROM local GROUP BY at::date) AS days) AS days,
+            (SELECT COALESCE(json_agg(json_build_object('hour', hour, 'ms', ms)), '[]')
+                FROM (SELECT extract(hour FROM at)::int AS hour, sum(ms) AS ms FROM local GROUP BY 1) AS hours) AS hours,
+            (SELECT COALESCE(json_agg(json_build_object('name', name, 'color', color, 'ms', ms) ORDER BY ms DESC), '[]')
+                FROM (SELECT groups.name, groups.color, sum(sessions.time_ms) AS ms
+                    FROM sessions JOIN groups ON groups.id = sessions.group_id
+                    WHERE sessions.user_id = $1 AND sessions.time_ms > 0
+                    GROUP BY groups.id ORDER BY ms DESC LIMIT 3) AS top) AS top_groups,
+            (SELECT count(*) FILTER (WHERE done)::int FROM tasks WHERE user_id = $1) AS tasks_done,
+            (SELECT count(*) FILTER (WHERE done AND completed_at >= now() - interval '7 days')::int
+                FROM tasks WHERE user_id = $1) AS tasks_done_week,
+            (SELECT count(*)::int FROM friendships
+                WHERE status = 'accepted' AND $1 IN (requester_id, addressee_id)) AS friends,
+            (SELECT count(*)::int FROM shared_session_members WHERE user_id = $1 AND status = 'joined') AS shared_sessions,
+            (SELECT COALESCE(sum(time_ms), 0)::bigint FROM shared_session_time WHERE user_id = $1) AS shared_ms`,
+        [userId]
+    );
+    return summarizeStats(result.rows[0]);
+}
+
+// The numbers the profile shows, from the per-day and per-hour sums
+function summarizeStats(row) {
+    const days = row.days.map(d => ({ ...d, ms: Number(d.ms), longest: Number(d.longest) }));
+    const active = days.filter(d => d.ms > 0);
+    const byDay = new Map(active.map(d => [d.day, d.ms]));
+    const time = (day) => Date.parse(`${day}T00:00:00Z`);
+    const today = time(row.today);
+    const dayBefore = (n) => new Date(today - n * DAY_MS).toISOString().slice(0, 10);
+
+    // focus per day, oldest first, the last one is today
+    const daily = Array.from({ length: STATS_DAYS }, (_, i) => byDay.get(dayBefore(STATS_DAYS - 1 - i)) ?? 0);
+    const sumOf = (from, to) => daily.slice(STATS_DAYS - to, STATS_DAYS - from).reduce((a, b) => a + b, 0);
+
+    // a streak still counts while today has no session yet: it only ends after a day without one
+    let currentStreak = 0;
+    for (let n = byDay.has(row.today) ? 0 : 1; byDay.has(dayBefore(n)); n++) currentStreak++;
+    let longestStreak = 0;
+    let run = 0;
+    active.forEach((d, i) => {
+        run = i > 0 && time(d.day) - time(active[i - 1].day) === DAY_MS ? run + 1 : 1;
+        longestStreak = Math.max(longestStreak, run);
+    });
+
+    // Monday first, like the calendar
+    const weekdays = Array(7).fill(0);
+    for (const d of active) weekdays[(new Date(time(d.day)).getUTCDay() + 6) % 7] += d.ms;
+
+    const parts = { morning: 0, afternoon: 0, evening: 0, night: 0 };
+    for (const { hour, ms } of row.hours) {
+        const part = hour >= 5 && hour < 12 ? "morning" : hour >= 12 && hour < 17 ? "afternoon" : hour >= 17 && hour < 22 ? "evening" : "night";
+        parts[part] += Number(ms);
+    }
+    const favoriteTime = Object.entries(parts).reduce((best, entry) => (entry[1] > best[1] ? entry : best), [null, 0])[0];
+
+    const totalMs = days.reduce((sum, d) => sum + d.ms, 0);
+    const sessions = days.reduce((sum, d) => sum + d.sessions, 0);
+    const best = active.reduce((top, d) => (!top || d.ms > top.ms ? d : top), null);
+
+    return {
+        today: row.today,
+        totalMs,
+        sessions,
+        activeDays: active.length,
+        avgSessionMs: sessions > 0 ? Math.round(totalMs / sessions) : 0,
+        longestSessionMs: days.reduce((max, d) => Math.max(max, d.longest), 0),
+        currentStreak,
+        longestStreak,
+        todayMs: daily[STATS_DAYS - 1],
+        weekMs: sumOf(0, 7),
+        lastWeekMs: sumOf(7, 14),
+        monthMs: sumOf(0, 30),
+        bestDay: best ? { day: best.day, ms: best.ms } : null,
+        weekdays,
+        favoriteTime,
+        daily,
+        topGroups: row.top_groups.map(g => ({ name: g.name, color: g.color, ms: Number(g.ms) })),
+        tasksDone: row.tasks_done,
+        tasksDoneWeek: row.tasks_done_week,
+        friends: row.friends,
+        sharedSessions: row.shared_sessions,
+        sharedMs: Number(row.shared_ms),
+    };
+}
+
+// A profile as `viewerId` may see it, or null when there is no such user.
+// relation: 'self' | 'friend' | 'incoming' (they asked me) | 'outgoing' (I asked them) | 'none';
+// requestId is the open friend request, to accept or withdraw it right from the profile.
+async function loadProfile(where, value, viewerId) {
+    const result = await pool.query(
+        `SELECT users.id, users.username, users.display_name, users.created_at, users.bio, users.status_text,
+            users.study, users.interests, users.profile_color, users.banner, users.avatar_emoji, users.show_stats,
+            friendships.id AS friendship_id, friendships.status AS friendship_status,
+            friendships.requester_id, friendships.responded_at
+        FROM users
+        LEFT JOIN friendships
+            ON LEAST(friendships.requester_id, friendships.addressee_id) = LEAST(users.id, $2::int)
+            AND GREATEST(friendships.requester_id, friendships.addressee_id) = GREATEST(users.id, $2::int)
+        WHERE ${where === "id" ? "users.id = $1" : "lower(users.username) = lower($1)"}`,
+        [value, viewerId]
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+
+    const relation = row.id === viewerId ? "self"
+        : row.friendship_status === "accepted" ? "friend"
+        : row.friendship_status === "pending" ? (row.requester_id === viewerId ? "outgoing" : "incoming")
+        : "none";
+    const profile = {
+        ...publicUser(row),
+        relation,
+        ...(relation === "incoming" || relation === "outgoing" ? { requestId: row.friendship_id } : {}),
+    };
+    if (relation !== "self" && relation !== "friend") return profile;
+
+    const statsVisible = relation === "self" || row.show_stats;
+    const [stats, mutual] = await Promise.all([
+        statsVisible ? loadStats(row.id) : null,
+        relation === "friend"
+            ? pool.query(
+                `SELECT users.id, users.username, users.display_name, users.avatar_emoji, users.profile_color,
+                    count(*) OVER ()::int AS total
+                FROM users
+                WHERE users.id IN (${friendIdsOf("$1::int")}) AND users.id IN (${friendIdsOf("$2::int")})
+                ORDER BY lower(COALESCE(users.display_name, users.username))
+                LIMIT ${MUTUAL_FRIENDS_MAX}`,
+                [row.id, viewerId]
+            )
+            : null,
+    ]);
+
+    return {
+        ...profile,
+        memberSince: row.created_at,
+        ...(relation === "friend" ? { friendsSince: row.responded_at } : {}),
+        bio: row.bio,
+        status: row.status_text,
+        study: row.study,
+        interests: row.interests,
+        color: row.profile_color,
+        banner: row.banner,
+        emoji: row.avatar_emoji,
+        // only I see the switch itself; friends see `stats: null` when it is off
+        ...(relation === "self" ? { showStats: row.show_stats } : {}),
+        stats,
+        ...(mutual ? {
+            mutualFriends: mutual.rows.map(m => ({ ...publicUser(m), emoji: m.avatar_emoji, color: m.profile_color })),
+            mutualFriendCount: mutual.rows[0]?.total ?? 0,
+        } : {}),
+    };
+}
+
+// Somebody's profile by username (with or without "@"); 404 USER_NOT_FOUND when there is none
+app.get("/api/profiles/:username", profileLimiter, async (req, res) => {
+    const username = String(req.params.username).trim().replace(/^@/, "");
+    if (!username || username.length > 30) return res.status(404).json({ error: "User not found", code: "USER_NOT_FOUND" });
+    try {
+        const profile = await loadProfile("username", username, req.user.userId);
+        if (!profile) return res.status(404).json({ error: "User not found", code: "USER_NOT_FOUND" });
+        res.json(profile);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// My own profile with all statistics
+app.get("/api/profile", async (req, res) => {
+    try {
+        res.json(await loadProfile("id", req.user.userId, req.user.userId));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Set up my profile. Every field is optional, only the ones sent change; empty text or null clears:
+// { bio, status, study, interests: [...], color, banner, emoji, showStats }. Answers with my profile.
+app.put("/api/profile", async (req, res) => {
+    const body = req.body ?? {};
+    const columns = {};
+
+    const text = { bio: ["bio", BIO_MAX], status: ["status_text", STATUS_MAX], study: ["study", STUDY_MAX] };
+    for (const [field, [column, max]] of Object.entries(text)) {
+        if (!(field in body)) continue;
+        const value = cleanText(body[field], max);
+        if (value === undefined) return invalidInput(res, field);
+        columns[column] = value;
+    }
+
+    if ("interests" in body) {
+        const list = body.interests ?? [];
+        if (!Array.isArray(list) || list.length > INTERESTS_MAX * 2) return invalidInput(res, "interests");
+        const interests = [];
+        for (const item of list) {
+            const tag = cleanText(item, INTEREST_MAX);
+            if (tag === undefined) return invalidInput(res, "interests");
+            // empty ones and the same tag twice (in any case) are dropped
+            if (tag && !interests.some(t => t.toLowerCase() === tag.toLowerCase())) interests.push(tag);
+        }
+        if (interests.length > INTERESTS_MAX) return invalidInput(res, "interests");
+        columns.interests = interests;
+    }
+
+    const choices = { color: ["profile_color", PROFILE_COLORS], banner: ["banner", PROFILE_BANNERS], emoji: ["avatar_emoji", PROFILE_EMOJIS] };
+    for (const [field, [column, allowed]] of Object.entries(choices)) {
+        if (!(field in body)) continue;
+        const value = body[field] ?? null;
+        if (value !== null && !allowed.includes(value)) return invalidInput(res, field);
+        columns[column] = value;
+    }
+
+    if ("showStats" in body) {
+        if (typeof body.showStats !== "boolean") return invalidInput(res, "showStats");
+        columns.show_stats = body.showStats;
+    }
+
+    try {
+        const names = Object.keys(columns);
+        if (names.length > 0) {
+            // the column names come from the lists above, never from the request
+            await pool.query(
+                `UPDATE users SET ${names.map((name, i) => `${name} = $${i + 2}`).join(", ")} WHERE id = $1`,
+                [req.user.userId, ...Object.values(columns)]
+            );
+        }
+        res.json(await loadProfile("id", req.user.userId, req.user.userId));
     } catch (err) {
         serverError(res, err);
     }
