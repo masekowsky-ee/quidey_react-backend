@@ -18,6 +18,9 @@
 //   invites:changed   {}                      my session invites changed
 //   friends:changed   {}                      a friend request or friendship involving me changed
 //   tasks:changed     { taskId }              a task shared with me (or by me) changed
+//   family:changed    { familyId }            a family I'm in or invited to changed (members,
+//                                             name, calendar entries), or it was deleted
+//   family:message    { familyId, message }   a new message in a family's chat (testers only)
 // The *:changed events carry no data on purpose: the app loads what it shows again, so nothing
 // can get out of step, and the server only does that work when something actually changed.
 // From the browser:

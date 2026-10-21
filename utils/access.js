@@ -10,4 +10,7 @@ const hasTesterAccess = (account) => Boolean(account.is_tester || account.is_adm
 // The same as hasAppAccess, for SQL on the users table
 const APP_ACCESS_SQL = "(users.is_pro OR users.is_tester OR users.is_admin)";
 
-module.exports = { hasAppAccess, hasTesterAccess, APP_ACCESS_SQL };
+// The same as hasTesterAccess, for SQL on the users table
+const TESTER_ACCESS_SQL = "(users.is_tester OR users.is_admin)";
+
+module.exports = { hasAppAccess, hasTesterAccess, APP_ACCESS_SQL, TESTER_ACCESS_SQL };

@@ -170,6 +170,124 @@ CREATE SEQUENCE public.email_verification_tokens_id_seq
 ALTER SEQUENCE public.email_verification_tokens_id_seq OWNED BY public.email_verification_tokens.id;
 
 --
+-- Name: families; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.families (
+    id integer NOT NULL,
+    name text NOT NULL,
+    owner_id integer NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT families_name_check CHECK (((char_length(name) >= 1) AND (char_length(name) <= 60)))
+);
+
+--
+-- Name: families_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.families_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: families_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.families_id_seq OWNED BY public.families.id;
+
+--
+-- Name: family_members; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.family_members (
+    family_id integer NOT NULL,
+    user_id integer NOT NULL,
+    status text NOT NULL,
+    invited_by integer,
+    invited_at timestamp with time zone DEFAULT now() NOT NULL,
+    joined_at timestamp with time zone,
+    CONSTRAINT family_members_status_check CHECK ((status = ANY (ARRAY['invited'::text, 'joined'::text])))
+);
+
+--
+-- Name: family_messages; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.family_messages (
+    id integer NOT NULL,
+    family_id integer NOT NULL,
+    user_id integer NOT NULL,
+    text text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT family_messages_text_check CHECK (((char_length(text) >= 1) AND (char_length(text) <= 1000)))
+);
+
+--
+-- Name: family_messages_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.family_messages_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: family_messages_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.family_messages_id_seq OWNED BY public.family_messages.id;
+
+--
+-- Name: family_tasks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.family_tasks (
+    id integer NOT NULL,
+    family_id integer NOT NULL,
+    name text NOT NULL,
+    description text,
+    done boolean DEFAULT false NOT NULL,
+    due date,
+    due_time time without time zone,
+    prio integer,
+    duration_minutes integer,
+    location text,
+    link text,
+    details text,
+    color text,
+    added_by integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT family_tasks_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
+    CONSTRAINT family_tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
+    CONSTRAINT family_tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080))))
+);
+
+--
+-- Name: family_tasks_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.family_tasks_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: family_tasks_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.family_tasks_id_seq OWNED BY public.family_tasks.id;
+
+--
 -- Name: friendships; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -694,6 +812,24 @@ ALTER TABLE ONLY public.broadcasts ALTER COLUMN id SET DEFAULT nextval('public.b
 ALTER TABLE ONLY public.email_verification_tokens ALTER COLUMN id SET DEFAULT nextval('public.email_verification_tokens_id_seq'::regclass);
 
 --
+-- Name: families id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.families ALTER COLUMN id SET DEFAULT nextval('public.families_id_seq'::regclass);
+
+--
+-- Name: family_messages id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_messages ALTER COLUMN id SET DEFAULT nextval('public.family_messages_id_seq'::regclass);
+
+--
+-- Name: family_tasks id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_tasks ALTER COLUMN id SET DEFAULT nextval('public.family_tasks_id_seq'::regclass);
+
+--
 -- Name: friendships id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -799,6 +935,34 @@ ALTER TABLE ONLY public.email_verification_tokens
 
 ALTER TABLE ONLY public.email_verification_tokens
     ADD CONSTRAINT email_verification_tokens_token_hash_key UNIQUE (token_hash);
+
+--
+-- Name: families families_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.families
+    ADD CONSTRAINT families_pkey PRIMARY KEY (id);
+
+--
+-- Name: family_members family_members_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_members
+    ADD CONSTRAINT family_members_pkey PRIMARY KEY (family_id, user_id);
+
+--
+-- Name: family_messages family_messages_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_messages
+    ADD CONSTRAINT family_messages_pkey PRIMARY KEY (id);
+
+--
+-- Name: family_tasks family_tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_tasks
+    ADD CONSTRAINT family_tasks_pkey PRIMARY KEY (id);
 
 --
 -- Name: friendships friendships_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -957,6 +1121,24 @@ CREATE INDEX beta_access_requests_status_idx ON public.beta_access_requests USIN
 --
 
 CREATE INDEX email_verification_tokens_user_idx ON public.email_verification_tokens USING btree (user_id);
+
+--
+-- Name: family_members_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX family_members_user_idx ON public.family_members USING btree (user_id);
+
+--
+-- Name: family_messages_family_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX family_messages_family_idx ON public.family_messages USING btree (family_id, id);
+
+--
+-- Name: family_tasks_family_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX family_tasks_family_idx ON public.family_tasks USING btree (family_id);
 
 --
 -- Name: friendships_addressee_status_idx; Type: INDEX; Schema: public; Owner: -
@@ -1154,6 +1336,62 @@ ALTER TABLE ONLY public.broadcasts
 
 ALTER TABLE ONLY public.email_verification_tokens
     ADD CONSTRAINT email_verification_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: families families_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.families
+    ADD CONSTRAINT families_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: family_members family_members_family_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_members
+    ADD CONSTRAINT family_members_family_id_fkey FOREIGN KEY (family_id) REFERENCES public.families(id) ON DELETE CASCADE;
+
+--
+-- Name: family_members family_members_invited_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_members
+    ADD CONSTRAINT family_members_invited_by_fkey FOREIGN KEY (invited_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+--
+-- Name: family_members family_members_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_members
+    ADD CONSTRAINT family_members_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: family_messages family_messages_family_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_messages
+    ADD CONSTRAINT family_messages_family_id_fkey FOREIGN KEY (family_id) REFERENCES public.families(id) ON DELETE CASCADE;
+
+--
+-- Name: family_messages family_messages_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_messages
+    ADD CONSTRAINT family_messages_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: family_tasks family_tasks_added_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_tasks
+    ADD CONSTRAINT family_tasks_added_by_fkey FOREIGN KEY (added_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+--
+-- Name: family_tasks family_tasks_family_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_tasks
+    ADD CONSTRAINT family_tasks_family_id_fkey FOREIGN KEY (family_id) REFERENCES public.families(id) ON DELETE CASCADE;
 
 --
 -- Name: friendships friendships_addressee_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -

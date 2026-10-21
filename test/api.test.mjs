@@ -938,6 +938,149 @@ describe("profiles and statistics", () => {
     });
 });
 
+describe("Quidey Family (testers only)", () => {
+    let mia, leo, ida, kai;
+    const F = "/api/tester/families";
+    const sockets = [];
+    const connect = (token) => new Promise((resolve, reject) => {
+        const socket = io(API, { auth: { token }, transports: ["websocket"], reconnection: false, forceNew: true });
+        sockets.push(socket);
+        socket.once("connect", () => resolve(socket));
+        socket.once("connect_error", (err) => reject(err));
+    });
+    const next = (socket, event, ms = 2000) => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`no ${event} within ${ms} ms`)), ms);
+        socket.once(event, (payload) => { clearTimeout(timer); resolve(payload); });
+    });
+    const silent = (socket, event, ms = 300) => new Promise((resolve, reject) => {
+        const handler = () => reject(new Error(`unexpected ${event}`));
+        socket.once(event, handler);
+        setTimeout(() => { socket.off(event, handler); resolve(); }, ms);
+    });
+
+    before(async () => {
+        mia = await member("fammia");
+        leo = await member("famleo");
+        ida = await member("famida");
+        kai = await member("famkai");
+        await sql("UPDATE users SET is_tester = true WHERE username IN ('fammia', 'famleo', 'famida')");
+        await befriend(mia, leo, "famleo");
+        await befriend(mia, ida, "famida");
+    });
+    after(() => { for (const socket of sockets) socket.disconnect(); });
+
+    test("only testers get in", async () => {
+        assert.equal((await call("GET", F, null, kai.token)).data.code, "TESTER_REQUIRED");
+        assert.equal((await call("POST", F, { name: "Nope" }, kai.token)).status, 403);
+    });
+
+    test("a family invites friends only; invites are joined or declined", async () => {
+        assert.equal((await call("POST", F, { name: "  " }, mia.token)).data.code, "NAME_REQUIRED");
+        const created = await call("POST", F, { name: "Familie Berg", friendIds: [leo.id, kai.id] }, mia.token);
+        assert.equal(created.status, 201);
+        const family = created.data;
+        assert.equal(family.isOwner, true);
+        assert.deepEqual(family.people.map(p => [p.user.id, p.status]), [[mia.id, "joined"], [leo.id, "invited"]], "kai is no friend");
+
+        assert.equal((await call("GET", `${F}/${family.id}`, null, leo.token)).status, 404, "not joined yet");
+        assert.equal((await call("GET", F, null, leo.token)).data.invites[0].invitedBy.id, mia.id);
+        const joined = await call("POST", `${F}/${family.id}/join`, null, leo.token);
+        assert.equal(joined.status, 200);
+        assert.equal(joined.data.isOwner, false);
+        assert.equal((await call("GET", F, null, leo.token)).data.families[0].memberCount, 2);
+
+        // ida declines
+        assert.equal((await call("POST", `${F}/${family.id}/invites`, { userIds: [ida.id] }, mia.token)).status, 200);
+        assert.equal((await call("POST", `${F}/${family.id}/invites`, { userIds: [ida.id] }, mia.token)).data.code, "NOTHING_TO_INVITE");
+        assert.equal((await call("DELETE", `${F}/${family.id}/members/me`, null, ida.token)).status, 200);
+        assert.equal((await call("GET", F, null, ida.token)).data.invites.length, 0);
+        assert.equal((await call("POST", `${F}/${family.id}/join`, null, ida.token)).status, 404);
+    });
+
+    test("the shared calendar: everybody adds and changes, only the adder or owner removes", async () => {
+        const family = (await call("GET", F, null, mia.token)).data.families.find(f => f.name === "Familie Berg");
+        const day = daysFromToday(3);
+        assert.equal((await call("POST", `${F}/${family.id}/tasks`, { name: "Arzt", due_time: "10:00" }, leo.token)).data.field, "due_time");
+        assert.equal((await call("POST", `${F}/${family.id}/tasks`, { name: "Arzt", color: "plaid" }, leo.token)).data.field, "color");
+        const added = await call("POST", `${F}/${family.id}/tasks`, { name: "Arzt", due: day, due_time: "10:00", location: "Praxis" }, leo.token);
+        assert.equal(added.status, 201);
+        const entry = added.data.tasks[0];
+        assert.equal(entry.due_time, "10:00");
+        assert.equal(entry.addedBy.id, leo.id);
+
+        const moved = await call("PATCH", `${F}/${family.id}/tasks/${entry.id}`, { due: daysFromToday(4), done: true }, mia.token);
+        assert.equal(moved.data.tasks[0].done, true);
+        assert.equal(moved.data.tasks[0].due_time, "10:00", "the time stays with a new day");
+        const undated = await call("PATCH", `${F}/${family.id}/tasks/${entry.id}`, { due: null }, mia.token);
+        assert.equal(undated.data.tasks[0].due_time, null, "no day, no time");
+        assert.equal((await call("PATCH", `${F}/${family.id}/tasks/${entry.id}`, {}, mia.token)).data.code, "NOTHING_TO_CHANGE");
+        assert.equal((await call("PATCH", `${F}/${family.id}/tasks/${entry.id}`, { done: true }, kai.token)).status, 403);
+
+        const mine = (await call("POST", `${F}/${family.id}/tasks`, { name: "Einkaufen", due: day }, mia.token)).data.tasks.find(t => t.name === "Einkaufen");
+        assert.equal((await call("DELETE", `${F}/${family.id}/tasks/${mine.id}`, null, leo.token)).data.code, "NOT_ALLOWED");
+        assert.equal((await call("DELETE", `${F}/${family.id}/tasks/${entry.id}`, null, mia.token)).status, 200, "the owner may");
+        assert.equal((await call("DELETE", `${F}/${family.id}/tasks/${mine.id}`, null, mia.token)).data.tasks.length, 0);
+    });
+
+    test("the chat and changes reach the members live, nobody else", async () => {
+        const family = (await call("GET", F, null, mia.token)).data.families.find(f => f.name === "Familie Berg");
+        const leoLive = await connect(leo.token);
+        const kaiLive = await connect(kai.token);
+        assert.equal((await call("POST", `${F}/${family.id}/messages`, { text: "  " }, mia.token)).data.code, "TEXT_REQUIRED");
+        const [live, sent] = await Promise.all([
+            next(leoLive, "family:message"),
+            call("POST", `${F}/${family.id}/messages`, { text: "Essen um 7?" }, mia.token),
+            silent(kaiLive, "family:message"),
+        ]);
+        assert.equal(sent.status, 201);
+        assert.equal(live.familyId, family.id);
+        assert.equal(live.message.text, "Essen um 7?");
+        assert.equal(live.message.user.id, mia.id);
+        const [changed] = await Promise.all([
+            next(leoLive, "family:changed"),
+            call("POST", `${F}/${family.id}/tasks`, { name: "Kino" }, mia.token),
+        ]);
+        assert.equal(changed.familyId, family.id);
+
+        const chat = (await call("GET", `${F}/${family.id}/messages`, null, leo.token)).data;
+        assert.equal(chat.messages.at(-1).text, "Essen um 7?");
+        assert.equal(chat.hasMore, false);
+        assert.equal((await call("GET", `${F}/${family.id}/messages?before=x`, null, leo.token)).status, 400);
+        assert.equal((await call("GET", `${F}/${family.id}/messages`, null, ida.token)).status, 404, "not a member");
+    });
+
+    test("only the owner renames, removes and deletes; the owner can't leave", async () => {
+        const family = (await call("GET", F, null, mia.token)).data.families.find(f => f.name === "Familie Berg");
+        assert.equal((await call("PATCH", `${F}/${family.id}`, { name: "Bergs" }, leo.token)).data.code, "NOT_OWNER");
+        assert.equal((await call("PATCH", `${F}/${family.id}`, { name: "Bergs" }, mia.token)).data.name, "Bergs");
+        assert.equal((await call("DELETE", `${F}/${family.id}/members/me`, null, mia.token)).data.code, "OWNER_CANNOT_LEAVE");
+        assert.equal((await call("DELETE", `${F}/${family.id}/members/${mia.id}`, null, leo.token)).data.code, "NOT_OWNER");
+        assert.equal((await call("DELETE", `${F}/${family.id}`, null, leo.token)).data.code, "NOT_OWNER");
+        assert.equal((await call("DELETE", `${F}/${family.id}/members/${leo.id}`, null, mia.token)).status, 200);
+        assert.equal((await call("GET", `${F}/${family.id}`, null, leo.token)).status, 404);
+        assert.equal((await call("DELETE", `${F}/${family.id}`, null, mia.token)).status, 200);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM family_tasks WHERE family_id = $1", [family.id]))[0].n, 0);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM family_messages WHERE family_id = $1", [family.id]))[0].n, 0);
+    });
+
+    test("a deleted owner hands the family on and takes their messages along", async () => {
+        const owner = await member("famowner");
+        await sql("UPDATE users SET is_tester = true WHERE username = 'famowner'");
+        await befriend(owner, leo, "famleo");
+        const family = (await call("POST", F, { name: "Erbe", friendIds: [leo.id] }, owner.token)).data;
+        await call("POST", `${F}/${family.id}/join`, null, leo.token);
+        await call("POST", `${F}/${family.id}/messages`, { text: "Hallo" }, owner.token);
+        const alone = (await call("POST", F, { name: "Allein" }, owner.token)).data;
+
+        assert.equal((await call("DELETE", "/api/users", { password: PW }, owner.token)).status, 200);
+        const kept = (await call("GET", `${F}/${family.id}`, null, leo.token)).data;
+        assert.equal(kept.owner.id, leo.id);
+        assert.equal(kept.isOwner, true);
+        assert.equal((await call("GET", `${F}/${family.id}/messages`, null, leo.token)).data.messages.length, 0);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM families WHERE id = $1", [alone.id]))[0].n, 0);
+    });
+});
+
 describe("deleting an account", () => {
     test("needs the password; the last admin can't leave", async () => {
         const solo = await member("lastadmin", { admin: true });

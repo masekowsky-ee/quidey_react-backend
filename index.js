@@ -11,7 +11,7 @@ const { sendVerificationMail, sendContactMail, sendFeedbackMail } = require("./u
 const { startReminderMails } = require("./utils/reminderMails");
 const http = require("node:http");
 const realtime = require("./realtime");
-const { hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
+const { hasAppAccess, hasTesterAccess, APP_ACCESS_SQL, TESTER_ACCESS_SQL } = require("./utils/access");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1879,6 +1879,18 @@ app.delete("/api/users", authLimiter, async (req, res) => {
         );
         await client.query("DELETE FROM tasks WHERE user_id = $1", [userId]);
         await client.query("DELETE FROM groups WHERE user_id = $1", [userId]);
+        // my families stay for the others: the longest member takes over (a family nobody
+        // else joined goes with the account)
+        await client.query(
+            `UPDATE families SET owner_id = heir.user_id
+            FROM (
+                SELECT DISTINCT ON (family_id) family_id, user_id FROM family_members
+                WHERE status = 'joined' AND user_id <> $1
+                ORDER BY family_id, joined_at, user_id
+            ) AS heir
+            WHERE families.id = heir.family_id AND families.owner_id = $1`,
+            [userId]
+        );
         await client.query("DELETE FROM users WHERE id = $1", [userId]);
         await client.query("COMMIT");
         forgetAccount(userId);
@@ -3648,6 +3660,484 @@ app.delete("/api/shared-sessions/:id", async (req, res) => {
         res.json({ id: sessionId });
         for (const member of members.rows) {
             realtime.toUser(member.user_id, member.status === "invited" ? "invites:changed" : "session:changed", { sessionId });
+        }
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- Quidey Family (testers only for now) ----------
+// A fixed group of accounts with a calendar and a chat of their own, apart from the shared
+// sessions. Members are friends of whoever invited them; only joined members see a family
+// (for anybody else it doesn't exist: 404). Everybody in it can add, change and tick off
+// calendar entries; removing one is for whoever added it and the owner.
+// Live: "family:changed" { familyId } (members, name, entries, invites changed: load again)
+// and "family:message" { familyId, message } go to the members' user rooms.
+
+const FAMILY_NAME_MAX = 60;
+const FAMILY_MEMBER_MAX = 20;
+// families one account can be in (joined or invited)
+const FAMILIES_PER_USER_MAX = 10;
+const FAMILY_MESSAGE_PAGE = 100;
+const familyBase = "/api/tester/families";
+
+const familyName = (value) => typeof value === "string" ? value.trim().slice(0, FAMILY_NAME_MAX) : "";
+
+// My membership row with the family's owner, or undefined
+async function getFamilyMembership(familyId, userId) {
+    const result = await pool.query(
+        `SELECT families.owner_id, family_members.status
+        FROM family_members JOIN families ON families.id = family_members.family_id
+        WHERE family_members.family_id = $1 AND family_members.user_id = $2`,
+        [familyId, userId]
+    );
+    return result.rows[0];
+}
+
+// Answers the request itself when I'm not a joined member
+async function requireFamily(req, res) {
+    const familyId = idParam(req.params.id);
+    const membership = familyId && await getFamilyMembership(familyId, req.user.userId);
+    if (!membership || membership.status !== "joined") {
+        fail(res, 404, "FAMILY_NOT_FOUND", "Family not found");
+        return null;
+    }
+    return { familyId, isOwner: membership.owner_id === req.user.userId };
+}
+
+// Whom to tell about a change: the joined members (with `invited` also the invited people),
+// only those who are still testers (the feature isn't theirs any more otherwise)
+async function familyMemberIds(familyId, { invited = false } = {}) {
+    const result = await pool.query(
+        `SELECT family_members.user_id FROM family_members JOIN users ON users.id = family_members.user_id
+        WHERE family_members.family_id = $1 AND ${TESTER_ACCESS_SQL}
+            ${invited ? "" : "AND family_members.status = 'joined'"}`,
+        [familyId]
+    );
+    return result.rows.map(row => row.user_id);
+}
+
+// The members and invited people (and `also`) load the family or their list again
+async function notifyFamily(familyId, also = []) {
+    const ids = await familyMemberIds(familyId, { invited: true });
+    for (const id of new Set([...ids, ...also])) realtime.toUser(id, "family:changed", { familyId });
+}
+
+// Invites my friends who aren't in it yet and still have room for another family.
+// Resolves to the ids invited now, or { error } when the family would get too big.
+async function inviteToFamily(db, familyId, userId, friendIds) {
+    if (friendIds.length === 0) return [];
+    const count = await db.query("SELECT count(*)::int AS n FROM family_members WHERE family_id = $1", [familyId]);
+    if (count.rows[0].n + friendIds.length > FAMILY_MEMBER_MAX) return { error: "FAMILY_FULL" };
+    const result = await db.query(
+        `INSERT INTO family_members (family_id, user_id, status, invited_by)
+        SELECT $1, invitee.id, 'invited', $2
+        FROM unnest($3::int[]) AS invitee(id)
+        WHERE EXISTS (
+            SELECT 1 FROM friendships
+            WHERE status = 'accepted'
+                AND LEAST(requester_id, addressee_id) = LEAST($2::int, invitee.id)
+                AND GREATEST(requester_id, addressee_id) = GREATEST($2::int, invitee.id)
+        )
+        AND (SELECT count(*) FROM family_members WHERE user_id = invitee.id) < $4
+        ON CONFLICT DO NOTHING
+        RETURNING user_id`,
+        [familyId, userId, friendIds, FAMILIES_PER_USER_MAX]
+    );
+    return result.rows.map(row => row.user_id);
+}
+
+const toFamilyMessage = (row) => ({
+    id: row.id,
+    user: publicUser(row, "author_"),
+    text: row.text,
+    createdAt: row.created_at,
+});
+
+// Everything the family page shows:
+// { id, name, createdAt, owner, isOwner, me,
+//   people: [{ user, status: 'joined' | 'invited', isOwner, joinedAt }],
+//   tasks:  [{ id, name, description, done, due, due_time, prio, duration_minutes, location, link,
+//              details, color, addedBy, createdAt }] }
+async function loadFamily(familyId, userId) {
+    const [family, members, tasks] = await Promise.all([
+        pool.query(
+            `SELECT families.id, families.name, families.created_at,
+                users.id AS owner_id, users.username AS owner_username, users.display_name AS owner_display_name
+            FROM families JOIN users ON users.id = families.owner_id
+            WHERE families.id = $1`,
+            [familyId]
+        ),
+        pool.query(
+            `SELECT family_members.status, family_members.joined_at, users.id, users.username, users.display_name
+            FROM family_members JOIN users ON users.id = family_members.user_id
+            WHERE family_members.family_id = $1
+            ORDER BY family_members.status DESC, family_members.joined_at, family_members.invited_at`,
+            [familyId]
+        ),
+        pool.query(
+            `SELECT family_tasks.id, family_tasks.name, family_tasks.description, family_tasks.done,
+                family_tasks.due, to_char(family_tasks.due_time, 'HH24:MI') AS due_time, family_tasks.prio,
+                family_tasks.duration_minutes, family_tasks.location, family_tasks.link, family_tasks.details,
+                family_tasks.color, family_tasks.created_at,
+                users.id AS adder_id, users.username AS adder_username, users.display_name AS adder_display_name
+            FROM family_tasks LEFT JOIN users ON users.id = family_tasks.added_by
+            WHERE family_tasks.family_id = $1
+            ORDER BY family_tasks.due NULLS LAST, family_tasks.due_time NULLS FIRST, family_tasks.id`,
+            [familyId]
+        ),
+    ]);
+    const row = family.rows[0];
+    if (!row) return null;
+    return {
+        id: row.id,
+        name: row.name,
+        createdAt: row.created_at,
+        owner: publicUser(row, "owner_"),
+        isOwner: row.owner_id === userId,
+        me: userId,
+        people: members.rows.map(member => ({
+            user: publicUser(member),
+            status: member.status,
+            isOwner: member.id === row.owner_id,
+            joinedAt: member.joined_at,
+        })),
+        tasks: tasks.rows.map(task => ({
+            id: task.id,
+            name: task.name,
+            description: task.description,
+            done: task.done,
+            due: task.due,
+            due_time: task.due_time,
+            prio: task.prio,
+            duration_minutes: task.duration_minutes,
+            location: task.location,
+            link: task.link,
+            details: task.details,
+            color: task.color,
+            addedBy: task.adder_id ? publicUser(task, "adder_") : null,
+            createdAt: task.created_at,
+        })),
+    };
+}
+
+async function sendFamily(res, familyId, userId, status = 200) {
+    const family = await loadFamily(familyId, userId);
+    if (!family) return fail(res, 404, "FAMILY_NOT_FOUND", "Family not found");
+    res.status(status).json(family);
+}
+
+// My families and the invites waiting for me:
+// { families: [{ id, name, owner, isOwner, memberCount }], invites: [{ ...same, invitedBy, invitedAt }] }
+app.get(familyBase, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const result = await pool.query(
+            `SELECT families.id, families.name, families.owner_id, family_members.status, family_members.invited_at,
+                owner.username AS owner_username, owner.display_name AS owner_display_name,
+                inviter.id AS inviter_id, inviter.username AS inviter_username, inviter.display_name AS inviter_display_name,
+                (SELECT count(*) FROM family_members AS m WHERE m.family_id = families.id AND m.status = 'joined')::int AS member_count
+            FROM family_members
+            JOIN families ON families.id = family_members.family_id
+            JOIN users AS owner ON owner.id = families.owner_id
+            LEFT JOIN users AS inviter ON inviter.id = family_members.invited_by
+            WHERE family_members.user_id = $1
+            ORDER BY lower(families.name), families.id`,
+            [userId]
+        );
+        const summary = (row) => ({
+            id: row.id,
+            name: row.name,
+            owner: publicUser(row, "owner_"),
+            isOwner: row.owner_id === userId,
+            memberCount: row.member_count,
+        });
+        res.json({
+            families: result.rows.filter(row => row.status === "joined").map(summary),
+            invites: result.rows.filter(row => row.status === "invited").map(row => ({
+                ...summary(row),
+                invitedBy: row.inviter_id ? publicUser(row, "inviter_") : null,
+                invitedAt: row.invited_at,
+            })),
+        });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Start a family: { name, friendIds? }
+app.post(familyBase, async (req, res) => {
+    const userId = req.user.userId;
+    const name = familyName(req.body?.name);
+    if (!name) return fail(res, 400, "NAME_REQUIRED", "Name is required");
+    const friendIds = idList(req.body?.friendIds).filter(id => id !== userId);
+
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        // one at a time per account, so two quick requests can't pass the limit together
+        await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [userId]);
+        const mine = await client.query("SELECT count(*)::int AS n FROM family_members WHERE user_id = $1", [userId]);
+        if (mine.rows[0].n >= FAMILIES_PER_USER_MAX) {
+            await client.query("ROLLBACK");
+            return fail(res, 409, "TOO_MANY_FAMILIES", "You are in too many families already");
+        }
+        const created = await client.query("INSERT INTO families (name, owner_id) VALUES ($1, $2) RETURNING id", [name, userId]);
+        const familyId = created.rows[0].id;
+        await client.query(
+            `INSERT INTO family_members (family_id, user_id, status, invited_by, joined_at)
+            VALUES ($1, $2, 'joined', $2, now())`,
+            [familyId, userId]
+        );
+        const invited = await inviteToFamily(client, familyId, userId, friendIds);
+        if (invited.error) {
+            await client.query("ROLLBACK");
+            return fail(res, 400, invited.error, "Too many members");
+        }
+        await client.query("COMMIT");
+        await sendFamily(res, familyId, userId, 201);
+        for (const id of invited) realtime.toUser(id, "family:changed", { familyId });
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        serverError(res, err);
+    } finally {
+        client.release();
+    }
+});
+
+app.get(`${familyBase}/:id`, async (req, res) => {
+    try {
+        const family = await requireFamily(req, res);
+        if (!family) return;
+        await sendFamily(res, family.familyId, req.user.userId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Rename (owner): { name }
+app.patch(`${familyBase}/:id`, async (req, res) => {
+    const userId = req.user.userId;
+    const name = familyName(req.body?.name);
+    if (!name) return fail(res, 400, "NAME_REQUIRED", "Name is required");
+    try {
+        const family = await requireFamily(req, res);
+        if (!family) return;
+        if (!family.isOwner) return fail(res, 403, "NOT_OWNER", "Only the owner can rename the family");
+        await pool.query("UPDATE families SET name = $1 WHERE id = $2", [name, family.familyId]);
+        await sendFamily(res, family.familyId, userId);
+        await notifyFamily(family.familyId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Delete it with its calendar and chat (owner)
+app.delete(`${familyBase}/:id`, async (req, res) => {
+    try {
+        const family = await requireFamily(req, res);
+        if (!family) return;
+        if (!family.isOwner) return fail(res, 403, "NOT_OWNER", "Only the owner can delete the family");
+        const people = await familyMemberIds(family.familyId, { invited: true });
+        await pool.query("DELETE FROM families WHERE id = $1", [family.familyId]);
+        res.json({ id: family.familyId });
+        for (const id of people) realtime.toUser(id, "family:changed", { familyId: family.familyId });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Any member invites their own friends: { userIds }
+app.post(`${familyBase}/:id/invites`, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const family = await requireFamily(req, res);
+        if (!family) return;
+        const invited = await inviteToFamily(pool, family.familyId, userId, idList(req.body?.userIds));
+        if (invited.error) return fail(res, 400, invited.error, "Too many members");
+        if (invited.length === 0) return fail(res, 400, "NOTHING_TO_INVITE", "Nobody new to invite");
+        await sendFamily(res, family.familyId, userId);
+        await notifyFamily(family.familyId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Accept an invite
+app.post(`${familyBase}/:id/join`, async (req, res) => {
+    const userId = req.user.userId;
+    const familyId = idParam(req.params.id);
+    if (!familyId) return fail(res, 404, "INVITE_NOT_FOUND", "Invite not found");
+    try {
+        const result = await pool.query(
+            `UPDATE family_members SET status = 'joined', joined_at = now()
+            WHERE family_id = $1 AND user_id = $2 AND status = 'invited' RETURNING family_id`,
+            [familyId, userId]
+        );
+        if (result.rows.length === 0) return fail(res, 404, "INVITE_NOT_FOUND", "Invite not found");
+        await sendFamily(res, familyId, userId);
+        await notifyFamily(familyId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Leave or decline (my own id, or "me"), or, as the owner, remove somebody or take back an
+// invite. The owner can't leave; they delete the family instead.
+app.delete(`${familyBase}/:id/members/:userId`, async (req, res) => {
+    const userId = req.user.userId;
+    const familyId = idParam(req.params.id);
+    const targetId = req.params.userId === "me" ? userId : idParam(req.params.userId);
+    if (!familyId || !targetId) return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
+    try {
+        const membership = await getFamilyMembership(familyId, userId);
+        // an invite can be declined, but only members can do anything else
+        if (!membership || (membership.status !== "joined" && targetId !== userId)) {
+            return fail(res, 404, "FAMILY_NOT_FOUND", "Family not found");
+        }
+        const isOwner = membership.owner_id === userId;
+        if (targetId !== userId && !isOwner) return fail(res, 403, "NOT_OWNER", "Only the owner can remove members");
+        if (targetId === membership.owner_id) return fail(res, 400, "OWNER_CANNOT_LEAVE", "The owner can't leave the family");
+        const result = await pool.query(
+            "DELETE FROM family_members WHERE family_id = $1 AND user_id = $2 RETURNING status",
+            [familyId, targetId]
+        );
+        if (result.rows.length === 0) return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
+        res.json({ familyId, userId: targetId });
+        await notifyFamily(familyId, [targetId]);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// A calendar entry: { name, and any of SHARED_TASK_FIELDS }
+app.post(`${familyBase}/:id/tasks`, async (req, res) => {
+    const userId = req.user.userId;
+    const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, TASK_NAME_MAX) : "";
+    if (!name) return fail(res, 400, "NAME_REQUIRED", "Name is required");
+    const fields = readTaskExtras(req.body, SHARED_TASK_FIELDS);
+    if (fields.error) return invalidInput(res, fields.error);
+    if (fields.values.due_time && !fields.values.due) return invalidInput(res, "due_time");
+    try {
+        const family = await requireFamily(req, res);
+        if (!family) return;
+        const columns = ["family_id", "name", "added_by", ...Object.keys(fields.values)];
+        const values = [family.familyId, name, userId, ...Object.values(fields.values)];
+        await pool.query(
+            `INSERT INTO family_tasks (${columns.join(", ")}) VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")})`,
+            values
+        );
+        await sendFamily(res, family.familyId, userId, 201);
+        await notifyFamily(family.familyId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Change an entry: { done?, name?, and any of SHARED_TASK_FIELDS (null clears one) }
+app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
+    const userId = req.user.userId;
+    const taskId = idParam(req.params.taskId);
+    const { done } = req.body ?? {};
+    const name = req.body?.name === undefined ? undefined : cleanText(req.body.name, TASK_NAME_MAX);
+    const fields = readTaskExtras(req.body, SHARED_TASK_FIELDS);
+    if (done !== undefined && typeof done !== "boolean") return fail(res, 400, "DONE_REQUIRED", "done must be true or false");
+    if (name === null || (req.body?.name !== undefined && name === undefined)) return invalidInput(res, "name");
+    if (fields.error) return invalidInput(res, fields.error);
+    if (done === undefined && name === undefined && Object.keys(fields.values).length === 0) {
+        return fail(res, 400, "NOTHING_TO_CHANGE", "Send done, name or a field");
+    }
+    try {
+        const family = await requireFamily(req, res);
+        if (!family) return;
+        const before = await pool.query("SELECT due FROM family_tasks WHERE id = $1 AND family_id = $2", [taskId, family.familyId]);
+        if (before.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
+        // a time of day needs a day; taking the day away takes the time along
+        const due = "due" in fields.values ? fields.values.due : before.rows[0].due;
+        if (fields.values.due_time && !due) return invalidInput(res, "due_time");
+        if (!due && !("due_time" in fields.values)) fields.values.due_time = null;
+
+        const values = [taskId, done ?? null, name ?? null];
+        const sets = ["done = COALESCE($2, done)", "name = COALESCE($3, name)"];
+        for (const [column, value] of Object.entries(fields.values)) {
+            values.push(value);
+            sets.push(`${column} = $${values.length}`);
+        }
+        await pool.query(`UPDATE family_tasks SET ${sets.join(", ")} WHERE id = $1`, values);
+        await sendFamily(res, family.familyId, userId);
+        await notifyFamily(family.familyId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Remove an entry (whoever added it, or the owner)
+app.delete(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
+    const userId = req.user.userId;
+    const taskId = idParam(req.params.taskId);
+    try {
+        const family = await requireFamily(req, res);
+        if (!family) return;
+        const task = await pool.query("SELECT added_by FROM family_tasks WHERE id = $1 AND family_id = $2", [taskId, family.familyId]);
+        if (task.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
+        if (task.rows[0].added_by !== userId && !family.isOwner) {
+            return fail(res, 403, "NOT_ALLOWED", "Only who added it or the owner can remove it");
+        }
+        await pool.query("DELETE FROM family_tasks WHERE id = $1", [taskId]);
+        await sendFamily(res, family.familyId, userId);
+        await notifyFamily(family.familyId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// The chat, oldest first: the newest FAMILY_MESSAGE_PAGE, or those before ?before=<id>
+app.get(`${familyBase}/:id/messages`, async (req, res) => {
+    const before = req.query.before === undefined ? null : idParam(req.query.before);
+    if (req.query.before !== undefined && !before) return invalidInput(res, "before");
+    try {
+        const family = await requireFamily(req, res);
+        if (!family) return;
+        const result = await pool.query(
+            `SELECT * FROM (
+                SELECT family_messages.id, family_messages.text, family_messages.created_at,
+                    users.id AS author_id, users.username AS author_username, users.display_name AS author_display_name
+                FROM family_messages JOIN users ON users.id = family_messages.user_id
+                WHERE family_messages.family_id = $1 AND ($2::int IS NULL OR family_messages.id < $2)
+                ORDER BY family_messages.id DESC
+                LIMIT $3
+            ) AS latest ORDER BY id`,
+            [family.familyId, before, FAMILY_MESSAGE_PAGE]
+        );
+        res.json({ messages: result.rows.map(toFamilyMessage), hasMore: result.rows.length === FAMILY_MESSAGE_PAGE });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Write in the chat: { text }; answers with the new message
+app.post(`${familyBase}/:id/messages`, messageLimiter, async (req, res) => {
+    const userId = req.user.userId;
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+    if (!text) return fail(res, 400, "TEXT_REQUIRED", "Message is empty");
+    if (text.length > 1000) return fail(res, 400, "TEXT_TOO_LONG", "Message is too long");
+    try {
+        const family = await requireFamily(req, res);
+        if (!family) return;
+        const result = await pool.query(
+            `WITH created AS (
+                INSERT INTO family_messages (family_id, user_id, text) VALUES ($1, $2, $3)
+                RETURNING id, text, created_at, user_id
+            )
+            SELECT created.id, created.text, created.created_at,
+                users.id AS author_id, users.username AS author_username, users.display_name AS author_display_name
+            FROM created JOIN users ON users.id = created.user_id`,
+            [family.familyId, userId, text]
+        );
+        const message = toFamilyMessage(result.rows[0]);
+        res.status(201).json(message);
+        for (const id of await familyMemberIds(family.familyId)) {
+            realtime.toUser(id, "family:message", { familyId: family.familyId, message });
         }
     } catch (err) {
         serverError(res, err);
