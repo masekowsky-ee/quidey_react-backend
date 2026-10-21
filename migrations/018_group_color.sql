@@ -1,4 +1,4 @@
--- 018: a colour per group; its tasks show a flag in that colour
+-- 018: a colour per group; its tasks show a dot in that colour
 -- Already part of schema.sql. Run this only on a database created before it.
 -- Same colours as tasks (TASK_COLORS in index.js), null = none.
 
