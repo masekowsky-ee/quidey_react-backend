@@ -170,6 +170,39 @@ CREATE SEQUENCE public.email_verification_tokens_id_seq
 ALTER SEQUENCE public.email_verification_tokens_id_seq OWNED BY public.email_verification_tokens.id;
 
 --
+-- Name: event_types; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.event_types (
+    id integer NOT NULL,
+    user_id integer NOT NULL,
+    name text NOT NULL,
+    color text,
+    "position" integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT event_types_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
+    CONSTRAINT event_types_name_check CHECK (((char_length(name) >= 1) AND (char_length(name) <= 40)))
+);
+
+--
+-- Name: event_types_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.event_types_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: event_types_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.event_types_id_seq OWNED BY public.event_types.id;
+
+--
 -- Name: families; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -709,9 +742,13 @@ CREATE TABLE public.tasks (
     color text,
     reminder_email boolean DEFAULT false NOT NULL,
     reminder_mailed_at timestamp with time zone,
+    kind text DEFAULT 'task'::text NOT NULL,
+    event_type_id integer,
     CONSTRAINT tasks_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
     CONSTRAINT tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
     CONSTRAINT tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080)))),
+    CONSTRAINT tasks_event_needs_due_check CHECK (((kind <> 'event'::text) OR (due IS NOT NULL))),
+    CONSTRAINT tasks_kind_check CHECK ((kind = ANY (ARRAY['task'::text, 'event'::text]))),
     CONSTRAINT tasks_reminder_minutes_check CHECK (((reminder_minutes IS NULL) OR ((reminder_minutes >= 0) AND (reminder_minutes <= 10080)))),
     CONSTRAINT tasks_repeat_check CHECK (((repeat IS NULL) OR (repeat = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text, 'yearly'::text])))),
     CONSTRAINT tasks_repeat_needs_due_check CHECK (((repeat IS NULL) OR (due IS NOT NULL)))
@@ -810,6 +847,12 @@ ALTER TABLE ONLY public.broadcasts ALTER COLUMN id SET DEFAULT nextval('public.b
 --
 
 ALTER TABLE ONLY public.email_verification_tokens ALTER COLUMN id SET DEFAULT nextval('public.email_verification_tokens_id_seq'::regclass);
+
+--
+-- Name: event_types id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_types ALTER COLUMN id SET DEFAULT nextval('public.event_types_id_seq'::regclass);
 
 --
 -- Name: families id; Type: DEFAULT; Schema: public; Owner: -
@@ -935,6 +978,13 @@ ALTER TABLE ONLY public.email_verification_tokens
 
 ALTER TABLE ONLY public.email_verification_tokens
     ADD CONSTRAINT email_verification_tokens_token_hash_key UNIQUE (token_hash);
+
+--
+-- Name: event_types event_types_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_types
+    ADD CONSTRAINT event_types_pkey PRIMARY KEY (id);
 
 --
 -- Name: families families_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -1123,6 +1173,12 @@ CREATE INDEX beta_access_requests_status_idx ON public.beta_access_requests USIN
 CREATE INDEX email_verification_tokens_user_idx ON public.email_verification_tokens USING btree (user_id);
 
 --
+-- Name: event_types_user_name_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX event_types_user_name_idx ON public.event_types USING btree (user_id, lower(name));
+
+--
 -- Name: family_members_user_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1267,6 +1323,18 @@ CREATE INDEX task_groups_group_idx ON public.task_groups USING btree (group_id);
 CREATE INDEX task_shares_user_status_idx ON public.task_shares USING btree (user_id, status);
 
 --
+-- Name: tasks_event_type_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tasks_event_type_idx ON public.tasks USING btree (event_type_id) WHERE (event_type_id IS NOT NULL);
+
+--
+-- Name: tasks_open_events_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tasks_open_events_idx ON public.tasks USING btree (due) WHERE ((kind = 'event'::text) AND (NOT done));
+
+--
 -- Name: tasks_reminder_email_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1277,6 +1345,12 @@ CREATE INDEX tasks_reminder_email_idx ON public.tasks USING btree (due) WHERE (r
 --
 
 CREATE INDEX tasks_repeat_from_idx ON public.tasks USING btree (repeat_from_id);
+
+--
+-- Name: tasks_user_events_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tasks_user_events_idx ON public.tasks USING btree (user_id, due) WHERE (kind = 'event'::text);
 
 --
 -- Name: tasks_user_idx; Type: INDEX; Schema: public; Owner: -
@@ -1336,6 +1410,13 @@ ALTER TABLE ONLY public.broadcasts
 
 ALTER TABLE ONLY public.email_verification_tokens
     ADD CONSTRAINT email_verification_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: event_types event_types_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_types
+    ADD CONSTRAINT event_types_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
 -- Name: families families_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -1630,6 +1711,13 @@ ALTER TABLE ONLY public.task_shares
 
 ALTER TABLE ONLY public.task_shares
     ADD CONSTRAINT task_shares_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: tasks tasks_event_type_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tasks
+    ADD CONSTRAINT tasks_event_type_id_fkey FOREIGN KEY (event_type_id) REFERENCES public.event_types(id) ON DELETE SET NULL;
 
 --
 -- Name: tasks tasks_repeat_from_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -

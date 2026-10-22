@@ -215,6 +215,8 @@ app.use("/api/shared-sessions", authenticateToken);
 app.use("/api/task-shares", authenticateToken);
 app.use("/api/profiles", authenticateToken);
 app.use("/api/profile", authenticateToken);
+app.use("/api/event-types", authenticateToken);
+app.use("/api/stats", authenticateToken);
 
 // Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
 // Checked against the account on every request (not stored in the token; see loadAccount), so
@@ -228,7 +230,7 @@ function requirePro(req, res, next) {
 }
 
 app.use(
-    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile"],
+    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats"],
     requirePro
 );
 
@@ -330,6 +332,8 @@ function cleanLink(value) {
     }
 }
 
+const TASK_KINDS = ["task", "event"];
+
 // The colours a task can have (the app draws them); null is the default look
 const TASK_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
 
@@ -349,7 +353,13 @@ const TASK_EXTRAS = {
     color: (value) => (value === null || value === "" ? null : TASK_COLORS.includes(value) ? value : undefined),
     // also remind by mail (only the owner can change it, see PUT /api/tasks/:id)
     reminder_email: (value) => (typeof value === "boolean" ? value : undefined),
+    // 'task' (ticked off by hand) or 'event' (done once it is over); only the owner changes it
+    kind: (value) => (TASK_KINDS.includes(value) ? value : undefined),
+    // one of the owner's event types (checked against the database, see ownEventType)
+    event_type_id: (value) => (value === null || value === "" ? null : idParam(value) ?? undefined),
 };
+// the fields only a task's owner can change (the others' values are ignored)
+const OWNER_ONLY_FIELDS = ["reminder_email", "kind", "event_type_id"];
 function readTaskExtras(body, fields = TASK_EXTRAS) {
     const values = {};
     for (const [field, clean] of Object.entries(fields)) {
@@ -391,6 +401,7 @@ const TASK_SELECT = `
         tasks.duration_minutes, tasks.reminder_minutes, tasks.location, tasks.link, tasks.details,
         tasks.description, tasks.prio, tasks.done, tasks.created_at, tasks.user_id,
         tasks.repeat, tasks.completed_at, tasks.color, tasks.reminder_email,
+        tasks.kind, tasks.event_type_id, event_types.name AS event_type_name, event_types.color AS event_type_color,
         owner.username AS owner_username, owner.display_name AS owner_display_name,
         my_share.id AS my_share_id,
         COALESCE((
@@ -411,6 +422,7 @@ const TASK_SELECT = `
         ), '[]') AS shared_with
     FROM tasks
     JOIN users AS owner ON owner.id = tasks.user_id
+    LEFT JOIN event_types ON event_types.id = tasks.event_type_id
     LEFT JOIN task_shares AS my_share
         ON my_share.task_id = tasks.id AND my_share.user_id = $1 AND my_share.status = 'accepted'
     WHERE (tasks.user_id = $1 OR my_share.id IS NOT NULL)`;
@@ -434,6 +446,10 @@ function toTaskResponse(row, userId) {
         color: row.color,
         // the owner's setting: a mail reaches only them
         reminder_email: row.reminder_email,
+        kind: row.kind,
+        event_type_id: row.event_type_id,
+        // the owner's type, so people it is shared with see its name too
+        event_type: row.event_type_id ? { id: row.event_type_id, name: row.event_type_name, color: row.event_type_color } : null,
         completed_at: row.completed_at,
         created_at: row.created_at,
         user_id: row.user_id,
@@ -470,6 +486,8 @@ app.get("/api/tasks", async (req, res) => {
     const userId = req.user.userId;
 
     try{
+        // my events that ended since the last check are ticked off first (and repeat)
+        await syncEventsNow("tasks.user_id = $1 AND NOT tasks.done", [userId]);
         // my own tasks and the ones friends shared with me (see TASK_SELECT)
         const result = await pool.query(`${TASK_SELECT} ORDER BY tasks.id`, [userId]);
         res.json(result.rows.map(row => toTaskResponse(row, userId)));
@@ -736,22 +754,112 @@ app.post("/api/tasks", async (req, res) => {
     // a time of day needs a day, and so does repeating
     if (extras.values.due_time && !due) return invalidInput(res, "due_time");
     if (extras.values.repeat && !due) return invalidInput(res, "repeat");
+    // an event happens on a day; only events have a type
+    if (extras.values.kind === "event" && !due) return invalidInput(res, "due");
+    if (extras.values.kind !== "event") delete extras.values.event_type_id;
 
     const columns = ["name", "due", "description", "prio", "user_id", ...Object.keys(extras.values)];
     const values = [name, due, description, prio, userId, ...Object.values(extras.values)];
 
+    const client = await pool.connect();
     try {
-        const result = await pool.query(
+        if (!(await ownEventType(client, extras.values.event_type_id, userId))) return invalidInput(res, "event_type_id");
+        await client.query("BEGIN");
+        const result = await client.query(
             `INSERT INTO tasks (${columns.join(", ")})
             VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")})
             RETURNING id`,
             values
         );
-        res.status(201).json(await loadTask(result.rows[0].id, userId));
+        const id = result.rows[0].id;
+        // an event entered afterwards (e.g. yesterday's work) is over right away
+        const [synced] = await syncEvents(client, "tasks.id = $1", [id]);
+        await client.query("COMMIT");
+        const task = await loadTask(id, userId);
+        res.status(201).json(synced?.nextId ? { ...task, nextTask: await loadTask(synced.nextId, userId) } : task);
     } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
+    } finally {
+        client.release();
     }
 });
+
+// Whether an event type id is one of the user's own (null / not sent: fine, no type)
+async function ownEventType(db, typeId, userId) {
+    if (typeId === null || typeId === undefined) return true;
+    const result = await db.query("SELECT 1 FROM event_types WHERE id = $1 AND user_id = $2", [typeId, userId]);
+    return result.rows.length > 0;
+}
+
+// When an event is over: its day at its time in the owner's time zone plus how long it lasts.
+// Without a time it takes the whole day. Needs tasks joined with their owner as users.
+const EVENT_END_SQL = `CASE WHEN tasks.due_time IS NULL
+        THEN (tasks.due + 1)::timestamp AT TIME ZONE COALESCE(users.timezone, 'Europe/Berlin')
+        ELSE (tasks.due + tasks.due_time) AT TIME ZONE COALESCE(users.timezone, 'Europe/Berlin')
+            + make_interval(mins => COALESCE(tasks.duration_minutes, 0))
+    END`;
+
+// Events are never ticked off by hand: they are done once they are over. This sets `done` of the
+// events `where` picks (SQL about tasks / users, with `params`) to whether they are over, so
+// one moved into the future opens again. completed_at is when it ended. A repeating event that
+// just ended gets its next one, like a task that was ticked off.
+// Returns [{ id, userId, done, nextId }] of the events that changed.
+async function syncEvents(db, where, params = []) {
+    const result = await db.query(
+        `UPDATE tasks SET done = state.over, completed_at = CASE WHEN state.over THEN state.ends_at END
+        FROM (
+            SELECT tasks.id, ends.at AS ends_at, ends.at <= now() AS over
+            FROM tasks
+            JOIN users ON users.id = tasks.user_id
+            CROSS JOIN LATERAL (SELECT ${EVENT_END_SQL} AS at) AS ends
+            WHERE tasks.kind = 'event' AND tasks.due IS NOT NULL AND (${where})
+            FOR UPDATE OF tasks SKIP LOCKED
+        ) AS state
+        WHERE tasks.id = state.id AND tasks.done IS DISTINCT FROM state.over
+        RETURNING tasks.id, tasks.user_id, tasks.done`,
+        params
+    );
+    const changed = [];
+    for (const row of result.rows) {
+        changed.push({ id: row.id, userId: row.user_id, done: row.done, nextId: row.done ? await createNextRepeat(db, row.id) : null });
+    }
+    return changed;
+}
+
+// syncEvents in a transaction of its own, so an ended event and its next repeat come together
+async function syncEventsNow(where, params) {
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const changed = await syncEvents(client, where, params);
+        await client.query("COMMIT");
+        return changed;
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+    } finally {
+        client.release();
+    }
+}
+
+// Once a minute: ticks off the events that ended since (of everybody) and tells the people who
+// have them, so open apps update without waiting for their next refresh
+async function closePastEvents() {
+    let changed = [];
+    try {
+        // an event after tomorrow can't be over yet, whatever the time zone
+        changed = await syncEventsNow("NOT tasks.done AND tasks.due <= current_date + 1");
+    } catch (err) {
+        console.error("Closing past events failed:", err);
+        return;
+    }
+    for (const event of changed) {
+        try {
+            notifyTaskPeople(await taskPeople(event.id), event.id);
+        } catch { /* they see it on their next refresh */ }
+    }
+}
 
 // { name, description, color? } (color: one of TASK_COLORS or null)
 app.post("/api/groups", async (req, res) => {
@@ -1924,35 +2032,50 @@ app.put("/api/tasks/:id", async (req, res) => {
     if (extras.values.due_time && !due) return invalidInput(res, "due_time");
     if (extras.values.repeat && !due) return invalidInput(res, "repeat");
 
-    const values = [name, due, description, prio, done, id, userId];
-    // completed_at: set when the task becomes done (SET sees the old row), cleared when reopened
-    const sets = ["name = $1", "due = $2", "description = $3", "prio = $4", "done = $5",
-        "completed_at = CASE WHEN NOT $5 THEN NULL WHEN tasks.done THEN tasks.completed_at ELSE now() END"];
-    for (const [column, value] of Object.entries(extras.values)) {
-        values.push(value);
-        // mails go to the owner, so only the owner turns them on or off ($7: me)
-        sets.push(column === "reminder_email"
-            ? `${column} = CASE WHEN tasks.user_id = $7 THEN $${values.length} ELSE tasks.reminder_email END`
-            : `${column} = $${values.length}`);
-    }
-    // without a day there is no time of day and no repeating either
-    if (!due && !("due_time" in extras.values)) sets.push("due_time = NULL");
-    if (!due && !("repeat" in extras.values)) sets.push("repeat = NULL");
-
     const client = await pool.connect();
     try {
         await client.query("BEGIN");
         const before = await client.query(
-            `SELECT done FROM tasks WHERE id = $1 AND id IN (${accessibleTaskIds("$2")}) FOR UPDATE`,
+            `SELECT done, kind, user_id FROM tasks WHERE id = $1 AND id IN (${accessibleTaskIds("$2")}) FOR UPDATE`,
             [id, userId]
         );
         if (before.rows.length === 0) {
             await client.query("ROLLBACK");
             return res.status(404).json({ error: "Task not found" });
         }
+        const old = before.rows[0];
+        const isOwner = old.user_id === userId;
+        // task or event, and its type, are the owner's to choose
+        const kind = isOwner && extras.values.kind ? extras.values.kind : old.kind;
+        if (isOwner && kind !== "event") extras.values.event_type_id = null;
+        const invalid = kind === "event" && !due ? "due"
+            : isOwner && !(await ownEventType(client, extras.values.event_type_id, userId)) ? "event_type_id"
+            : null;
+        if (invalid) {
+            await client.query("ROLLBACK");
+            return invalidInput(res, invalid);
+        }
+
+        // an event is done when it's over (syncEvents below), never by hand
+        const values = [name, due, description, prio, kind === "event" ? Boolean(old.done) : done, id, userId];
+        // completed_at: set when the task becomes done (SET sees the old row), cleared when reopened
+        const sets = ["name = $1", "due = $2", "description = $3", "prio = $4", "done = $5",
+            "completed_at = CASE WHEN NOT $5 THEN NULL WHEN tasks.done THEN tasks.completed_at ELSE now() END"];
+        for (const [column, value] of Object.entries(extras.values)) {
+            values.push(value);
+            // e.g. mails go to the owner, so only the owner turns them on or off ($7: me)
+            sets.push(OWNER_ONLY_FIELDS.includes(column)
+                ? `${column} = CASE WHEN tasks.user_id = $7 THEN $${values.length} ELSE tasks.${column} END`
+                : `${column} = $${values.length}`);
+        }
+        // without a day there is no time of day and no repeating either
+        if (!due && !("due_time" in extras.values)) sets.push("due_time = NULL");
+        if (!due && !("repeat" in extras.values)) sets.push("repeat = NULL");
 
         await client.query(`UPDATE tasks SET ${sets.join(", ")} WHERE id = $6 AND id IN (${accessibleTaskIds("$7")})`, values);
-        const nextId = before.rows[0].done || !done ? null : await createNextRepeat(client, id);
+        const [synced] = await syncEvents(client, "tasks.id = $1", [id]);
+        const nextId = kind === "event" ? synced?.nextId ?? null
+            : old.done || !done ? null : await createNextRepeat(client, id);
         await client.query("COMMIT");
 
         const task = await loadTask(id, userId);
@@ -1990,10 +2113,10 @@ async function createNextRepeat(db, taskId) {
             LIMIT 1
         )
         INSERT INTO tasks (name, due, description, prio, user_id, due_time, duration_minutes,
-            reminder_minutes, location, link, details, repeat, repeat_from_id, color, reminder_email)
+            reminder_minutes, location, link, details, repeat, repeat_from_id, color, reminder_email, kind, event_type_id)
         SELECT source.name, next_due.due, source.description, source.prio, source.user_id, source.due_time,
             source.duration_minutes, source.reminder_minutes, source.location, source.link, source.details,
-            source.repeat, source.id, source.color, source.reminder_email
+            source.repeat, source.id, source.color, source.reminder_email, source.kind, source.event_type_id
         FROM source, next_due
         RETURNING id`,
         [taskId]
@@ -2429,9 +2552,9 @@ async function loadStats(userId) {
                     FROM sessions JOIN groups ON groups.id = sessions.group_id
                     WHERE sessions.user_id = $1 AND sessions.time_ms > 0
                     GROUP BY groups.id ORDER BY ms DESC LIMIT 3) AS top) AS top_groups,
-            (SELECT count(*) FILTER (WHERE done)::int FROM tasks WHERE user_id = $1) AS tasks_done,
+            (SELECT count(*) FILTER (WHERE done)::int FROM tasks WHERE user_id = $1 AND kind = 'task') AS tasks_done,
             (SELECT count(*) FILTER (WHERE done AND completed_at >= now() - interval '7 days')::int
-                FROM tasks WHERE user_id = $1) AS tasks_done_week,
+                FROM tasks WHERE user_id = $1 AND kind = 'task') AS tasks_done_week,
             (SELECT count(*)::int FROM friendships
                 WHERE status = 'accepted' AND $1 IN (requester_id, addressee_id)) AS friends,
             (SELECT count(*)::int FROM shared_session_members WHERE user_id = $1 AND status = 'joined') AS shared_sessions,
@@ -4144,6 +4267,205 @@ app.post(`${familyBase}/:id/messages`, messageLimiter, async (req, res) => {
     }
 });
 
+// ---------- event types ----------
+// Each user's own list of what their events are, e.g. "Arbeit", "Vorlesung", "Sport".
+// Rows: { id, name, color, position }. The statistics add up past events per type.
+
+const EVENT_TYPE_NAME_MAX = 40;
+const EVENT_TYPES_MAX = 30;
+
+const toEventType = (row) => ({ id: row.id, name: row.name, color: row.color, position: row.position });
+
+// The user's other devices load their tasks again (and with them the types)
+const eventTypesChanged = (userId) => realtime.toUser(userId, "tasks:changed", {});
+
+app.get("/api/event-types", async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT id, name, color, position FROM event_types WHERE user_id = $1 ORDER BY position, id",
+            [req.user.userId]
+        );
+        res.json(result.rows.map(toEventType));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// { name, color? } -> the new type, at the end of the list
+app.post("/api/event-types", async (req, res) => {
+    const userId = req.user.userId;
+    const name = cleanText(req.body?.name, EVENT_TYPE_NAME_MAX);
+    const color = req.body?.color === undefined ? null : TASK_EXTRAS.color(req.body.color);
+    if (!name) return invalidInput(res, "name");
+    if (color === undefined) return invalidInput(res, "color");
+    try {
+        const result = await pool.query(
+            `INSERT INTO event_types (user_id, name, color, position)
+            SELECT $1, $2, $3, COALESCE(max(position) + 1, 0) FROM event_types WHERE user_id = $1
+            HAVING count(*) < ${EVENT_TYPES_MAX}
+            ON CONFLICT (user_id, lower(name)) DO NOTHING
+            RETURNING id, name, color, position`,
+            [userId, name, color]
+        );
+        if (result.rows.length === 0) {
+            const count = await pool.query("SELECT count(*)::int AS n FROM event_types WHERE user_id = $1", [userId]);
+            return count.rows[0].n >= EVENT_TYPES_MAX
+                ? fail(res, 400, "TOO_MANY_EVENT_TYPES", "Too many event types")
+                : fail(res, 409, "EVENT_TYPE_EXISTS", "An event type with this name exists");
+        }
+        res.status(201).json(toEventType(result.rows[0]));
+        eventTypesChanged(userId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// { name?, color?, position? }: only what is sent changes
+app.put("/api/event-types/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    const userId = req.user.userId;
+    if (!id) return notFound(res, "Event type");
+    const sets = [];
+    const values = [id, userId];
+    if (req.body?.name !== undefined) {
+        const name = cleanText(req.body.name, EVENT_TYPE_NAME_MAX);
+        if (!name) return invalidInput(res, "name");
+        values.push(name);
+        sets.push(`name = $${values.length}`);
+    }
+    if (req.body?.color !== undefined) {
+        const color = TASK_EXTRAS.color(req.body.color);
+        if (color === undefined) return invalidInput(res, "color");
+        values.push(color);
+        sets.push(`color = $${values.length}`);
+    }
+    if (req.body?.position !== undefined) {
+        const position = cleanMinutes(req.body.position, 0, 1000);
+        if (position === undefined || position === null) return invalidInput(res, "position");
+        values.push(position);
+        sets.push(`position = $${values.length}`);
+    }
+    if (sets.length === 0) return invalidInput(res, "name");
+    try {
+        const result = await pool.query(
+            `UPDATE event_types SET ${sets.join(", ")} WHERE id = $1 AND user_id = $2 RETURNING id, name, color, position`,
+            values
+        );
+        if (result.rows.length === 0) return notFound(res, "Event type");
+        res.json(toEventType(result.rows[0]));
+        eventTypesChanged(userId);
+    } catch (err) {
+        if (err.code === "23505") return fail(res, 409, "EVENT_TYPE_EXISTS", "An event type with this name exists");
+        serverError(res, err);
+    }
+});
+
+// The type goes; its events stay, without a type
+app.delete("/api/event-types/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    const userId = req.user.userId;
+    if (!id) return notFound(res, "Event type");
+    try {
+        const result = await pool.query("DELETE FROM event_types WHERE id = $1 AND user_id = $2", [id, userId]);
+        if (result.rowCount === 0) return notFound(res, "Event type");
+        res.json({ message: "Event type deleted" });
+        eventTypesChanged(userId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- statistics for a period ----------
+// GET /api/stats?from=YYYY-MM-DD&to=YYYY-MM-DD (both days included, both optional: without
+// them everything). Days are the user's own (users.timezone). Only the user's own data:
+//   focus:     { ms, sessions, days: [{ day, ms }] }                  solo focus sessions
+//   events:    { ms, count, days: [{ day, ms }], types: [{ id, name, color, ms, count }] }
+//              past events (time = their duration), per type; id null = without a type
+//   groups:    [{ name, color, ms }]  focus per group, the six biggest
+//   tasksDone: tasks ticked off in the period (events don't count)
+//   firstDay:  the first day with anything at all, to draw "everything" from there
+const STATS_DAY = /^\d{4}-\d{2}-\d{2}$/;
+const STATS_MAX_DAYS = 3700;
+
+app.get("/api/stats", async (req, res) => {
+    const userId = req.user.userId;
+    const dayOf = (value) => {
+        if (value === undefined || value === "") return null;
+        return typeof value === "string" && STATS_DAY.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)) ? value : undefined;
+    };
+    const from = dayOf(req.query.from);
+    const to = dayOf(req.query.to);
+    if (from === undefined) return invalidInput(res, "from");
+    if (to === undefined) return invalidInput(res, "to");
+    if (from && to && (from > to || Date.parse(to) - Date.parse(from) > STATS_MAX_DAYS * DAY_MS)) return invalidInput(res, "to");
+
+    try {
+        const result = await pool.query(
+            `WITH me AS (SELECT COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = $1),
+            focus AS (
+                SELECT ((sessions.date AT TIME ZONE current_setting('TimeZone')) AT TIME ZONE me.tz)::date AS day,
+                    COALESCE(sessions.time_ms, 0)::bigint AS ms, sessions.group_id
+                FROM sessions, me
+                WHERE sessions.user_id = $1 AND sessions.date IS NOT NULL
+            ),
+            focus_in AS (
+                SELECT * FROM focus WHERE ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)
+            ),
+            events AS (
+                SELECT tasks.due AS day, COALESCE(tasks.duration_minutes, 0)::bigint * 60000 AS ms, tasks.event_type_id
+                FROM tasks
+                WHERE tasks.user_id = $1 AND tasks.kind = 'event' AND tasks.done
+            ),
+            events_in AS (
+                SELECT * FROM events WHERE ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)
+            )
+            SELECT
+                (SELECT to_char((now() AT TIME ZONE tz)::date, 'YYYY-MM-DD') FROM me) AS today,
+                (SELECT to_char(min(day), 'YYYY-MM-DD') FROM (SELECT day FROM focus UNION ALL SELECT day FROM events) AS all_days) AS first_day,
+                (SELECT COALESCE(json_agg(json_build_object('day', to_char(day, 'YYYY-MM-DD'), 'ms', ms, 'n', n) ORDER BY day), '[]')
+                    FROM (SELECT day, sum(ms) AS ms, count(*) AS n FROM focus_in GROUP BY day) AS d) AS focus_days,
+                (SELECT COALESCE(json_agg(json_build_object('day', to_char(day, 'YYYY-MM-DD'), 'ms', ms, 'n', n) ORDER BY day), '[]')
+                    FROM (SELECT day, sum(ms) AS ms, count(*) AS n FROM events_in GROUP BY day) AS d) AS event_days,
+                (SELECT COALESCE(json_agg(json_build_object('id', id, 'name', name, 'color', color, 'ms', ms, 'count', n) ORDER BY ms DESC, n DESC), '[]')
+                    FROM (SELECT events_in.event_type_id AS id, event_types.name, event_types.color, sum(events_in.ms) AS ms, count(*) AS n
+                        FROM events_in LEFT JOIN event_types ON event_types.id = events_in.event_type_id
+                        GROUP BY events_in.event_type_id, event_types.name, event_types.color) AS t) AS event_types,
+                (SELECT COALESCE(json_agg(json_build_object('name', name, 'color', color, 'ms', ms) ORDER BY ms DESC), '[]')
+                    FROM (SELECT groups.name, groups.color, sum(focus_in.ms) AS ms
+                        FROM focus_in JOIN groups ON groups.id = focus_in.group_id
+                        WHERE focus_in.ms > 0
+                        GROUP BY groups.id ORDER BY ms DESC LIMIT 6) AS g) AS groups,
+                (SELECT count(*)::int FROM tasks, me
+                    WHERE tasks.user_id = $1 AND tasks.kind = 'task' AND tasks.done AND tasks.completed_at IS NOT NULL
+                        AND ($2::date IS NULL OR (tasks.completed_at AT TIME ZONE me.tz)::date >= $2::date)
+                        AND ($3::date IS NULL OR (tasks.completed_at AT TIME ZONE me.tz)::date <= $3::date)) AS tasks_done`,
+            [userId, from, to]
+        );
+        const row = result.rows[0];
+        const days = (list) => list.map(d => ({ day: d.day, ms: Number(d.ms), count: Number(d.n) }));
+        const focusDays = days(row.focus_days);
+        const eventDays = days(row.event_days);
+        const sum = (list, key) => list.reduce((total, d) => total + d[key], 0);
+        res.json({
+            today: row.today,
+            from,
+            to,
+            firstDay: row.first_day,
+            focus: { ms: sum(focusDays, "ms"), sessions: sum(focusDays, "count"), days: focusDays.map(({ day, ms }) => ({ day, ms })) },
+            events: {
+                ms: sum(eventDays, "ms"),
+                count: sum(eventDays, "count"),
+                days: eventDays.map(({ day, ms }) => ({ day, ms })),
+                types: row.event_types.map(type => ({ id: type.id, name: type.name, color: type.color, ms: Number(type.ms), count: Number(type.count) })),
+            },
+            groups: row.groups.map(group => ({ name: group.name, color: group.color, ms: Number(group.ms) })),
+            tasksDone: row.tasks_done,
+        });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
 // Unknown routes, and errors no route handled (e.g. invalid JSON): short JSON answers,
 // never Express's HTML page with a stack trace
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
@@ -4161,6 +4483,9 @@ const server = http.createServer(app);
 realtime.initRealtime(server, { allowedOrigins, tokenAlgorithm: TOKEN_ALGORITHM });
 // reminders by mail, checked once a minute
 startReminderMails(pool, limitFromEnv("REMINDER_CHECK_MS", 60 * 1000));
+// events that are over are ticked off, also checked once a minute (first right away)
+closePastEvents();
+setInterval(closePastEvents, limitFromEnv("EVENT_CHECK_MS", 60 * 1000)).unref();
 server.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
 });

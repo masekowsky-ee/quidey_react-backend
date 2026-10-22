@@ -93,7 +93,7 @@ before(async () => {
         cwd: ROOT,
         env: {
             ...process.env, DB_NAME: DB, PORT: String(port), SMTP_HOST: "", CONTACT_TO: "owner@example.com",
-            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200",
+            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200",
         },
     });
     server.stdout.on("data", (chunk) => { log += chunk; });
@@ -215,6 +215,128 @@ describe("repeating tasks and completion time", () => {
         const [{ due }] = await sql("SELECT to_char(due, 'YYYY-MM-DD') AS due FROM tasks WHERE id = $1", [nextTask.id]);
         assert.ok(due >= daysFromToday(0));
         assert.ok(["30", "31"].includes(due.slice(8)), due);
+    });
+});
+
+describe("events and event types", () => {
+    let me;
+    let other;
+    before(async () => {
+        me = await member("eventer");
+        other = await member("eventother");
+    });
+    const newEvent = (fields, token = me.token) =>
+        call("POST", "/api/tasks", { name: "Schicht", prio: null, description: "", kind: "event", ...fields }, token);
+
+    test("event types: my own list, unique names, colour checked, others can't touch it", async () => {
+        const work = await call("POST", "/api/event-types", { name: "Arbeit", color: "blue" }, me.token);
+        assert.equal(work.status, 201);
+        assert.deepEqual([work.data.name, work.data.color, work.data.position], ["Arbeit", "blue", 0]);
+        assert.equal((await call("POST", "/api/event-types", { name: "arbeit" }, me.token)).data.code, "EVENT_TYPE_EXISTS");
+        assert.equal((await call("POST", "/api/event-types", { name: "Sport", color: "plaid" }, me.token)).data.field, "color");
+        assert.equal((await call("POST", "/api/event-types", { name: " " }, me.token)).data.field, "name");
+        const sport = (await call("POST", "/api/event-types", { name: "Sport" }, me.token)).data;
+        assert.equal(sport.position, 1);
+        assert.equal((await call("POST", "/api/event-types", { name: "Arbeit" }, other.token)).status, 201, "names are per account");
+
+        const renamed = await call("PUT", `/api/event-types/${sport.id}`, { name: "Training", color: "green" }, me.token);
+        assert.deepEqual([renamed.data.name, renamed.data.color], ["Training", "green"]);
+        assert.equal((await call("PUT", `/api/event-types/${sport.id}`, { name: "Arbeit" }, me.token)).data.code, "EVENT_TYPE_EXISTS");
+        assert.equal((await call("PUT", `/api/event-types/${sport.id}`, { name: "Mine" }, other.token)).status, 404);
+        assert.equal((await call("DELETE", `/api/event-types/${sport.id}`, null, other.token)).status, 404);
+        assert.deepEqual((await call("GET", "/api/event-types", null, me.token)).data.map(t => t.name), ["Arbeit", "Training"]);
+    });
+
+    test("an event needs a day and one of my own types; tasks have no type", async () => {
+        assert.equal((await newEvent({ due: null })).data.field, "due");
+        assert.equal((await newEvent({ due: daysFromToday(1), kind: "meeting" })).data.field, "kind");
+        const theirs = (await call("GET", "/api/event-types", null, other.token)).data[0];
+        assert.equal((await newEvent({ due: daysFromToday(1), event_type_id: theirs.id })).data.field, "event_type_id");
+        const mine = (await call("GET", "/api/event-types", null, me.token)).data[0];
+        const task = (await call("POST", "/api/tasks", { name: "Bericht", prio: 50, due: null, description: "", event_type_id: mine.id }, me.token)).data;
+        assert.deepEqual([task.kind, task.event_type_id], ["task", null]);
+    });
+
+    test("a past event is done right away, a coming one stays open and can't be ticked off by hand", async () => {
+        const work = (await call("GET", "/api/event-types", null, me.token)).data[0];
+        const past = (await newEvent({ due: daysFromToday(-2), due_time: "09:00", duration_minutes: 480, event_type_id: work.id })).data;
+        assert.equal(past.kind, "event");
+        assert.equal(past.done, true);
+        assert.deepEqual(past.event_type, { id: work.id, name: "Arbeit", color: "blue" });
+        const [{ ended }] = await sql(
+            "SELECT completed_at = ((due + due_time) AT TIME ZONE 'Europe/Berlin') + interval '8 hours' AS ended FROM tasks WHERE id = $1", [past.id]);
+        assert.ok(ended, "completed when it ended");
+
+        const coming = (await newEvent({ due: daysFromToday(2), due_time: "09:00", duration_minutes: 60 })).data;
+        assert.equal(coming.done, false);
+        const ticked = (await call("PUT", `/api/tasks/${coming.id}`, { ...coming, due: daysFromToday(2), done: true }, me.token)).data;
+        assert.equal(ticked.done, false);
+
+        // a whole-day event is over only when the day is
+        assert.equal((await newEvent({ due: daysFromToday(0) })).data.done, false);
+
+        // moved into the future it opens again; moved back it's done again
+        const moved = (await call("PUT", `/api/tasks/${past.id}`, { ...past, due: daysFromToday(3), done: true }, me.token)).data;
+        assert.deepEqual([moved.done, moved.completed_at], [false, null]);
+        const back = (await call("PUT", `/api/tasks/${past.id}`, { ...past, due: daysFromToday(-2), done: false }, me.token)).data;
+        assert.equal(back.done, true);
+    });
+
+    test("a repeating event that is over comes back with its next one, type and all", async () => {
+        const work = (await call("GET", "/api/event-types", null, me.token)).data[0];
+        const res = (await newEvent({ due: daysFromToday(-3), due_time: "08:00", duration_minutes: 240, repeat: "weekly", event_type_id: work.id })).data;
+        assert.equal(res.done, true);
+        const next = res.nextTask;
+        assert.ok(next);
+        assert.deepEqual([next.kind, next.event_type_id, next.done, next.duration_minutes], ["event", work.id, false, 240]);
+        const [{ due }] = await sql("SELECT to_char(due, 'YYYY-MM-DD') AS due FROM tasks WHERE id = $1", [next.id]);
+        assert.equal(due, daysFromToday(4));
+    });
+
+    test("the server ticks off events that end while nobody looks", async () => {
+        const [{ id }] = await sql(
+            `INSERT INTO tasks (name, user_id, kind, due, due_time, duration_minutes, done)
+            VALUES ('Vorbei', $1, 'event', $2, '06:00', 30, false) RETURNING id`, [me.id, daysFromToday(-1)]);
+        for (let i = 0; i < 50 && !(await sql("SELECT done FROM tasks WHERE id = $1", [id]))[0].done; i++) await sleep(100);
+        assert.equal((await sql("SELECT done FROM tasks WHERE id = $1", [id]))[0].done, true);
+    });
+
+    test("statistics for a period: event time per type, focus and ticked-off tasks", async () => {
+        const kim = await member("statkim");
+        const work = (await call("POST", "/api/event-types", { name: "Arbeit", color: "teal" }, kim.token)).data;
+        for (const n of [-1, -2, -3, -4]) {
+            await newEvent({ due: daysFromToday(n), due_time: "08:00", duration_minutes: 480, event_type_id: work.id }, kim.token);
+        }
+        await newEvent({ due: daysFromToday(-40), due_time: "08:00", duration_minutes: 480, event_type_id: work.id }, kim.token);
+        await newEvent({ due: daysFromToday(-2), due_time: "18:00", duration_minutes: 90 }, kim.token);
+        await newEvent({ due: daysFromToday(5), due_time: "08:00", duration_minutes: 480, event_type_id: work.id }, kim.token);
+        await sql("INSERT INTO sessions (user_id, time_ms, date) VALUES ($1, 1800000, now() - interval '1 day')", [kim.id]);
+        await sql("INSERT INTO tasks (name, user_id, done, completed_at) VALUES ('Blatt', $1, true, now() - interval '1 day')", [kim.id]);
+
+        const week = (await call("GET", `/api/stats?from=${daysFromToday(-6)}&to=${daysFromToday(0)}`, null, kim.token)).data;
+        assert.equal(week.events.ms, 32 * 3_600_000 + 90 * 60_000);
+        assert.equal(week.events.count, 5);
+        assert.deepEqual(week.events.types.map(t => [t.name, t.ms, t.count]), [["Arbeit", 32 * 3_600_000, 4], [null, 90 * 60_000, 1]]);
+        assert.equal(week.events.days.length, 4);
+        assert.deepEqual([week.focus.ms, week.focus.sessions], [1_800_000, 1]);
+        assert.equal(week.tasksDone, 1, "events don't count as ticked-off tasks");
+        assert.equal((await call("GET", "/api/profile", null, kim.token)).data.stats.tasksDone, 1, "not in the all-time numbers either");
+        assert.equal(week.firstDay, daysFromToday(-40));
+
+        const all = (await call("GET", "/api/stats", null, kim.token)).data;
+        assert.equal(all.events.types[0].ms, 40 * 3_600_000);
+        assert.equal((await call("GET", `/api/stats?from=${daysFromToday(0)}&to=${daysFromToday(-1)}`, null, kim.token)).status, 400);
+        assert.equal((await call("GET", "/api/stats?from=yesterday", null, kim.token)).data.field, "from");
+        assert.equal((await call("GET", "/api/stats")).status, 401);
+    });
+
+    test("deleting a type keeps its events, without a type", async () => {
+        const type = (await call("POST", "/api/event-types", { name: "Kurz" }, me.token)).data;
+        const event = (await newEvent({ due: daysFromToday(1), event_type_id: type.id })).data;
+        assert.equal((await call("DELETE", `/api/event-types/${type.id}`, null, me.token)).status, 200);
+        const tasks = (await call("GET", "/api/tasks", null, me.token)).data;
+        const kept = tasks.find(t => t.id === event.id);
+        assert.deepEqual([kept.kind, kept.event_type_id, kept.event_type], ["event", null, null]);
     });
 });
 
@@ -1096,6 +1218,7 @@ describe("deleting an account", () => {
         await befriend(gone, friend, "stayer");
         await call("POST", "/api/tasks", { name: "Steuer", prio: 50, due: daysFromToday(1), description: "" }, gone.token);
         await call("POST", "/api/groups", { name: "Arbeit", description: "" }, gone.token);
+        await call("POST", "/api/event-types", { name: "Arbeit" }, gone.token);
         await call("POST", "/api/sessions", { totalTime: 1500, workedTasks: [], group: "Arbeit" }, gone.token);
         await call("POST", "/api/shared-sessions", { name: "Lerngruppe" }, gone.token);
         await call("POST", `/api/messages/${friend.id}`, { body: "Tschüss" }, gone.token);
@@ -1106,7 +1229,8 @@ describe("deleting an account", () => {
             `SELECT (SELECT count(*) FROM tasks WHERE user_id = $1) + (SELECT count(*) FROM groups WHERE user_id = $1)
                 + (SELECT count(*) FROM sessions WHERE user_id = $1) + (SELECT count(*) FROM friendships WHERE requester_id = $1 OR addressee_id = $1)
                 + (SELECT count(*) FROM shared_sessions WHERE owner_id = $1) + (SELECT count(*) FROM messages WHERE sender_id = $1 OR recipient_id = $1)
-                + (SELECT count(*) FROM notifications WHERE user_id = $1) + (SELECT count(*) FROM users WHERE id = $1) AS n`,
+                + (SELECT count(*) FROM notifications WHERE user_id = $1) + (SELECT count(*) FROM event_types WHERE user_id = $1)
+                + (SELECT count(*) FROM users WHERE id = $1) AS n`,
             [gone.id]
         );
         assert.equal(Number(left.n), 0);
