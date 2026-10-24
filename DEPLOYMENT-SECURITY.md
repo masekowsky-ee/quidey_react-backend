@@ -59,7 +59,9 @@ sudo quidey-migrate baseline 017  # once: record 001..017 as applied WITHOUT run
 - `NODE_ENV=production`.
 - `JWT_SECRET`: a new random value for production (not the dev one), at least 32 characters:
   `node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"`.
-- `CORS_ORIGINS=https://quidey.com` (exactly the site's origin, no trailing slash).
+- `CORS_ORIGINS=https://app.quidey.com` (exactly the app's origin, no trailing slash; the landing
+  page on quidey.com is a separate static site and never calls the API).
+- `FRONTEND_URL=https://app.quidey.com`: the links in mails (verification, reminders) open the app.
 - Run it as a normal user (not root), under a process manager that restarts it
   (systemd service or pm2), and keep `npm audit` / updates in mind now and then.
 
@@ -98,7 +100,9 @@ sudo quidey-migrate baseline 017  # once: record 001..017 as applied WITHOUT run
   `VITE_API_URL=https://api.quidey.com`, then `npm run build`.
   The build writes `dist/_headers` with the security headers; its Content-Security-Policy
   only allows calls to that API address, so the build must use the real one.
-- After deploying, check the headers once: `curl -sI https://quidey.com | grep -i -E "content-security|strict-transport|x-frame"`.
+- The app is served on `app.quidey.com` (worker `quideyreactmain`); `quidey.com` is the landing
+  page from the separate repo `quidey_landing` (worker `quidey-landing`).
+- After deploying, check the headers once: `curl -sI https://app.quidey.com | grep -i -E "content-security|strict-transport|x-frame"`.
   If something on the page stops working, the browser console names the CSP rule that blocked it.
 
 ## 5. After going live

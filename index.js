@@ -339,6 +339,13 @@ const TASK_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet
 
 // How far the next one of a repeating task is from the last (Postgres intervals)
 const REPEAT_INTERVALS = { daily: "1 day", weekly: "7 days", monthly: "1 month", yearly: "1 year" };
+// at most this many repeats when a repeating task has an end
+const REPEAT_LEFT_MAX = 1000;
+// The day n steps of its rhythm after a task's day (SQL about a row `t` with due and repeat; n
+// steps from the day itself, not step after step, so the 31st stays the 31st where it can)
+const repeatDueSql = (t, n) => `(${t}.due + ${n} * CASE ${t}.repeat
+        WHEN 'daily' THEN interval '1 day' WHEN 'weekly' THEN interval '7 days'
+        WHEN 'monthly' THEN interval '1 month' ELSE interval '1 year' END)::date`;
 
 // The optional task fields, each checked only when it was sent:
 // { values: { column: value } } or { error: field }
@@ -350,6 +357,8 @@ const TASK_EXTRAS = {
     link: cleanLink,
     details: (value) => cleanText(value, TASK_DETAILS_MAX),
     repeat: (value) => (value === null || value === "" ? null : Object.hasOwn(REPEAT_INTERVALS, value) ? value : undefined),
+    // how many more times it comes back after this one (null = no end)
+    repeat_left: (value) => cleanMinutes(value, 0, REPEAT_LEFT_MAX),
     color: (value) => (value === null || value === "" ? null : TASK_COLORS.includes(value) ? value : undefined),
     // also remind by mail (only the owner can change it, see PUT /api/tasks/:id)
     reminder_email: (value) => (typeof value === "boolean" ? value : undefined),
@@ -385,6 +394,10 @@ const SHARED_TASK_FIELDS = {
     color: TASK_EXTRAS.color,
 };
 
+// A shared session's tasks also can be events: they need a day and are done once they are
+// over (syncSessionEvents). Family calendars stay with SHARED_TASK_FIELDS.
+const SESSION_TASK_FIELDS = { ...SHARED_TASK_FIELDS, kind: TASK_EXTRAS.kind };
+
 // Ids of the tasks a user may see and change: their own, and the ones shared with them that
 // they accepted. `param` is the query parameter holding the user id, e.g. "$2".
 const accessibleTaskIds = (param) =>
@@ -400,7 +413,9 @@ const TASK_SELECT = `
     SELECT tasks.id, tasks.name, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
         tasks.duration_minutes, tasks.reminder_minutes, tasks.location, tasks.link, tasks.details,
         tasks.description, tasks.prio, tasks.done, tasks.created_at, tasks.user_id,
-        tasks.repeat, tasks.completed_at, tasks.color, tasks.reminder_email,
+        tasks.repeat, tasks.repeat_left,
+        ARRAY(SELECT to_char(day, 'YYYY-MM-DD') FROM unnest(tasks.repeat_skip) AS day ORDER BY day) AS repeat_skip,
+        tasks.completed_at, tasks.color, tasks.reminder_email,
         tasks.kind, tasks.event_type_id, event_types.name AS event_type_name, event_types.color AS event_type_color,
         owner.username AS owner_username, owner.display_name AS owner_display_name,
         my_share.id AS my_share_id,
@@ -443,6 +458,9 @@ function toTaskResponse(row, userId) {
         prio: row.prio,
         done: row.done,
         repeat: row.repeat,
+        // how many more times it comes back (null = no end) and the coming days left out
+        repeat_left: row.repeat_left,
+        repeat_skip: row.repeat_skip,
         color: row.color,
         // the owner's setting: a mail reaches only them
         reminder_email: row.reminder_email,
@@ -757,6 +775,8 @@ app.post("/api/tasks", async (req, res) => {
     // an event happens on a day; only events have a type
     if (extras.values.kind === "event" && !due) return invalidInput(res, "due");
     if (extras.values.kind !== "event") delete extras.values.event_type_id;
+    // an end only for something that repeats
+    if (!extras.values.repeat) delete extras.values.repeat_left;
 
     const columns = ["name", "due", "description", "prio", "user_id", ...Object.keys(extras.values)];
     const values = [name, due, description, prio, userId, ...Object.values(extras.values)];
@@ -827,6 +847,32 @@ async function syncEvents(db, where, params = []) {
     return changed;
 }
 
+// The same for events in shared sessions: `done` is whether they are over, in the session
+// owner's time zone. Tells the members' apps of each session that changed (unless notify is
+// false, when the caller does). Returns the ids of the sessions that changed.
+async function syncSessionEvents(where, params = [], notify = true) {
+    const result = await pool.query(
+        `UPDATE shared_session_tasks SET done = state.over
+        FROM (
+            SELECT shared_session_tasks.id, ends.at <= now() AS over
+            FROM shared_session_tasks
+            JOIN shared_sessions ON shared_sessions.id = shared_session_tasks.session_id
+            JOIN users ON users.id = shared_sessions.owner_id
+            CROSS JOIN LATERAL (SELECT ${EVENT_END_SQL.replaceAll("tasks.", "shared_session_tasks.")} AS at) AS ends
+            WHERE shared_session_tasks.kind = 'event' AND shared_session_tasks.due IS NOT NULL
+                AND shared_sessions.ended_at IS NULL AND (${where})
+        ) AS state
+        WHERE shared_session_tasks.id = state.id AND shared_session_tasks.done IS DISTINCT FROM state.over
+        RETURNING shared_session_tasks.session_id`,
+        params
+    );
+    const sessions = [...new Set(result.rows.map(row => row.session_id))];
+    if (notify) {
+        for (const sessionId of sessions) await notifySession(sessionId).catch(() => {});
+    }
+    return sessions;
+}
+
 // syncEvents in a transaction of its own, so an ended event and its next repeat come together
 async function syncEventsNow(where, params) {
     const client = await pool.connect();
@@ -850,6 +896,7 @@ async function closePastEvents() {
     try {
         // an event after tomorrow can't be over yet, whatever the time zone
         changed = await syncEventsNow("NOT tasks.done AND tasks.due <= current_date + 1");
+        await syncSessionEvents("NOT shared_session_tasks.done AND shared_session_tasks.due <= current_date + 1");
     } catch (err) {
         console.error("Closing past events failed:", err);
         return;
@@ -1350,10 +1397,15 @@ app.post("/api/feedback", authenticateToken, feedbackLimiter, async (req, res) =
     if (message.length < 5 || message.length > 5000) {
         return res.status(400).json({ error: "Feedback must be 5-5000 characters", code: "INVALID_MESSAGE" });
     }
+    // where an answer goes: the account's address unless another one is given
+    const replyTo = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+    if (replyTo && (!EMAIL_PATTERN.test(replyTo) || replyTo.length > 254)) {
+        return res.status(400).json({ error: "Invalid email address", code: "INVALID_EMAIL" });
+    }
 
     try {
         const user = (await pool.query("SELECT username, display_name, email FROM users WHERE id = $1", [req.user.userId])).rows[0];
-        await sendFeedbackMail({ category, message, page, user });
+        await sendFeedbackMail({ category, message, page, user: replyTo ? { ...user, email: replyTo } : user });
         res.json({ sent: true });
     } catch (err) {
         console.error("Feedback mail failed:", err);
@@ -2056,6 +2108,9 @@ app.put("/api/tasks/:id", async (req, res) => {
             return invalidInput(res, invalid);
         }
 
+        // an end only for something that repeats; a new rhythm forgets the repeats left out
+        if ("repeat" in extras.values && !extras.values.repeat) extras.values.repeat_left = null;
+
         // an event is done when it's over (syncEvents below), never by hand
         const values = [name, due, description, prio, kind === "event" ? Boolean(old.done) : done, id, userId];
         // completed_at: set when the task becomes done (SET sees the old row), cleared when reopened
@@ -2070,7 +2125,11 @@ app.put("/api/tasks/:id", async (req, res) => {
         }
         // without a day there is no time of day and no repeating either
         if (!due && !("due_time" in extras.values)) sets.push("due_time = NULL");
-        if (!due && !("repeat" in extras.values)) sets.push("repeat = NULL");
+        if (!due && !("repeat" in extras.values)) sets.push("repeat = NULL", "repeat_left = NULL");
+        if ("repeat" in extras.values) {
+            values.push(extras.values.repeat);
+            sets.push(`repeat_skip = CASE WHEN tasks.repeat IS DISTINCT FROM $${values.length} THEN '{}' ELSE tasks.repeat_skip END`);
+        }
 
         await client.query(`UPDATE tasks SET ${sets.join(", ")} WHERE id = $6 AND id IN (${accessibleTaskIds("$7")})`, values);
         const [synced] = await syncEvents(client, "tasks.id = $1", [id]);
@@ -2091,8 +2150,9 @@ app.put("/api/tasks/:id", async (req, res) => {
 });
 
 // The next one of a repeating task that was just done: the same task (owner, fields, groups)
-// on the first day of its rhythm that isn't in the past, linked by repeat_from_id. Nothing
-// when the task doesn't repeat or its next one already exists (done, reopened, done again).
+// on the first day of its rhythm that isn't in the past and wasn't left out (repeat_skip),
+// linked by repeat_from_id. Nothing when the task doesn't repeat, its end is reached
+// (repeat_left) or its next one already exists (done, reopened, done again).
 // Returns the new task's id or null.
 async function createNextRepeat(db, taskId) {
     const result = await db.query(
@@ -2101,22 +2161,23 @@ async function createNextRepeat(db, taskId) {
             WHERE id = $1 AND repeat IS NOT NULL AND due IS NOT NULL
                 AND NOT EXISTS (SELECT 1 FROM tasks AS next WHERE next.repeat_from_id = $1)
         ), next_due AS (
-            -- n steps from the day itself (not step after step), so the 31st stays the 31st where it can
-            SELECT (source.due + n * CASE source.repeat
-                    WHEN 'daily' THEN interval '1 day' WHEN 'weekly' THEN interval '7 days'
-                    WHEN 'monthly' THEN interval '1 month' ELSE interval '1 year' END)::date AS due
+            SELECT n, ${repeatDueSql("source", "n")} AS due
             FROM source, generate_series(1, 4000) AS n
-            WHERE (source.due + n * CASE source.repeat
-                    WHEN 'daily' THEN interval '1 day' WHEN 'weekly' THEN interval '7 days'
-                    WHEN 'monthly' THEN interval '1 month' ELSE interval '1 year' END)::date >= current_date
+            WHERE ${repeatDueSql("source", "n")} >= current_date
+                AND NOT ${repeatDueSql("source", "n")} = ANY(source.repeat_skip)
+                -- every step counts, also the ones jumped over
+                AND (source.repeat_left IS NULL OR n <= source.repeat_left)
             ORDER BY n
             LIMIT 1
         )
         INSERT INTO tasks (name, due, description, prio, user_id, due_time, duration_minutes,
-            reminder_minutes, location, link, details, repeat, repeat_from_id, color, reminder_email, kind, event_type_id)
+            reminder_minutes, location, link, details, repeat, repeat_from_id, color, reminder_email, kind, event_type_id,
+            repeat_left, repeat_skip)
         SELECT source.name, next_due.due, source.description, source.prio, source.user_id, source.due_time,
             source.duration_minutes, source.reminder_minutes, source.location, source.link, source.details,
-            source.repeat, source.id, source.color, source.reminder_email, source.kind, source.event_type_id
+            source.repeat, source.id, source.color, source.reminder_email, source.kind, source.event_type_id,
+            source.repeat_left - next_due.n,
+            ARRAY(SELECT day FROM unnest(source.repeat_skip) AS day WHERE day > next_due.due)
         FROM source, next_due
         RETURNING id`,
         [taskId]
@@ -2191,27 +2252,105 @@ app.put("/api/notes/:id", async (req, res) => {
 })
 
 //DELETE endpoints
+// Deleting a repeating task asks what goes (?scope=):
+//   one        only this one; an open one that repeats leaves its next one behind
+//   following  this one and the ones after it (repeat_from_id links them)
+//   all        the whole row of them, the done ones before it, too
+// Without scope only this one goes (like one, but without a next one: older apps).
+// ?occurrence=YYYY-MM-DD names a coming repeat of this (open) task that the app shows but that
+// doesn't exist yet: one leaves that day out (repeat_skip), following lets the task end before
+// it (repeat_left), all is the same as for the task itself.
+// -> { message, deletedIds, task (this task, changed when it stays), nextTask? (took its place) }
 app.delete("/api/tasks/:id", async (req, res) => {
     const id = idParam(req.params.id);
     const userId = req.user.userId;
     if (!id) return notFound(res, "Task");
+    const scope = req.query.scope ?? null;
+    if (scope !== null && !["one", "following", "all"].includes(scope)) return invalidInput(res, "scope");
+    const occurrence = req.query.occurrence === undefined ? null : cleanDate(req.query.occurrence);
+    if (occurrence === undefined || (occurrence && !scope)) return invalidInput(res, "occurrence");
 
+    const client = await pool.connect();
     try {
         // who else had it, asked before it's gone
         const others = await taskPeople(id, userId);
-        const result = await pool.query(
-            "DELETE FROM tasks WHERE id = $1 AND user_id = $2 RETURNING *",
-            [id, userId]
-        );
-
-        if (result.rows.length === 0) {
+        await client.query("BEGIN");
+        const found = await client.query("SELECT done, repeat FROM tasks WHERE id = $1 AND user_id = $2 FOR UPDATE", [id, userId]);
+        if (found.rows.length === 0) {
+            await client.query("ROLLBACK");
             return res.status(404).json({ error: "Task not found" });
         }
+        const task = found.rows[0];
 
-        res.json({ message: "Task deleted", task: result.rows[0] });
+        if (occurrence && scope !== "all") {
+            // which step of the rhythm that day is (it has to be one of the coming ones)
+            const step = await client.query(
+                `SELECT n FROM tasks AS t, generate_series(1, 4000) AS n
+                WHERE t.id = $1 AND t.repeat IS NOT NULL AND ${repeatDueSql("t", "n")} = $2::date
+                LIMIT 1`,
+                [id, occurrence]
+            );
+            if (step.rows.length === 0 || task.done) {
+                await client.query("ROLLBACK");
+                return invalidInput(res, "occurrence");
+            }
+            const left = step.rows[0].n - 1;
+            if (scope === "one") {
+                await client.query(
+                    "UPDATE tasks SET repeat_skip = array_append(repeat_skip, $2::date) WHERE id = $1 AND NOT $2::date = ANY(repeat_skip)",
+                    [id, occurrence]
+                );
+            } else {
+                // the ones before that day stay; none left means it doesn't repeat any more
+                await client.query(
+                    `UPDATE tasks SET repeat = CASE WHEN $2 = 0 THEN NULL ELSE repeat END,
+                        repeat_left = CASE WHEN $2 = 0 THEN NULL ELSE LEAST(COALESCE(repeat_left, $2), $2) END,
+                        repeat_skip = CASE WHEN $2 = 0 THEN '{}' ELSE repeat_skip END
+                    WHERE id = $1`,
+                    [id, left]
+                );
+            }
+            await client.query("COMMIT");
+            res.json({ message: "Task changed", deletedIds: [], task: await loadTask(id, userId) });
+            notifyTaskPeople(others, id);
+            return;
+        }
+
+        // the row this task belongs to: the ones it came from and the ones that came from it
+        const chain = await client.query(
+            `WITH RECURSIVE before AS (
+                SELECT id, repeat_from_id FROM tasks WHERE id = $1
+                UNION SELECT tasks.id, tasks.repeat_from_id FROM tasks JOIN before ON tasks.id = before.repeat_from_id
+            ), after AS (
+                SELECT id FROM tasks WHERE id = $1
+                UNION SELECT tasks.id FROM tasks JOIN after ON tasks.repeat_from_id = after.id
+            )
+            SELECT id, 'before' AS side FROM before WHERE id <> $1
+            UNION ALL SELECT id, 'after' FROM after WHERE id <> $1`,
+            [id]
+        );
+        const ids = [id];
+        for (const row of chain.rows) {
+            if (scope === "all" || (scope === "following" && row.side === "after")) ids.push(row.id);
+        }
+
+        // only this one: an open repeating one hands over to its next one first
+        const nextId = scope === "one" && !task.done && task.repeat ? await createNextRepeat(client, id) : null;
+        const result = await client.query("DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2 RETURNING id", [ids, userId]);
+        await client.query("COMMIT");
+
+        res.json({
+            message: "Task deleted",
+            deletedIds: result.rows.map(row => row.id),
+            task: { id },
+            ...(nextId ? { nextTask: await loadTask(nextId, userId) } : {}),
+        });
         notifyTaskPeople(others, id);
     } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
+    } finally {
+        client.release();
     }
 });
 
@@ -3095,6 +3234,7 @@ async function loadSharedSession(sessionId, userId) {
                 shared_session_tasks.due, to_char(shared_session_tasks.due_time, 'HH24:MI') AS due_time,
                 shared_session_tasks.prio, shared_session_tasks.duration_minutes, shared_session_tasks.location,
                 shared_session_tasks.link, shared_session_tasks.details, shared_session_tasks.color,
+                shared_session_tasks.kind,
                 users.id AS adder_id, users.username AS adder_username, users.display_name AS adder_display_name,
                 assignee.id AS assignee_id, assignee.username AS assignee_username, assignee.display_name AS assignee_display_name
             FROM shared_session_tasks
@@ -3181,6 +3321,7 @@ async function loadSharedSession(sessionId, userId) {
                 link: task.link,
                 details: task.details,
                 color: task.color,
+                kind: task.kind,
                 addedBy: task.adder_id ? publicUser(task, "adder_") : null,
                 assignee: task.assignee_id ? publicUser(task, "assignee_") : null,
                 // only the person who shared it can do anything with their own task's id
@@ -3204,6 +3345,8 @@ async function loadSharedSession(sessionId, userId) {
 }
 
 async function sendSharedSession(res, sessionId, userId, status = 200) {
+    // events that ended since the last check are done
+    await syncSessionEvents("shared_session_tasks.session_id = $1", [sessionId]);
     const session = await loadSharedSession(sessionId, userId);
     if (!session) return fail(res, 404, "SESSION_NOT_FOUND", "Session not found");
     res.status(status).json(session);
@@ -3262,7 +3405,7 @@ app.get("/api/shared-sessions", async (req, res) => {
 });
 
 // The tasks of all running sessions I joined, for the solo home page (one group per session):
-// [{ id, name, me, tasks: [{ id, name, description, done, assignee, myMs, totalMs }] }]
+// [{ id, name, me, tasks: [{ id, name, description, done, assignee, myMs, totalMs }] }] (no events)
 // Registered before /:id, which would otherwise take "my-tasks" for an id.
 app.get("/api/shared-sessions/my-tasks", async (req, res) => {
     const userId = req.user.userId;
@@ -3277,7 +3420,9 @@ app.get("/api/shared-sessions/my-tasks", async (req, res) => {
                     WHERE task_id = shared_session_tasks.id), 0) AS total_ms
             FROM shared_session_members
             JOIN shared_sessions ON shared_sessions.id = shared_session_members.session_id
+            -- only tasks: a session's events aren't worked on (they show in the session and its calendar)
             LEFT JOIN shared_session_tasks ON shared_session_tasks.session_id = shared_sessions.id
+                AND shared_session_tasks.kind = 'task'
             LEFT JOIN users AS assignee ON assignee.id = shared_session_tasks.assignee_id
             WHERE shared_session_members.user_id = $1 AND shared_session_members.status = 'joined'
                 AND shared_sessions.ended_at IS NULL
@@ -3471,9 +3616,12 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
         let task;
         if (req.body?.taskId !== undefined) {
             const own = await pool.query(
-                `SELECT id, name, description, due, to_char(due_time, 'HH24:MI') AS due_time, prio,
-                    duration_minutes, location, link, details, color
-                FROM tasks WHERE id = $1 AND user_id = $2`,
+                `SELECT tasks.id, tasks.name, tasks.description, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
+                    tasks.prio, tasks.duration_minutes, tasks.location, tasks.link, tasks.details,
+                    -- an event without its own colour takes its type's (the type itself is personal)
+                    COALESCE(tasks.color, event_types.color) AS color, tasks.kind
+                FROM tasks LEFT JOIN event_types ON event_types.id = tasks.event_type_id
+                WHERE tasks.id = $1 AND tasks.user_id = $2`,
                 [idParam(req.body.taskId), userId]
             );
             if (own.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
@@ -3483,9 +3631,10 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
         } else {
             const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, TASK_NAME_MAX) : "";
             if (!name) return fail(res, 400, "NAME_REQUIRED", "Name is required");
-            const fields = readTaskExtras(req.body, SHARED_TASK_FIELDS);
+            const fields = readTaskExtras(req.body, SESSION_TASK_FIELDS);
             if (fields.error) return invalidInput(res, fields.error);
             if (fields.values.due_time && !fields.values.due) return invalidInput(res, "due_time");
+            if (fields.values.kind === "event" && !fields.values.due) return invalidInput(res, "due");
             task = { name, fields: fields.values, sourceTaskId: null };
         }
 
@@ -3496,6 +3645,8 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
             VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING id`,
             values
         );
+        // an event entered afterwards is over right away
+        await syncSessionEvents("shared_session_tasks.id = $1", [created.rows[0].id], false);
         await logEvent(pool, session.sessionId, userId, "task_added", { taskId: created.rows[0].id, taskName: task.name });
         await sendSharedSession(res, session.sessionId, userId, 201);
         await notifySession(session.sessionId);
@@ -3517,7 +3668,7 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
     const changesAssignee = req.body && "assigneeId" in req.body;
     const assigneeId = changesAssignee && req.body.assigneeId !== null ? idParam(req.body.assigneeId) : null;
     const name = req.body?.name === undefined ? undefined : cleanText(req.body.name, TASK_NAME_MAX);
-    const fields = readTaskExtras(req.body, SHARED_TASK_FIELDS);
+    const fields = readTaskExtras(req.body, SESSION_TASK_FIELDS);
 
     if (done !== undefined && typeof done !== "boolean") return fail(res, 400, "DONE_REQUIRED", "done must be true or false");
     if (name === null || (req.body?.name !== undefined && name === undefined)) return invalidInput(res, "name");
@@ -3532,7 +3683,7 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
         if (!session) return;
 
         const before = await pool.query(
-            "SELECT name, done, assignee_id, source_task_id, due FROM shared_session_tasks WHERE id = $1 AND session_id = $2",
+            "SELECT name, done, assignee_id, source_task_id, due, kind FROM shared_session_tasks WHERE id = $1 AND session_id = $2",
             [taskId, session.sessionId]
         );
         if (before.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
@@ -3542,13 +3693,22 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
         const due = "due" in fields.values ? fields.values.due : task.due;
         if (fields.values.due_time && !due) return invalidInput(res, "due_time");
         if (!due && !("due_time" in fields.values)) fields.values.due_time = null;
+        // an event happens on a day and is done once it's over, never by hand
+        const kind = fields.values.kind ?? task.kind;
+        if (kind === "event" && !due) return invalidInput(res, "due");
+        if (kind === "event" && done !== undefined) {
+            if (Object.keys(fields.values).length === 0 && !changesAssignee && name === undefined) {
+                return fail(res, 400, "EVENT_NOT_DONE_BY_HAND", "An event is done once it is over");
+            }
+        }
+        const setDone = kind === "event" ? undefined : done;
 
         if (assigneeId) {
             const member = await getMembership(session.sessionId, assigneeId);
             if (member?.status !== "joined") return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
         }
 
-        const values = [done ?? null, changesAssignee, assigneeId, taskId, name ?? null];
+        const values = [setDone ?? null, changesAssignee, assigneeId, taskId, name ?? null];
         const sets = ["done = COALESCE($1, done)", "assignee_id = CASE WHEN $2 THEN $3::int ELSE assignee_id END",
             "name = COALESCE($5, name)"];
         for (const [column, value] of Object.entries(fields.values)) {
@@ -3557,8 +3717,12 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
         }
         await pool.query(`UPDATE shared_session_tasks SET ${sets.join(", ")} WHERE id = $4`, values);
         if (name) task.name = name;
+        // a moved event can be over (or open again)
+        if (kind === "event" || task.kind === "event") {
+            await syncSessionEvents("shared_session_tasks.id = $1", [taskId], false);
+        }
 
-        if (done !== undefined && done !== task.done) {
+        if (setDone !== undefined && setDone !== task.done) {
             if (task.source_task_id) {
                 await pool.query(
                     "UPDATE tasks SET done = $1, completed_at = CASE WHEN $1 THEN COALESCE(completed_at, now()) END WHERE id = $2",
@@ -3628,10 +3792,14 @@ app.post("/api/shared-sessions/:id/activity", async (req, res) => {
         const wanted = [currentTaskId, bookTaskId].filter(Boolean);
         if (wanted.length > 0) {
             const found = await pool.query(
-                "SELECT id FROM shared_session_tasks WHERE session_id = $1 AND id = ANY($2::int[])",
+                "SELECT id, kind FROM shared_session_tasks WHERE session_id = $1 AND id = ANY($2::int[])",
                 [session.sessionId, wanted]
             );
             if (found.rows.length < new Set(wanted).size) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
+            // an event happens, nobody works on it with the stopwatch
+            if (found.rows.some(row => row.id === currentTaskId && row.kind === "event")) {
+                return fail(res, 409, "EVENT_NOT_WORKED", "An event can't be worked on");
+            }
         }
 
         let bookedMs = 0;
@@ -4274,7 +4442,28 @@ app.post(`${familyBase}/:id/messages`, messageLimiter, async (req, res) => {
 const EVENT_TYPE_NAME_MAX = 40;
 const EVENT_TYPES_MAX = 30;
 
-const toEventType = (row) => ({ id: row.id, name: row.name, color: row.color, position: row.position });
+const EVENT_TYPE_KEYWORDS_MAX = 20;
+const EVENT_TYPE_KEYWORD_MAX = 40;
+
+const toEventType = (row) => ({ id: row.id, name: row.name, color: row.color, position: row.position, keywords: row.keywords ?? [] });
+
+// The words that pick a type by themselves: a list of strings, trimmed, without doubles (case
+// doesn't count). undefined when it isn't such a list.
+function cleanKeywords(value) {
+    if (!Array.isArray(value) || value.length > EVENT_TYPE_KEYWORDS_MAX * 2) return undefined;
+    const seen = new Set();
+    const keywords = [];
+    for (const item of value) {
+        if (typeof item !== "string") return undefined;
+        const word = item.trim();
+        if (!word) continue;
+        if (word.length > EVENT_TYPE_KEYWORD_MAX) return undefined;
+        if (seen.has(word.toLowerCase())) continue;
+        seen.add(word.toLowerCase());
+        keywords.push(word);
+    }
+    return keywords.length > EVENT_TYPE_KEYWORDS_MAX ? undefined : keywords;
+}
 
 // The user's other devices load their tasks again (and with them the types)
 const eventTypesChanged = (userId) => realtime.toUser(userId, "tasks:changed", {});
@@ -4282,7 +4471,7 @@ const eventTypesChanged = (userId) => realtime.toUser(userId, "tasks:changed", {
 app.get("/api/event-types", async (req, res) => {
     try {
         const result = await pool.query(
-            "SELECT id, name, color, position FROM event_types WHERE user_id = $1 ORDER BY position, id",
+            "SELECT id, name, color, position, keywords FROM event_types WHERE user_id = $1 ORDER BY position, id",
             [req.user.userId]
         );
         res.json(result.rows.map(toEventType));
@@ -4291,21 +4480,23 @@ app.get("/api/event-types", async (req, res) => {
     }
 });
 
-// { name, color? } -> the new type, at the end of the list
+// { name, color?, keywords? } -> the new type, at the end of the list
 app.post("/api/event-types", async (req, res) => {
     const userId = req.user.userId;
     const name = cleanText(req.body?.name, EVENT_TYPE_NAME_MAX);
     const color = req.body?.color === undefined ? null : TASK_EXTRAS.color(req.body.color);
+    const keywords = req.body?.keywords === undefined ? [] : cleanKeywords(req.body.keywords);
     if (!name) return invalidInput(res, "name");
     if (color === undefined) return invalidInput(res, "color");
+    if (keywords === undefined) return invalidInput(res, "keywords");
     try {
         const result = await pool.query(
-            `INSERT INTO event_types (user_id, name, color, position)
-            SELECT $1, $2, $3, COALESCE(max(position) + 1, 0) FROM event_types WHERE user_id = $1
+            `INSERT INTO event_types (user_id, name, color, position, keywords)
+            SELECT $1, $2, $3, COALESCE(max(position) + 1, 0), $4 FROM event_types WHERE user_id = $1
             HAVING count(*) < ${EVENT_TYPES_MAX}
             ON CONFLICT (user_id, lower(name)) DO NOTHING
-            RETURNING id, name, color, position`,
-            [userId, name, color]
+            RETURNING id, name, color, position, keywords`,
+            [userId, name, color, keywords]
         );
         if (result.rows.length === 0) {
             const count = await pool.query("SELECT count(*)::int AS n FROM event_types WHERE user_id = $1", [userId]);
@@ -4320,7 +4511,7 @@ app.post("/api/event-types", async (req, res) => {
     }
 });
 
-// { name?, color?, position? }: only what is sent changes
+// { name?, color?, position?, keywords? }: only what is sent changes
 app.put("/api/event-types/:id", async (req, res) => {
     const id = idParam(req.params.id);
     const userId = req.user.userId;
@@ -4345,10 +4536,16 @@ app.put("/api/event-types/:id", async (req, res) => {
         values.push(position);
         sets.push(`position = $${values.length}`);
     }
+    if (req.body?.keywords !== undefined) {
+        const keywords = cleanKeywords(req.body.keywords);
+        if (keywords === undefined) return invalidInput(res, "keywords");
+        values.push(keywords);
+        sets.push(`keywords = $${values.length}`);
+    }
     if (sets.length === 0) return invalidInput(res, "name");
     try {
         const result = await pool.query(
-            `UPDATE event_types SET ${sets.join(", ")} WHERE id = $1 AND user_id = $2 RETURNING id, name, color, position`,
+            `UPDATE event_types SET ${sets.join(", ")} WHERE id = $1 AND user_id = $2 RETURNING id, name, color, position, keywords`,
             values
         );
         if (result.rows.length === 0) return notFound(res, "Event type");

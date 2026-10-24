@@ -172,6 +172,14 @@ describe("contact form and feedback", () => {
         await sleep(100);
         assert.match(log, /Feedback aus Quidey: Fehler[\s\S]*@fbuser[\s\S]*fbuser@example\.com[\s\S]*Der Kalender springt\./);
     });
+
+    test("feedback can name another address to answer to", async () => {
+        const bob = await member("fbreply");
+        assert.equal((await call("POST", "/api/feedback", { category: "idea", message: "Mehr Farben bitte.", email: "kein-mail" }, bob.token)).data.code, "INVALID_EMAIL");
+        assert.equal((await call("POST", "/api/feedback", { category: "idea", message: "Mehr Farben bitte.", email: "privat@example.org" }, bob.token)).status, 200);
+        await sleep(100);
+        assert.match(log, /@fbreply\)\nE-Mail: privat@example\.org/);
+    });
 });
 
 describe("repeating tasks and completion time", () => {
@@ -497,6 +505,157 @@ describe("details of tasks in a shared session", () => {
         // reminders and repeating stay personal
         assert.equal(shared.reminder_minutes, undefined);
         assert.equal(shared.repeat, undefined);
+    });
+});
+
+describe("repeats that end, and deleting repeating tasks", () => {
+    let me;
+    before(async () => { me = await member("serieser"); });
+    const dueOf = async (id) => (await sql("SELECT to_char(due, 'YYYY-MM-DD') AS due FROM tasks WHERE id = $1", [id]))[0]?.due;
+    // the day as the app sends it (the API answers with a timestamp)
+    const finish = (task, extra = {}) => call("PUT", `/api/tasks/${task.id}`, { ...task, due: iso(new Date(task.due)), done: true, ...extra }, me.token);
+    const weekly = (extra = {}) => call("POST", "/api/tasks", { name: "Serie", prio: 50, due: daysFromToday(1), description: "", repeat: "weekly", ...extra }, me.token);
+
+    test("an end only for something that repeats; it counts down and stops", async () => {
+        assert.equal((await weekly({ repeat_left: -1 })).data.field, "repeat_left");
+        const once = (await call("POST", "/api/tasks", { name: "Einmal", prio: 50, due: daysFromToday(1), description: "", repeat_left: 3 }, me.token)).data;
+        assert.equal(once.repeat_left, null);
+
+        const task = (await weekly({ repeat_left: 1 })).data;
+        assert.equal(task.repeat_left, 1);
+        const next = (await finish(task)).data.nextTask;
+        assert.equal(next.repeat_left, 0);
+        assert.equal(await dueOf(next.id), daysFromToday(8));
+        const last = (await finish(next)).data;
+        assert.equal(last.nextTask, undefined, "no repeats left");
+
+        const plain = (await finish(task, { repeat: null })).data;
+        assert.equal(plain.repeat_left, null, "not repeating takes the end along");
+    });
+
+    test("a coming repeat deleted on its own is jumped over and still counts", async () => {
+        const task = (await weekly({ repeat_left: 3 })).data;
+        const skipped = daysFromToday(8);
+        const r = await call("DELETE", `/api/tasks/${task.id}?scope=one&occurrence=${skipped}`, null, me.token);
+        assert.equal(r.status, 200);
+        assert.deepEqual(r.data.task.repeat_skip, [skipped]);
+        assert.equal((await call("DELETE", `/api/tasks/${task.id}?scope=one&occurrence=${daysFromToday(9)}`, null, me.token)).data.field, "occurrence");
+
+        const next = (await finish(task)).data.nextTask;
+        assert.equal(await dueOf(next.id), daysFromToday(15));
+        assert.equal(next.repeat_left, 1);
+        assert.deepEqual(next.repeat_skip, []);
+    });
+
+    test("'this and following' on a coming repeat ends the task before it", async () => {
+        const task = (await weekly()).data;
+        let r = await call("DELETE", `/api/tasks/${task.id}?scope=following&occurrence=${daysFromToday(22)}`, null, me.token);
+        assert.equal(r.data.task.repeat_left, 2);
+        assert.equal(r.data.task.repeat, "weekly");
+        r = await call("DELETE", `/api/tasks/${task.id}?scope=following&occurrence=${daysFromToday(8)}`, null, me.token);
+        assert.equal(r.data.task.repeat, null, "nothing left: it doesn't repeat any more");
+        assert.ok(await dueOf(task.id), "the task itself stays");
+    });
+
+    test("deleting a real one: only this hands over, following and all take the row along", async () => {
+        const first = (await call("POST", "/api/tasks", { name: "Kette", prio: 50, due: daysFromToday(-14), description: "", repeat: "weekly" }, me.token)).data;
+        const second = (await finish(first)).data.nextTask;
+        const third = (await finish(second)).data.nextTask;
+
+        // only this one: the open one goes, its next one takes over
+        let r = await call("DELETE", `/api/tasks/${third.id}?scope=one`, null, me.token);
+        assert.deepEqual(r.data.deletedIds, [third.id]);
+        const fourth = r.data.nextTask;
+        assert.ok(fourth && !fourth.done);
+        assert.equal(await dueOf(fourth.id), daysFromToday(14), "second today, third in a week, so the fourth in two");
+
+        // this and the following: from the second on, the first stays
+        r = await call("DELETE", `/api/tasks/${second.id}?scope=following`, null, me.token);
+        assert.deepEqual(r.data.deletedIds, [second.id], "the fourth no longer hangs on the deleted third");
+        assert.ok(await dueOf(first.id));
+
+        // all of them
+        const a = (await call("POST", "/api/tasks", { name: "Alle", prio: 50, due: daysFromToday(-7), description: "", repeat: "weekly" }, me.token)).data;
+        const b = (await finish(a)).data.nextTask;
+        const c = (await finish(b)).data.nextTask;
+        r = await call("DELETE", `/api/tasks/${b.id}?scope=all`, null, me.token);
+        assert.deepEqual(r.data.deletedIds.sort((x, y) => x - y), [a.id, b.id, c.id]);
+        assert.equal((await call("DELETE", `/api/tasks/${a.id}?scope=sometimes`, null, me.token)).data?.field, "scope");
+    });
+
+    test("without a scope only this one goes, like before", async () => {
+        const task = (await weekly()).data;
+        const r = await call("DELETE", `/api/tasks/${task.id}`, null, me.token);
+        assert.deepEqual(r.data.deletedIds, [task.id]);
+        assert.equal(r.data.nextTask, undefined);
+    });
+});
+
+describe("keywords of event types", () => {
+    let me;
+    before(async () => { me = await member("keyworder"); });
+
+    test("are stored trimmed and without doubles, and can be changed", async () => {
+        const type = (await call("POST", "/api/event-types", { name: "Arbeit", keywords: [" Arbeit ", "arbeit", "Schicht", ""] }, me.token)).data;
+        assert.deepEqual(type.keywords, ["Arbeit", "Schicht"]);
+        const changed = (await call("PUT", `/api/event-types/${type.id}`, { keywords: ["Job"] }, me.token)).data;
+        assert.deepEqual(changed.keywords, ["Job"]);
+        assert.deepEqual((await call("GET", "/api/event-types", null, me.token)).data[0].keywords, ["Job"]);
+        assert.equal((await call("PUT", `/api/event-types/${type.id}`, { keywords: "Job" }, me.token)).data.field, "keywords");
+        assert.equal((await call("POST", "/api/event-types", { name: "Viel", keywords: Array.from({ length: 21 }, (_, i) => `w${i}`) }, me.token)).data.field, "keywords");
+        const plain = (await call("POST", "/api/event-types", { name: "Sport" }, me.token)).data;
+        assert.deepEqual(plain.keywords, []);
+    });
+});
+
+describe("events in a shared session", () => {
+    let ann, bob, sessionId;
+    before(async () => {
+        ann = await member("sesevann");
+        bob = await member("sesevbob");
+        await befriend(ann, bob, "sesevbob");
+        sessionId = (await call("POST", "/api/shared-sessions", { name: "Termine", friendIds: [bob.id] }, ann.token)).data.id;
+        await call("POST", `/api/shared-sessions/${sessionId}/join`, null, bob.token);
+    });
+    const tasksPath = () => `/api/shared-sessions/${sessionId}/tasks`;
+    const find = (session, name) => session.tasks.find(task => task.name === name);
+
+    test("an event needs a day; tasks stay tasks by default", async () => {
+        assert.equal((await call("POST", tasksPath(), { name: "Ohne Tag", kind: "event" }, ann.token)).data.field, "due");
+        assert.equal((await call("POST", tasksPath(), { name: "Falsch", kind: "meeting" }, ann.token)).data.field, "kind");
+        assert.equal(find((await call("POST", tasksPath(), { name: "Aufgabe" }, ann.token)).data, "Aufgabe").kind, "task");
+    });
+
+    test("is done once it is over, never by hand; moving it opens it again", async () => {
+        const past = find((await call("POST", tasksPath(), { name: "Vorbei", kind: "event", due: daysFromToday(-1), due_time: "10:00", duration_minutes: 60 }, ann.token)).data, "Vorbei");
+        assert.equal(past.kind, "event");
+        assert.equal(past.done, true);
+        const coming = find((await call("POST", tasksPath(), { name: "Bald", kind: "event", due: daysFromToday(2) }, ann.token)).data, "Bald");
+        assert.equal(coming.done, false);
+        assert.equal((await call("PATCH", `${tasksPath()}/${coming.id}`, { done: true }, bob.token)).data.code, "EVENT_NOT_DONE_BY_HAND");
+        const moved = find((await call("PATCH", `${tasksPath()}/${past.id}`, { due: daysFromToday(3) }, bob.token)).data, "Vorbei");
+        assert.equal(moved.done, false);
+        assert.equal((await call("PATCH", `${tasksPath()}/${coming.id}`, { due: null }, bob.token)).data.field, "due");
+    });
+
+    test("one of my own events comes along as an event, with its type's colour", async () => {
+        const type = (await call("POST", "/api/event-types", { name: "Vorlesung", color: "violet" }, ann.token)).data;
+        const own = (await call("POST", "/api/tasks", { name: "Mathe", prio: 50, due: daysFromToday(4), description: "", kind: "event", event_type_id: type.id }, ann.token)).data;
+        const shared = find((await call("POST", tasksPath(), { taskId: own.id }, ann.token)).data, "Mathe");
+        assert.equal(shared.kind, "event");
+        assert.equal(shared.color, "violet");
+    });
+
+    test("nobody works on an event, and it stays out of the list to work on", async () => {
+        const event = find((await call("POST", tasksPath(), { name: "Treffen", kind: "event", due: daysFromToday(5) }, ann.token)).data, "Treffen");
+        assert.equal((await call("POST", `/api/shared-sessions/${sessionId}/activity`, { currentTaskId: event.id }, bob.token)).data.code, "EVENT_NOT_WORKED");
+        const mine = (await call("GET", "/api/shared-sessions/my-tasks", null, bob.token)).data.find(s => s.id === sessionId);
+        assert.ok(mine.tasks.length > 0);
+        assert.ok(!mine.tasks.some(task => task.name === "Treffen"));
+    });
+
+    test("family calendars don't take a kind", async () => {
+        assert.equal((await sql("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_name = 'family_tasks' AND column_name = 'kind'"))[0].n, 0);
     });
 });
 

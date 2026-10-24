@@ -180,7 +180,9 @@ CREATE TABLE public.event_types (
     color text,
     "position" integer DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    keywords text[] DEFAULT '{}'::text[] NOT NULL,
     CONSTRAINT event_types_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
+    CONSTRAINT event_types_keywords_check CHECK ((cardinality(keywords) <= 20)),
     CONSTRAINT event_types_name_check CHECK (((char_length(name) >= 1) AND (char_length(name) <= 40)))
 );
 
@@ -608,9 +610,12 @@ CREATE TABLE public.shared_session_tasks (
     link text,
     details text,
     color text,
+    kind text DEFAULT 'task'::text NOT NULL,
     CONSTRAINT shared_session_tasks_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
     CONSTRAINT shared_session_tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
     CONSTRAINT shared_session_tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080)))),
+    CONSTRAINT shared_session_tasks_event_needs_due_check CHECK (((kind <> 'event'::text) OR (due IS NOT NULL))),
+    CONSTRAINT shared_session_tasks_kind_check CHECK ((kind = ANY (ARRAY['task'::text, 'event'::text]))),
     CONSTRAINT shared_session_tasks_name_check CHECK (((length(name) >= 1) AND (length(name) <= 200)))
 );
 
@@ -744,6 +749,8 @@ CREATE TABLE public.tasks (
     reminder_mailed_at timestamp with time zone,
     kind text DEFAULT 'task'::text NOT NULL,
     event_type_id integer,
+    repeat_left integer,
+    repeat_skip date[] DEFAULT '{}'::date[] NOT NULL,
     CONSTRAINT tasks_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
     CONSTRAINT tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
     CONSTRAINT tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080)))),
@@ -751,6 +758,7 @@ CREATE TABLE public.tasks (
     CONSTRAINT tasks_kind_check CHECK ((kind = ANY (ARRAY['task'::text, 'event'::text]))),
     CONSTRAINT tasks_reminder_minutes_check CHECK (((reminder_minutes IS NULL) OR ((reminder_minutes >= 0) AND (reminder_minutes <= 10080)))),
     CONSTRAINT tasks_repeat_check CHECK (((repeat IS NULL) OR (repeat = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text, 'yearly'::text])))),
+    CONSTRAINT tasks_repeat_left_check CHECK (((repeat_left IS NULL) OR ((repeat_left >= 0) AND (repeat_left <= 1000)))),
     CONSTRAINT tasks_repeat_needs_due_check CHECK (((repeat IS NULL) OR (due IS NOT NULL)))
 );
 
@@ -1285,6 +1293,12 @@ CREATE INDEX shared_session_events_session_idx ON public.shared_session_events U
 --
 
 CREATE INDEX shared_session_members_user_idx ON public.shared_session_members USING btree (user_id, status);
+
+--
+-- Name: shared_session_tasks_open_events_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX shared_session_tasks_open_events_idx ON public.shared_session_tasks USING btree (due) WHERE ((kind = 'event'::text) AND (NOT done));
 
 --
 -- Name: shared_session_tasks_session_idx; Type: INDEX; Schema: public; Owner: -
