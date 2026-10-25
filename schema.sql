@@ -859,6 +859,23 @@ CREATE SEQUENCE public.tasks_id_seq
 ALTER SEQUENCE public.tasks_id_seq OWNED BY public.tasks.id;
 
 --
+-- Name: tester_feedback; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tester_feedback (
+    user_id integer NOT NULL,
+    topic text NOT NULL,
+    rating smallint,
+    comment text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT tester_feedback_comment_check CHECK (((comment IS NULL) OR (char_length(comment) <= 2000))),
+    CONSTRAINT tester_feedback_rating_check CHECK (((rating IS NULL) OR ((rating >= 1) AND (rating <= 5)))),
+    CONSTRAINT tester_feedback_something_check CHECK (((rating IS NOT NULL) OR (comment IS NOT NULL))),
+    CONSTRAINT tester_feedback_topic_check CHECK ((topic ~ '^[a-z0-9]+:[a-z0-9-]{1,48}$'::text))
+);
+
+--
 -- Name: users; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1264,6 +1281,13 @@ ALTER TABLE ONLY public.tasks
     ADD CONSTRAINT tasks_pkey PRIMARY KEY (id);
 
 --
+-- Name: tester_feedback tester_feedback_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tester_feedback
+    ADD CONSTRAINT tester_feedback_pkey PRIMARY KEY (user_id, topic);
+
+--
 -- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1517,6 +1541,12 @@ CREATE INDEX tasks_user_events_idx ON public.tasks USING btree (user_id, due) WH
 --
 
 CREATE INDEX tasks_user_idx ON public.tasks USING btree (user_id);
+
+--
+-- Name: tester_feedback_topic_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tester_feedback_topic_idx ON public.tester_feedback USING btree (topic);
 
 --
 -- Name: users_email_lower_unique; Type: INDEX; Schema: public; Owner: -
@@ -1941,6 +1971,13 @@ ALTER TABLE ONLY public.tasks
 
 ALTER TABLE ONLY public.tasks
     ADD CONSTRAINT tasks_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+--
+-- Name: tester_feedback tester_feedback_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tester_feedback
+    ADD CONSTRAINT tester_feedback_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
 -- PostgreSQL database dump complete

@@ -1042,6 +1042,57 @@ describe("testers", () => {
         assert.equal((await call("GET", "/api/tester/anything", null, rita.token)).status, 404);
         assert.equal((await call("GET", "/api/tester/anything", null, boss.token)).status, 404);
     });
+
+    test("testers rate and comment on what they test; admins see it together", async () => {
+        const boss = await member("fbboss", { admin: true });
+        const tina = await member("fbtina", { pro: false });
+        const timo = await member("fbtimo", { pro: false });
+        const paul = await member("fbpaul");
+        await sql("UPDATE users SET is_tester = true WHERE username IN ('fbtina', 'fbtimo')");
+        const F = "/api/tester/feedback";
+
+        assert.equal((await call("GET", F, null, paul.token)).data.code, "TESTER_REQUIRED");
+        assert.deepEqual((await call("GET", F, null, tina.token)).data, []);
+
+        const saved = (await call("PUT", `${F}/ui:schulheft`, { rating: 4, comment: "  Ruhig und klar.  " }, tina.token)).data;
+        assert.equal(saved.rating, 4);
+        assert.equal(saved.comment, "Ruhig und klar.", "trimmed");
+        // only the fields sent change
+        const rated = (await call("PUT", `${F}/ui:schulheft`, { rating: 5 }, tina.token)).data;
+        assert.equal(rated.comment, "Ruhig und klar.");
+        assert.equal(rated.rating, 5);
+        await call("PUT", `${F}/feature:family`, { comment: "Toll für die WG" }, tina.token);
+        await call("PUT", `${F}/ui:schulheft`, { rating: 2 }, timo.token);
+        await call("PUT", `${F}/ui:tafel`, { rating: 3 }, timo.token);
+        assert.deepEqual((await call("GET", F, null, tina.token)).data.map(f => f.topic), ["feature:family", "ui:schulheft"]);
+
+        // checks
+        assert.equal((await call("PUT", `${F}/Not a topic`, { rating: 3 }, tina.token)).data.code, "INVALID_TOPIC");
+        assert.equal((await call("PUT", `${F}/ui:x`, { rating: 6 }, tina.token)).data.code, "INVALID_RATING");
+        assert.equal((await call("PUT", `${F}/ui:x`, { rating: 2.5 }, tina.token)).data.code, "INVALID_RATING");
+        assert.equal((await call("PUT", `${F}/ui:x`, { comment: "x".repeat(2001) }, tina.token)).data.code, "INVALID_COMMENT");
+        assert.equal((await call("PUT", `${F}/ui:x`, {}, tina.token)).data.code, "EMPTY_FEEDBACK");
+
+        // both emptied: the entry is gone
+        await call("PUT", `${F}/feature:family`, { comment: "   " }, tina.token);
+        assert.deepEqual((await call("GET", F, null, tina.token)).data.map(f => f.topic), ["ui:schulheft"]);
+
+        assert.equal((await call("GET", "/api/admin/tester-feedback", null, tina.token)).status, 403);
+        const all = (await call("GET", "/api/admin/tester-feedback", null, boss.token)).data;
+        const schulheft = all.topics.find(topic => topic.topic === "ui:schulheft");
+        assert.equal(schulheft.ratings, 2);
+        assert.equal(schulheft.average, 3.5);
+        assert.deepEqual(schulheft.spread, [0, 1, 0, 0, 1]);
+        assert.equal(schulheft.entries.find(e => e.user.username === "fbtina").comment, "Ruhig und klar.");
+        assert.ok(all.testers >= 2);
+
+        assert.equal((await call("DELETE", `${F}/ui:tafel`, null, timo.token)).status, 200);
+        assert.deepEqual((await call("GET", F, null, timo.token)).data.map(f => f.topic), ["ui:schulheft"]);
+
+        // gone with the account
+        assert.equal((await call("DELETE", "/api/users", { password: PW }, timo.token)).status, 200);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tester_feedback WHERE user_id = $1", [timo.id]))[0].n, 0);
+    });
 });
 
 describe("owners", () => {

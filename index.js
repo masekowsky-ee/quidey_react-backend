@@ -2434,6 +2434,130 @@ app.delete("/api/notes/:id", async (req, res) => {
     }
 })
 
+// ---------- Tester feedback ----------
+// What testers think of what they test (the app's Tester page): per topic stars 1-5 and/or a
+// comment, changed as often as they like. Topics: 'ui:<variant>' (interface variants) and
+// 'feature:<name>'; the list of what is tested lives in the app, so a new topic needs no
+// change here. Admins read everything together under /api/admin/tester-feedback.
+const TESTER_TOPIC = /^[a-z0-9]+:[a-z0-9-]{1,48}$/;
+const TESTER_COMMENT_MAX = 2000;
+
+const testerFeedbackJson = (row) => ({
+    topic: row.topic,
+    rating: row.rating,
+    comment: row.comment,
+    updatedAt: row.updated_at,
+});
+
+app.get("/api/tester/feedback", async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT topic, rating, comment, updated_at FROM tester_feedback WHERE user_id = $1 ORDER BY topic",
+            [req.user.userId]
+        );
+        res.json(result.rows.map(testerFeedbackJson));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// { rating?: 1-5 | null, comment?: string | null }: only the fields sent change. Both empty
+// in the end removes the entry.
+app.put("/api/tester/feedback/:topic", async (req, res) => {
+    const topic = req.params.topic;
+    if (!TESTER_TOPIC.test(topic)) return res.status(400).json({ error: "Invalid topic", code: "INVALID_TOPIC" });
+    const body = req.body ?? {};
+    const hasRating = Object.hasOwn(body, "rating");
+    const hasComment = Object.hasOwn(body, "comment");
+    if (!hasRating && !hasComment) return res.status(400).json({ error: "Nothing to save", code: "EMPTY_FEEDBACK" });
+    if (hasRating && body.rating !== null && !(Number.isInteger(body.rating) && body.rating >= 1 && body.rating <= 5)) {
+        return res.status(400).json({ error: "Rating must be 1-5", code: "INVALID_RATING" });
+    }
+    if (hasComment && body.comment !== null && typeof body.comment !== "string") {
+        return res.status(400).json({ error: "Invalid comment", code: "INVALID_COMMENT" });
+    }
+    const comment = hasComment && body.comment !== null ? body.comment.trim() || null : null;
+    if (comment && comment.length > TESTER_COMMENT_MAX) {
+        return res.status(400).json({ error: `Comment must be at most ${TESTER_COMMENT_MAX} characters`, code: "INVALID_COMMENT" });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const before = (await client.query(
+            "SELECT rating, comment FROM tester_feedback WHERE user_id = $1 AND topic = $2 FOR UPDATE",
+            [req.user.userId, topic]
+        )).rows[0];
+        const rating = hasRating ? body.rating : before?.rating ?? null;
+        const nextComment = hasComment ? comment : before?.comment ?? null;
+        let saved = null;
+        if (rating === null && nextComment === null) {
+            await client.query("DELETE FROM tester_feedback WHERE user_id = $1 AND topic = $2", [req.user.userId, topic]);
+        } else {
+            saved = (await client.query(
+                `INSERT INTO tester_feedback (user_id, topic, rating, comment) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (user_id, topic) DO UPDATE SET rating = $3, comment = $4, updated_at = now()
+                 RETURNING topic, rating, comment, updated_at`,
+                [req.user.userId, topic, rating, nextComment]
+            )).rows[0];
+        }
+        await client.query("COMMIT");
+        res.json(saved ? testerFeedbackJson(saved) : { topic, rating: null, comment: null, updatedAt: null });
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        serverError(res, err);
+    } finally {
+        client.release();
+    }
+});
+
+app.delete("/api/tester/feedback/:topic", async (req, res) => {
+    if (!TESTER_TOPIC.test(req.params.topic)) return res.status(400).json({ error: "Invalid topic", code: "INVALID_TOPIC" });
+    try {
+        await pool.query("DELETE FROM tester_feedback WHERE user_id = $1 AND topic = $2", [req.user.userId, req.params.topic]);
+        res.json({ deleted: true });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Everything testers said, per topic: how many rated, the average, how the stars spread, and
+// the comments (newest first) with who wrote them.
+app.get("/api/admin/tester-feedback", async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT f.topic, f.rating, f.comment, f.updated_at, u.id AS user_id, u.username, u.display_name
+             FROM tester_feedback f JOIN users u ON u.id = f.user_id
+             ORDER BY f.topic, f.updated_at DESC`
+        );
+        const topics = new Map();
+        for (const row of result.rows) {
+            if (!topics.has(row.topic)) {
+                topics.set(row.topic, { topic: row.topic, ratings: 0, average: null, spread: [0, 0, 0, 0, 0], entries: [] });
+            }
+            const topic = topics.get(row.topic);
+            if (row.rating !== null) {
+                topic.ratings += 1;
+                topic.spread[row.rating - 1] += 1;
+            }
+            topic.entries.push({
+                user: { id: row.user_id, username: row.username, displayName: row.display_name },
+                rating: row.rating,
+                comment: row.comment,
+                updatedAt: row.updated_at,
+            });
+        }
+        for (const topic of topics.values()) {
+            const sum = topic.spread.reduce((total, count, i) => total + count * (i + 1), 0);
+            topic.average = topic.ratings ? Math.round((sum / topic.ratings) * 100) / 100 : null;
+        }
+        const testers = new Set(result.rows.map(row => row.user_id)).size;
+        res.json({ testers, topics: [...topics.values()] });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
 // ---------- Friends ----------
 // Only public profile fields ever leave the server: never email or birth date.
 // Errors carry a `code` so the frontend can show a translated message.
