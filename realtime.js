@@ -21,6 +21,9 @@
 //   family:changed    { familyId }            a family I'm in or invited to changed (members,
 //                                             name, calendar entries), or it was deleted
 //   family:message    { familyId, message }   a new message in a family's chat (testers only)
+//   feed:changed      {}                      an entry in my feed came, changed or went (mine
+//                                             or a friend's), or somebody cheered mine on
+//   feed:cheered      { user, entryId }       a friend cheered one of my feed entries on
 // The *:changed events carry no data on purpose: the app loads what it shows again, so nothing
 // can get out of step, and the server only does that work when something actually changed.
 // From the browser:

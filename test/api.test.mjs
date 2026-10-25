@@ -1084,6 +1084,8 @@ describe("profiles and statistics", () => {
 
     test("I set up my profile; wrong values are refused", async () => {
         const pam = await member("profpam");
+        // teal and aurora come with levels 4 and 8 (utils/progress.js)
+        await sql("UPDATE users SET level = 10 WHERE id = $1", [pam.id]);
         const saved = await call("PUT", "/api/profile", {
             bio: "  Ich lerne gern früh.  ", status: "Mathe-Klausur am Freitag", study: "Informatik, 3. Semester",
             interests: ["Mathe", "mathe", " Physik ", ""], color: "teal", banner: "aurora", emoji: "📚", showStats: true,
@@ -1125,6 +1127,7 @@ describe("profiles and statistics", () => {
         await befriend(pia, quinn, "profquinn");
         await befriend(pia, viktor, "profviktor");
         await befriend(quinn, viktor, "profviktor");
+        await sql("UPDATE users SET level = 10 WHERE id = $1", [pia.id]);
         await call("PUT", "/api/profile", { bio: "Hallo!", status: "Lernt Bio", emoji: "🦊", color: "violet", banner: "dots" }, pia.token);
 
         const stranger = await call("GET", "/api/profiles/PROFPIA", null, rex.token);
@@ -1396,5 +1399,196 @@ describe("deleting an account", () => {
         assert.equal((await call("GET", "/api/users", null, gone.token)).status, 401, "the old login stops working");
         assert.equal((await call("GET", "/api/messages", null, friend.token)).data.length, 0, "the friend's side is gone too");
         assert.equal((await register("goner", "goner@example.com")).status, 201, "name and address are free again");
+    });
+});
+
+describe("progress: XP, levels and challenges", () => {
+    let pia, tom;
+    before(async () => {
+        pia = await member("pia");
+        tom = await member("tom");
+    });
+
+    test("a new account starts at level 1 with three daily and two weekly challenges, none needing friends", async () => {
+        const r = await call("GET", "/api/progress", null, pia.token);
+        assert.equal(r.status, 200);
+        assert.equal(r.data.level, 1);
+        assert.equal(r.data.xp, 0);
+        assert.equal(r.data.nextLevelXp, 150);
+        assert.equal(r.data.daily.length, 3);
+        assert.equal(r.data.weekly.length, 2);
+        const social = ["together20", "cheer2", "togetherWeek", "cheer10"];
+        assert.ok([...r.data.daily, ...r.data.weekly].every(c => !social.includes(c.id)), "nobody to cheer on or work with yet");
+        assert.ok(r.data.daily.every(c => c.value === 0 && !c.done));
+    });
+
+    test("focus minutes and tasks give XP; the daily focus challenge completes once and is posted", async () => {
+        await befriend(pia, tom, "tom");
+        // 100 minutes: more than any daily focus goal (the first slot is always one)
+        assert.equal((await call("POST", "/api/sessions", { totalTime: 100 * 60, workedTasks: [] }, pia.token)).status, 201);
+        const task = (await call("POST", "/api/tasks", { name: "Lesen", prio: 1, due: daysFromToday(0), description: "" }, pia.token)).data;
+        await call("PUT", `/api/tasks/${task.id}`, { ...task, done: true }, pia.token);
+
+        const r = (await call("GET", "/api/progress", null, pia.token)).data;
+        const focus = r.daily[0];
+        assert.match(focus.id, /^focus/);
+        assert.ok(focus.done);
+        assert.equal(focus.value, focus.goal, "progress stops at the goal");
+        assert.equal(r.sources.focus, 100);
+        assert.equal(r.sources.tasks, 5);
+        assert.ok(r.sources.challenges >= focus.xp);
+        assert.equal(r.xp, r.sources.focus + r.sources.tasks + r.sources.challenges);
+
+        const again = (await call("GET", "/api/progress", null, pia.token)).data;
+        assert.equal(again.sources.challenges, r.sources.challenges, "completed once per period");
+        const [{ n }] = await sql("SELECT count(*)::int AS n FROM challenge_completions WHERE user_id = $1 AND challenge = $2", [pia.id, focus.id]);
+        assert.equal(n, 1);
+
+        // the friend sees the day and the challenge in the feed
+        const feed = (await call("GET", "/api/feed", null, tom.token)).data;
+        const kinds = feed.entries.filter(e => e.user.id === pia.id).map(e => e.kind);
+        assert.ok(kinds.includes("day"));
+        assert.ok(kinds.includes("challenge"));
+        const day = feed.entries.find(e => e.kind === "day");
+        assert.equal(day.data.focusMs, 100 * 60 * 1000);
+        assert.equal(day.data.tasksDone, 1);
+    });
+
+    test("reaching a level is stored and announced once", async () => {
+        await sql("INSERT INTO challenge_completions (user_id, challenge, period, xp) VALUES ($1, 'week5h', '2026-01-05', 5000)", [pia.id]);
+        const r = (await call("GET", "/api/progress", null, pia.token)).data;
+        assert.ok(r.level >= 9, `level ${r.level}`);
+        assert.ok(r.xp >= r.levelStartXp && r.xp < r.nextLevelXp);
+        await call("GET", "/api/progress", null, pia.token);
+        const levels = await sql("SELECT data FROM feed_events WHERE user_id = $1 AND kind = 'level'", [pia.id]);
+        assert.equal(levels.length, 1);
+        assert.equal(levels[0].data.level, r.level);
+        assert.equal((await sql("SELECT level FROM users WHERE id = $1", [pia.id]))[0].level, r.level);
+    });
+
+    test("profile choices above my level are refused; what I already have stays allowed", async () => {
+        const locked = await call("PUT", "/api/profile", { banner: "sky" }, tom.token);
+        assert.equal(locked.status, 403);
+        assert.equal(locked.data.code, "LEVEL_LOCKED");
+        assert.equal(locked.data.level, 24);
+        assert.equal((await call("PUT", "/api/profile", { banner: "dots", color: "red" }, tom.token)).status, 200);
+        assert.equal((await call("PUT", "/api/profile", { frame: "ring" }, tom.token)).data.code, "LEVEL_LOCKED");
+
+        await sql("UPDATE users SET banner = 'sky' WHERE id = $1", [tom.id]);
+        assert.equal((await call("PUT", "/api/profile", { banner: "sky", status: "Lernen" }, tom.token)).status, 200, "kept from before");
+
+        // pia is past level 8: aurora and titles are hers
+        const ok = await call("PUT", "/api/profile", { banner: "aurora", title: "planner" }, pia.token);
+        assert.equal(ok.status, 200, JSON.stringify(ok.data));
+        assert.equal(ok.data.banner, "aurora");
+        assert.equal(ok.data.title, "planner");
+        assert.equal((await call("PUT", "/api/profile", { title: "mentor" }, pia.token)).data.code, "LEVEL_LOCKED");
+        assert.equal((await call("PUT", "/api/profile", { frame: "spiral" }, pia.token)).status, 400);
+        assert.equal((await call("PUT", "/api/profile", { showcase: ["firstSession", "firstSession"] }, pia.token)).status, 400);
+    });
+
+    test("this week among friends: me and friends who show their numbers, most XP first", async () => {
+        const r = (await call("GET", "/api/progress/friends", null, tom.token)).data;
+        assert.deepEqual(r.ranking.map(row => row.user.username), ["pia", "tom"]);
+        assert.ok(r.ranking[0].weekXp > 0);
+        assert.equal(r.ranking[1].me, true);
+        await sql("UPDATE users SET show_stats = false WHERE id = $1", [pia.id]);
+        assert.deepEqual((await call("GET", "/api/progress/friends", null, tom.token)).data.ranking.map(row => row.user.username), ["tom"]);
+        await sql("UPDATE users SET show_stats = true WHERE id = $1", [pia.id]);
+    });
+});
+
+describe("the owner's level", () => {
+    test("the owner (admin for good) is always on the top level, with everything unlocked", async () => {
+        const boss = await member("bossowner");
+        // only a database superuser can set it (the tests connect as one)
+        await sql("UPDATE users SET is_owner = true WHERE id = $1", [boss.id]);
+        const r = (await call("GET", "/api/progress", null, boss.token)).data;
+        assert.equal(r.level, r.maxLevel);
+        assert.equal(r.level, 50);
+        assert.equal(r.nextLevelXp, null);
+        assert.ok(r.xp >= r.levelStartXp);
+        assert.equal((await sql("SELECT level FROM users WHERE id = $1", [boss.id]))[0].level, 50);
+        const saved = await call("PUT", "/api/profile", { frame: "orbit", banner: "sky", title: "mentor" }, boss.token);
+        assert.equal(saved.status, 200, JSON.stringify(saved.data));
+        assert.equal(saved.data.level, 50);
+    });
+
+    test("everybody else stops at the top level too", async () => {
+        const grinder = await member("grinder");
+        await sql("INSERT INTO challenge_completions (user_id, challenge, period, xp) SELECT $1, 'week8h', d, 10000 FROM generate_series('2025-01-06'::date, '2025-04-07'::date, '7 days') AS d", [grinder.id]);
+        const r = (await call("GET", "/api/progress", null, grinder.token)).data;
+        assert.equal(r.level, 50);
+        assert.equal(r.nextLevelXp, null);
+    });
+});
+
+describe("feed", () => {
+    let lea, max, eve;
+    before(async () => {
+        lea = await member("lea");
+        max = await member("max");
+        eve = await member("eve");
+        await befriend(lea, max, "max");
+    });
+
+    test("posts reach friends only", async () => {
+        assert.equal((await call("POST", "/api/feed/posts", { text: "   " }, lea.token)).status, 400);
+        assert.equal((await call("POST", "/api/feed/posts", { text: "x".repeat(281) }, lea.token)).status, 400);
+        const post = await call("POST", "/api/feed/posts", { text: "Klausur geschafft" }, lea.token);
+        assert.equal(post.status, 201);
+        assert.equal(post.data.mine, true);
+        assert.equal(post.data.data.text, "Klausur geschafft");
+        assert.ok((await call("GET", "/api/feed", null, max.token)).data.entries.some(e => e.id === post.data.id));
+        assert.ok(!(await call("GET", "/api/feed", null, eve.token)).data.entries.some(e => e.id === post.data.id));
+        assert.equal((await call("PUT", `/api/feed/${post.data.id}/cheer`, null, eve.token)).status, 404, "a stranger can't reach it");
+    });
+
+    test("friends cheer once; I can't cheer myself; I see who cheered", async () => {
+        const [post] = (await call("GET", "/api/feed", null, lea.token)).data.entries;
+        assert.equal((await call("PUT", `/api/feed/${post.id}/cheer`, null, lea.token)).data.code, "OWN_FEED_ENTRY");
+        assert.deepEqual((await call("PUT", `/api/feed/${post.id}/cheer`, null, max.token)).data, { cheers: 1, cheered: true });
+        assert.deepEqual((await call("PUT", `/api/feed/${post.id}/cheer`, null, max.token)).data, { cheers: 1, cheered: true });
+        const mine = (await call("GET", "/api/feed", null, lea.token)).data.entries[0];
+        assert.equal(mine.cheers, 1);
+        assert.deepEqual(mine.cheerers.map(u => u.username), ["max"]);
+        assert.equal((await call("GET", "/api/feed", null, max.token)).data.entries[0].cheerers, undefined);
+        assert.deepEqual((await call("DELETE", `/api/feed/${post.id}/cheer`, null, max.token)).data, { cheers: 0, cheered: false });
+    });
+
+    test("pages go on from the cursor", async () => {
+        for (let i = 0; i < 31; i++) await sql("INSERT INTO feed_events (user_id, kind, data) VALUES ($1, 'post', $2)", [max.id, { text: `Nr. ${i}` }]);
+        const first = (await call("GET", "/api/feed", null, lea.token)).data;
+        assert.equal(first.entries.length, 30);
+        assert.ok(first.next);
+        const second = (await call("GET", `/api/feed?before=${encodeURIComponent(first.next)}`, null, lea.token)).data;
+        assert.equal(second.entries.length, 2);
+        assert.equal(second.next, null);
+        assert.equal(new Set([...first.entries, ...second.entries].map(e => e.id)).size, 32);
+        assert.equal((await call("GET", "/api/feed?before=nonsense", null, lea.token)).status, 400);
+    });
+
+    test("only my own entries can be removed; today's focus entry stays out", async () => {
+        const [post] = (await call("GET", "/api/feed", null, max.token)).data.entries;
+        assert.equal((await call("DELETE", `/api/feed/${post.id}`, null, lea.token)).status, 404);
+        assert.equal((await call("DELETE", `/api/feed/${post.id}`, null, max.token)).status, 204);
+
+        await call("POST", "/api/sessions", { totalTime: 20 * 60, workedTasks: [] }, lea.token);
+        await call("GET", "/api/progress", null, lea.token);
+        const day = (await call("GET", "/api/feed", null, lea.token)).data.entries.find(e => e.kind === "day");
+        assert.ok(day);
+        assert.equal((await call("DELETE", `/api/feed/${day.id}`, null, lea.token)).status, 204);
+        await call("POST", "/api/sessions", { totalTime: 15 * 60, workedTasks: [] }, lea.token);
+        await call("GET", "/api/progress", null, lea.token);
+        assert.ok(!(await call("GET", "/api/feed", null, max.token)).data.entries.some(e => e.kind === "day" && e.user.id === lea.id));
+    });
+
+    test("with sharing off, friends see my posts but nothing automatic", async () => {
+        assert.equal((await call("PUT", "/api/profile", { shareActivity: false }, max.token)).data.shareActivity, false);
+        await call("POST", "/api/sessions", { totalTime: 30 * 60, workedTasks: [] }, max.token);
+        await call("GET", "/api/progress", null, max.token);
+        const seen = (await call("GET", "/api/feed", null, lea.token)).data.entries.filter(e => e.user.id === max.id);
+        assert.ok(seen.every(e => e.kind === "post"));
+        assert.equal((await call("PUT", "/api/profile", { shareActivity: "no" }, max.token)).status, 400);
     });
 });

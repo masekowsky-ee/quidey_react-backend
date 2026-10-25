@@ -12,6 +12,8 @@ const { startReminderMails } = require("./utils/reminderMails");
 const http = require("node:http");
 const realtime = require("./realtime");
 const { hasAppAccess, hasTesterAccess, APP_ACCESS_SQL, TESTER_ACCESS_SQL } = require("./utils/access");
+const progress = require("./utils/progress");
+const { PROFILE_COLORS, PROFILE_BANNERS, PROFILE_EMOJIS, AVATAR_FRAMES, PROFILE_TITLES, SHOWCASE_MAX, BADGES } = progress;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -217,6 +219,8 @@ app.use("/api/profiles", authenticateToken);
 app.use("/api/profile", authenticateToken);
 app.use("/api/event-types", authenticateToken);
 app.use("/api/stats", authenticateToken);
+app.use("/api/feed", authenticateToken);
+app.use("/api/progress", authenticateToken);
 
 // Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
 // Checked against the account on every request (not stored in the token; see loadAccount), so
@@ -230,7 +234,7 @@ function requirePro(req, res, next) {
 }
 
 app.use(
-    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats"],
+    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress"],
     requirePro
 );
 
@@ -1084,6 +1088,9 @@ app.post("/api/sessions", async (req, res) => {
             [sessionId]
         );
         res.status(201).json(toSessionResponse(result.rows[0]));
+        // challenges, level and today's feed entry, after the answer (the app loads its
+        // progress itself; this keeps the friends' feeds current)
+        progress.evaluateProgress(pool, userId, announceFeed).catch(err => console.error(err));
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
@@ -2452,7 +2459,7 @@ app.get("/api/friends", async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT users.id, users.username, users.display_name, friendships.responded_at AS since,
-                users.avatar_emoji, users.profile_color, users.status_text
+                users.avatar_emoji, users.profile_color, users.status_text, users.level
             FROM friendships
             JOIN users ON users.id = CASE WHEN friendships.requester_id = $1
                 THEN friendships.addressee_id ELSE friendships.requester_id END
@@ -2464,7 +2471,7 @@ app.get("/api/friends", async (req, res) => {
         // friends also see each other's avatar and status (see /api/profiles)
         res.json(result.rows.map(row => ({
             ...publicUser(row), since: row.since,
-            emoji: row.avatar_emoji, color: row.profile_color, status: row.status_text,
+            emoji: row.avatar_emoji, color: row.profile_color, status: row.status_text, level: row.level,
         })));
     } catch (err) {
         serverError(res, err);
@@ -2634,14 +2641,8 @@ app.delete("/api/friends/:userId", async (req, res) => {
 // profile (bio, status, colour, banner, ...), our mutual friends and, unless I switched it off
 // (show_stats), my focus statistics. Email, birth date and timezone never leave the server.
 
-// The same lists as in the frontend (src/features/profile/profileOptions.js)
-const PROFILE_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
-const PROFILE_BANNERS = ["gradient", "aurora", "dots", "stripes", "grid", "glow"];
-const PROFILE_EMOJIS = [
-    "📚", "✏️", "🎧", "☕", "🌱", "🔥", "⭐", "🚀", "🧠", "🎯",
-    "🌙", "☀️", "🐱", "🐶", "🦊", "🐼", "🐸", "🦉", "🌸", "🍀",
-    "🎨", "🎸", "⚽", "💻", "🧪", "📐", "🌍", "🎮", "🍕", "🦄",
-];
+// The lists of choices (and the level each needs) are in utils/progress.js, the same as in the
+// frontend (src/features/profile/profileOptions.js, src/features/progress/progress.js)
 const BIO_MAX = 280;
 const STATUS_MAX = 80;
 const STUDY_MAX = 60;
@@ -2774,6 +2775,7 @@ async function loadProfile(where, value, viewerId) {
     const result = await pool.query(
         `SELECT users.id, users.username, users.display_name, users.created_at, users.bio, users.status_text,
             users.study, users.interests, users.profile_color, users.banner, users.avatar_emoji, users.show_stats,
+            users.level, users.avatar_frame, users.profile_title, users.showcase_badges, users.share_activity,
             friendships.id AS friendship_id, friendships.status AS friendship_status,
             friendships.requester_id, friendships.responded_at
         FROM users
@@ -2824,8 +2826,14 @@ async function loadProfile(where, value, viewerId) {
         color: row.profile_color,
         banner: row.banner,
         emoji: row.avatar_emoji,
-        // only I see the switch itself; friends see `stats: null` when it is off
-        ...(relation === "self" ? { showStats: row.show_stats } : {}),
+        // the highest level reached, and what it unlocked
+        level: row.level,
+        frame: row.avatar_frame,
+        title: row.profile_title,
+        // pinned badges only while they are earned (the numbers can go down again)
+        showcase: stats ? row.showcase_badges.filter(id => BADGES[id]?.(stats)) : row.showcase_badges,
+        // only I see the switches themselves; friends see `stats: null` when it is off
+        ...(relation === "self" ? { showStats: row.show_stats, shareActivity: row.share_activity } : {}),
         stats,
         ...(mutual ? {
             mutualFriends: mutual.rows.map(m => ({ ...publicUser(m), emoji: m.avatar_emoji, color: m.profile_color })),
@@ -2857,7 +2865,9 @@ app.get("/api/profile", async (req, res) => {
 });
 
 // Set up my profile. Every field is optional, only the ones sent change; empty text or null clears:
-// { bio, status, study, interests: [...], color, banner, emoji, showStats }. Answers with my profile.
+// { bio, status, study, interests: [...], color, banner, emoji, frame, title, showcase: [...],
+// showStats, shareActivity }. Choices above my level: 403 LEVEL_LOCKED { field, level }.
+// Answers with my profile.
 app.put("/api/profile", async (req, res) => {
     const body = req.body ?? {};
     const columns = {};
@@ -2884,20 +2894,61 @@ app.put("/api/profile", async (req, res) => {
         columns.interests = interests;
     }
 
-    const choices = { color: ["profile_color", PROFILE_COLORS], banner: ["banner", PROFILE_BANNERS], emoji: ["avatar_emoji", PROFILE_EMOJIS] };
+    // choices from a list, some of them unlocked by level (utils/progress.js)
+    const choices = {
+        color: ["profile_color", PROFILE_COLORS], banner: ["banner", PROFILE_BANNERS], emoji: ["avatar_emoji", PROFILE_EMOJIS],
+        frame: ["avatar_frame", AVATAR_FRAMES], title: ["profile_title", PROFILE_TITLES],
+    };
+    const gated = {};
     for (const [field, [column, allowed]] of Object.entries(choices)) {
         if (!(field in body)) continue;
         const value = body[field] ?? null;
         if (value !== null && !allowed.includes(value)) return invalidInput(res, field);
         columns[column] = value;
+        gated[field] = { column, value };
     }
 
-    if ("showStats" in body) {
-        if (typeof body.showStats !== "boolean") return invalidInput(res, "showStats");
-        columns.show_stats = body.showStats;
+    // up to three earned badges, pinned to the profile in this order
+    if ("showcase" in body) {
+        const list = body.showcase ?? [];
+        if (!Array.isArray(list) || list.length > SHOWCASE_MAX || new Set(list).size !== list.length
+            || list.some(id => typeof id !== "string" || !BADGES[id])) return invalidInput(res, "showcase");
+        columns.showcase_badges = list;
+        gated.showcase = { column: "showcase_badges", value: list };
+    }
+
+    for (const [field, column] of [["showStats", "show_stats"], ["shareActivity", "share_activity"]]) {
+        if (!(field in body)) continue;
+        if (typeof body[field] !== "boolean") return invalidInput(res, field);
+        columns[column] = body[field];
     }
 
     try {
+        // a choice my level hasn't unlocked yet is refused, unless it is what I already have
+        if (Object.keys(gated).length > 0) {
+            const current = (await pool.query(
+                "SELECT profile_color, banner, avatar_emoji, avatar_frame, profile_title, showcase_badges FROM users WHERE id = $1",
+                [req.user.userId]
+            )).rows[0];
+            const changed = Object.entries(gated)
+                .filter(([, { column, value }]) => JSON.stringify(current[column] ?? null) !== JSON.stringify(value));
+            if (changed.length > 0) {
+                const level = await progress.unlockLevel(pool, req.user.userId);
+                for (const [field, { value }] of changed) {
+                    const needed = progress.requiredLevel(field, value);
+                    if (needed > level) {
+                        return res.status(403).json({ error: `Unlocked at level ${needed}`, code: "LEVEL_LOCKED", field, level: needed });
+                    }
+                }
+                if (changed.some(([field]) => field === "showcase") && gated.showcase.value.length > 0) {
+                    const earned = progress.earnedBadges(await loadStats(req.user.userId));
+                    if (gated.showcase.value.some(id => !earned.includes(id))) {
+                        return res.status(403).json({ error: "Badge not earned yet", code: "BADGE_NOT_EARNED", field: "showcase" });
+                    }
+                }
+            }
+        }
+
         const names = Object.keys(columns);
         if (names.length > 0) {
             // the column names come from the lists above, never from the request
@@ -3821,6 +3872,13 @@ app.post("/api/shared-sessions/:id/activity", async (req, res) => {
                 DO UPDATE SET time_ms = shared_session_time.time_ms + EXCLUDED.time_ms, updated_at = now()`,
                 [bookTaskId, userId, bookedMs]
             );
+            // ...and per day in my time zone, for XP and the challenges (utils/progress.js)
+            await pool.query(
+                `INSERT INTO shared_time_days (user_id, day, time_ms)
+                SELECT id, (now() AT TIME ZONE COALESCE(timezone, 'Europe/Berlin'))::date, $2 FROM users WHERE id = $1
+                ON CONFLICT (user_id, day) DO UPDATE SET time_ms = shared_time_days.time_ms + EXCLUDED.time_ms`,
+                [userId, bookedMs]
+            );
         }
         // the old values, to tell whether I just started on something
         const previous = await pool.query(
@@ -4662,6 +4720,199 @@ app.get("/api/stats", async (req, res) => {
         serverError(res, err);
     }
 });
+
+// ---------- Progress: XP, levels, challenges ----------
+// Worked out from the numbers on every look (utils/progress.js); reaching a challenge or a level
+// is written once and posted to the feed of my friends (unless I switched sharing off).
+
+// My friends and I load the feed again (sent when an entry of mine came or changed)
+async function announceFeed(userId) {
+    try {
+        const result = await pool.query(friendIdsOf("$1::int"), [userId]);
+        realtime.toUser(userId, "feed:changed", {});
+        for (const row of result.rows) realtime.toUser(Object.values(row)[0], "feed:changed", {});
+    } catch (err) {
+        console.error(err);
+    }
+}
+
+// My level, XP and today's and this week's challenges (completing what is reached)
+app.get("/api/progress", async (req, res) => {
+    try {
+        res.json(await progress.evaluateProgress(pool, req.user.userId, announceFeed));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// This week among friends: XP since Monday of me and the friends who show their statistics,
+// most first
+app.get("/api/progress/friends", async (req, res) => {
+    const me = req.user.userId;
+    try {
+        const people = await pool.query(
+            `SELECT id, username, display_name, avatar_emoji, profile_color, level,
+                to_char(date_trunc('week', now() AT TIME ZONE COALESCE((SELECT timezone FROM users WHERE id = $1), 'Europe/Berlin')), 'YYYY-MM-DD') AS monday
+            FROM users WHERE id = $1 OR (show_stats AND id IN (${friendIdsOf("$1::int")}))`,
+            [me]
+        );
+        const monday = people.rows.find(row => row.id === me)?.monday ?? null;
+        const xp = await progress.loadXp(pool, people.rows.map(row => row.id), monday);
+        const ranking = people.rows
+            .map(row => ({
+                user: { ...publicUser(row), emoji: row.avatar_emoji, color: row.profile_color, level: row.level },
+                weekXp: xp[row.id]?.xp ?? 0,
+                me: row.id === me,
+            }))
+            .sort((a, b) => b.weekXp - a.weekXp || a.user.username.localeCompare(b.user.username));
+        res.json({ weekStart: monday, ranking });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- Feed ----------
+// What my friends and I did: a day's focus, challenges, levels, streaks, and short posts. Only
+// friends see it; automatic entries only while their owner shares them (share_activity).
+// Anybody can cheer a friend's entry on, once.
+
+const FEED_PAGE = 30;
+const FEED_POST_MAX = 280;
+
+const feedPostLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_FEED_POST", 20),
+    skip: (req) => req.method === "OPTIONS",
+    keyGenerator: (req) => `user:${req.user.userId}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many posts, please slow down", code: "RATE_LIMITED" },
+});
+
+// Feed entries `me` may see, newest (last changed) first. One entry by id, or a page before a cursor.
+async function loadFeed(me, { id = null, before = null, limit = FEED_PAGE } = {}) {
+    const result = await pool.query(
+        `SELECT e.id, e.kind, to_char(e.day, 'YYYY-MM-DD') AS day, e.data, e.created_at, e.updated_at,
+            to_char(e.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_at, e.user_id,
+            u.username, u.display_name, u.avatar_emoji, u.profile_color, u.level, u.avatar_frame,
+            (SELECT count(*)::int FROM feed_cheers WHERE event_id = e.id) AS cheers,
+            EXISTS (SELECT 1 FROM feed_cheers WHERE event_id = e.id AND user_id = $1) AS cheered,
+            -- who cheered: only on my own entries (they are all my friends)
+            CASE WHEN e.user_id = $1 THEN (
+                SELECT COALESCE(json_agg(json_build_object('id', cu.id, 'username', cu.username, 'displayName', cu.display_name)), '[]')
+                FROM (SELECT user_id FROM feed_cheers WHERE event_id = e.id ORDER BY created_at DESC LIMIT 3) AS c
+                JOIN users AS cu ON cu.id = c.user_id) END AS cheerers
+        FROM feed_events AS e JOIN users AS u ON u.id = e.user_id
+        WHERE (e.user_id = $1 OR e.user_id IN (${friendIdsOf("$1::int")}))
+            AND NOT (e.data ? 'hidden')
+            AND (e.kind = 'post' OR e.user_id = $1 OR u.share_activity)
+            AND ($2::int IS NULL OR e.id = $2)
+            AND ($3::timestamptz IS NULL OR (e.updated_at, e.id) < ($3::timestamptz, $4::int))
+        ORDER BY e.updated_at DESC, e.id DESC
+        LIMIT $5`,
+        [me, id, before?.at ?? null, before?.id ?? null, limit + 1]
+    );
+    const rows = result.rows.slice(0, limit);
+    return {
+        entries: rows.map(row => ({
+            id: row.id,
+            kind: row.kind,
+            day: row.day,
+            data: row.data,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+            user: {
+                ...publicUser({ id: row.user_id, username: row.username, display_name: row.display_name }),
+                emoji: row.avatar_emoji, color: row.profile_color, level: row.level, frame: row.avatar_frame,
+            },
+            mine: row.user_id === me,
+            cheers: row.cheers,
+            cheered: row.cheered,
+            ...(row.cheerers ? { cheerers: row.cheerers } : {}),
+        })),
+        next: result.rows.length > limit ? `${rows.at(-1).cursor_at}|${rows.at(-1).id}` : null,
+    };
+}
+
+// A page of the feed: ?before=<next of the page before>
+app.get("/api/feed", async (req, res) => {
+    let before = null;
+    if (req.query.before !== undefined) {
+        const [at, id] = String(req.query.before).split("|");
+        if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(at ?? "") || !idParam(id)) return invalidInput(res, "before");
+        before = { at, id: idParam(id) };
+    }
+    try {
+        res.json(await loadFeed(req.user.userId, { before }));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// A short post for my friends: { text } (up to 280 characters)
+app.post("/api/feed/posts", feedPostLimiter, async (req, res) => {
+    const text = cleanText(req.body?.text, FEED_POST_MAX);
+    if (!text) return invalidInput(res, "text");
+    try {
+        const result = await pool.query(
+            "INSERT INTO feed_events (user_id, kind, data) VALUES ($1, 'post', $2) RETURNING id",
+            [req.user.userId, { text }]
+        );
+        const { entries } = await loadFeed(req.user.userId, { id: result.rows[0].id });
+        announceFeed(req.user.userId);
+        res.status(201).json(entries[0]);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Take one of my entries out of the feed. Today's focus entry stays out even as the day goes on.
+app.delete("/api/feed/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return fail(res, 404, "FEED_ENTRY_NOT_FOUND", "Feed entry not found");
+    try {
+        const hidden = await pool.query(
+            `UPDATE feed_events SET data = data || '{"hidden": true}' WHERE id = $1 AND user_id = $2 AND kind = 'day' RETURNING id`,
+            [id, req.user.userId]
+        );
+        const deleted = hidden.rowCount > 0 ? hidden
+            : await pool.query("DELETE FROM feed_events WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
+        if (deleted.rowCount === 0) return fail(res, 404, "FEED_ENTRY_NOT_FOUND", "Feed entry not found");
+        announceFeed(req.user.userId);
+        res.status(204).end();
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Cheer a friend's entry on (PUT) or take it back (DELETE); answers { cheers, cheered }
+async function setCheer(req, res, on) {
+    const me = req.user.userId;
+    const id = idParam(req.params.id);
+    if (!id) return fail(res, 404, "FEED_ENTRY_NOT_FOUND", "Feed entry not found");
+    try {
+        const { entries } = await loadFeed(me, { id });
+        const entry = entries[0];
+        if (!entry) return fail(res, 404, "FEED_ENTRY_NOT_FOUND", "Feed entry not found");
+        if (entry.mine) return fail(res, 400, "OWN_FEED_ENTRY", "You can't cheer on your own entry");
+        const changed = on
+            ? await pool.query("INSERT INTO feed_cheers (event_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", [id, me])
+            : await pool.query("DELETE FROM feed_cheers WHERE event_id = $1 AND user_id = $2", [id, me]);
+        if (changed.rowCount > 0) {
+            realtime.toUser(entry.user.id, "feed:changed", {});
+            if (on) {
+                const who = await pool.query("SELECT id, username, display_name FROM users WHERE id = $1", [me]);
+                realtime.toUser(entry.user.id, "feed:cheered", { user: publicUser(who.rows[0]), entryId: id });
+            }
+        }
+        const count = await pool.query("SELECT count(*)::int AS n FROM feed_cheers WHERE event_id = $1", [id]);
+        res.json({ cheers: count.rows[0].n, cheered: on });
+    } catch (err) {
+        serverError(res, err);
+    }
+}
+app.put("/api/feed/:id/cheer", (req, res) => setCheer(req, res, true));
+app.delete("/api/feed/:id/cheer", (req, res) => setCheer(req, res, false));
 
 // Unknown routes, and errors no route handled (e.g. invalid JSON): short JSON answers,
 // never Express's HTML page with a stack trace

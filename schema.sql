@@ -140,6 +140,20 @@ CREATE SEQUENCE public.broadcasts_id_seq
 ALTER SEQUENCE public.broadcasts_id_seq OWNED BY public.broadcasts.id;
 
 --
+-- Name: challenge_completions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.challenge_completions (
+    user_id integer NOT NULL,
+    challenge text NOT NULL,
+    period date NOT NULL,
+    xp integer NOT NULL,
+    completed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT challenge_completions_challenge_check CHECK ((length(challenge) <= 40)),
+    CONSTRAINT challenge_completions_xp_check CHECK (((xp > 0) AND (xp <= 10000)))
+);
+
+--
 -- Name: email_verification_tokens; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -321,6 +335,50 @@ CREATE SEQUENCE public.family_tasks_id_seq
 --
 
 ALTER SEQUENCE public.family_tasks_id_seq OWNED BY public.family_tasks.id;
+
+--
+-- Name: feed_cheers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.feed_cheers (
+    event_id integer NOT NULL,
+    user_id integer NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+--
+-- Name: feed_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.feed_events (
+    id integer NOT NULL,
+    user_id integer NOT NULL,
+    kind text NOT NULL,
+    day date,
+    data jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT feed_events_day_needs_day_check CHECK (((kind <> ALL (ARRAY['day'::text, 'streak'::text])) OR (day IS NOT NULL))),
+    CONSTRAINT feed_events_kind_check CHECK ((kind = ANY (ARRAY['day'::text, 'challenge'::text, 'level'::text, 'streak'::text, 'post'::text])))
+);
+
+--
+-- Name: feed_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.feed_events_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: feed_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.feed_events_id_seq OWNED BY public.feed_events.id;
 
 --
 -- Name: friendships; Type: TABLE; Schema: public; Owner: -
@@ -681,6 +739,17 @@ CREATE SEQUENCE public.shared_sessions_id_seq
 ALTER SEQUENCE public.shared_sessions_id_seq OWNED BY public.shared_sessions.id;
 
 --
+-- Name: shared_time_days; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.shared_time_days (
+    user_id integer NOT NULL,
+    day date NOT NULL,
+    time_ms bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT shared_time_days_time_ms_check CHECK ((time_ms >= 0))
+);
+
+--
 -- Name: task_groups; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -810,12 +879,21 @@ CREATE TABLE public.users (
     banner text,
     avatar_emoji text,
     show_stats boolean DEFAULT true NOT NULL,
+    level integer DEFAULT 1 NOT NULL,
+    avatar_frame text,
+    profile_title text,
+    showcase_badges text[] DEFAULT '{}'::text[] NOT NULL,
+    share_activity boolean DEFAULT true NOT NULL,
     CONSTRAINT users_avatar_emoji_check CHECK (((avatar_emoji IS NULL) OR (length(avatar_emoji) <= 16))),
-    CONSTRAINT users_banner_check CHECK (((banner IS NULL) OR (banner = ANY (ARRAY['gradient'::text, 'aurora'::text, 'dots'::text, 'stripes'::text, 'grid'::text, 'glow'::text])))),
+    CONSTRAINT users_avatar_frame_check CHECK (((avatar_frame IS NULL) OR (avatar_frame = ANY (ARRAY['ring'::text, 'double'::text, 'dotted'::text, 'orbit'::text])))),
+    CONSTRAINT users_banner_check CHECK (((banner IS NULL) OR (banner = ANY (ARRAY['gradient'::text, 'aurora'::text, 'dots'::text, 'stripes'::text, 'grid'::text, 'glow'::text, 'rings'::text, 'topo'::text, 'sky'::text])))),
     CONSTRAINT users_bio_check CHECK (((bio IS NULL) OR (length(bio) <= 280))),
     CONSTRAINT users_interests_check CHECK ((cardinality(interests) <= 6)),
     CONSTRAINT users_language_check CHECK (((language IS NULL) OR (language = ANY (ARRAY['de'::text, 'en'::text])))),
+    CONSTRAINT users_level_check CHECK (((level >= 1) AND (level <= 1000))),
     CONSTRAINT users_profile_color_check CHECK (((profile_color IS NULL) OR (profile_color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
+    CONSTRAINT users_profile_title_check CHECK (((profile_title IS NULL) OR (length(profile_title) <= 24))),
+    CONSTRAINT users_showcase_badges_check CHECK ((cardinality(showcase_badges) <= 3)),
     CONSTRAINT users_status_text_check CHECK (((status_text IS NULL) OR (length(status_text) <= 80))),
     CONSTRAINT users_study_check CHECK (((study IS NULL) OR (length(study) <= 60)))
 );
@@ -879,6 +957,12 @@ ALTER TABLE ONLY public.family_messages ALTER COLUMN id SET DEFAULT nextval('pub
 --
 
 ALTER TABLE ONLY public.family_tasks ALTER COLUMN id SET DEFAULT nextval('public.family_tasks_id_seq'::regclass);
+
+--
+-- Name: feed_events id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.feed_events ALTER COLUMN id SET DEFAULT nextval('public.feed_events_id_seq'::regclass);
 
 --
 -- Name: friendships id; Type: DEFAULT; Schema: public; Owner: -
@@ -974,6 +1058,13 @@ ALTER TABLE ONLY public.broadcasts
     ADD CONSTRAINT broadcasts_pkey PRIMARY KEY (id);
 
 --
+-- Name: challenge_completions challenge_completions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.challenge_completions
+    ADD CONSTRAINT challenge_completions_pkey PRIMARY KEY (user_id, challenge, period);
+
+--
 -- Name: email_verification_tokens email_verification_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1021,6 +1112,20 @@ ALTER TABLE ONLY public.family_messages
 
 ALTER TABLE ONLY public.family_tasks
     ADD CONSTRAINT family_tasks_pkey PRIMARY KEY (id);
+
+--
+-- Name: feed_cheers feed_cheers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.feed_cheers
+    ADD CONSTRAINT feed_cheers_pkey PRIMARY KEY (event_id, user_id);
+
+--
+-- Name: feed_events feed_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.feed_events
+    ADD CONSTRAINT feed_events_pkey PRIMARY KEY (id);
 
 --
 -- Name: friendships friendships_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -1114,6 +1219,13 @@ ALTER TABLE ONLY public.shared_sessions
     ADD CONSTRAINT shared_sessions_pkey PRIMARY KEY (id);
 
 --
+-- Name: shared_time_days shared_time_days_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_time_days
+    ADD CONSTRAINT shared_time_days_pkey PRIMARY KEY (user_id, day);
+
+--
 -- Name: task_groups task_groups_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1203,6 +1315,24 @@ CREATE INDEX family_messages_family_idx ON public.family_messages USING btree (f
 --
 
 CREATE INDEX family_tasks_family_idx ON public.family_tasks USING btree (family_id);
+
+--
+-- Name: feed_cheers_user_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX feed_cheers_user_created ON public.feed_cheers USING btree (user_id, created_at);
+
+--
+-- Name: feed_events_one_per_day; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX feed_events_one_per_day ON public.feed_events USING btree (user_id, kind, day) WHERE (kind = ANY (ARRAY['day'::text, 'streak'::text]));
+
+--
+-- Name: feed_events_user_updated; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX feed_events_user_updated ON public.feed_events USING btree (user_id, updated_at DESC);
 
 --
 -- Name: friendships_addressee_status_idx; Type: INDEX; Schema: public; Owner: -
@@ -1419,6 +1549,13 @@ ALTER TABLE ONLY public.broadcasts
     ADD CONSTRAINT broadcasts_admin_id_fkey FOREIGN KEY (admin_id) REFERENCES public.users(id) ON DELETE SET NULL;
 
 --
+-- Name: challenge_completions challenge_completions_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.challenge_completions
+    ADD CONSTRAINT challenge_completions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
 -- Name: email_verification_tokens email_verification_tokens_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1487,6 +1624,27 @@ ALTER TABLE ONLY public.family_tasks
 
 ALTER TABLE ONLY public.family_tasks
     ADD CONSTRAINT family_tasks_family_id_fkey FOREIGN KEY (family_id) REFERENCES public.families(id) ON DELETE CASCADE;
+
+--
+-- Name: feed_cheers feed_cheers_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.feed_cheers
+    ADD CONSTRAINT feed_cheers_event_id_fkey FOREIGN KEY (event_id) REFERENCES public.feed_events(id) ON DELETE CASCADE;
+
+--
+-- Name: feed_cheers feed_cheers_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.feed_cheers
+    ADD CONSTRAINT feed_cheers_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: feed_events feed_events_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.feed_events
+    ADD CONSTRAINT feed_events_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
 -- Name: friendships friendships_addressee_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -1690,6 +1848,13 @@ ALTER TABLE ONLY public.shared_session_time
 
 ALTER TABLE ONLY public.shared_sessions
     ADD CONSTRAINT shared_sessions_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: shared_time_days shared_time_days_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_time_days
+    ADD CONSTRAINT shared_time_days_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
 -- Name: task_groups task_groups_group_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
