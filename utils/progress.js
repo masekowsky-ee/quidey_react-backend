@@ -306,6 +306,51 @@ function streakToday(focusDays, today) {
     return streak;
 }
 
+// The longest run of days in a row, from the days with focus, newest first
+function longestStreak(focusDays) {
+    const DAY = 24 * 60 * 60 * 1000;
+    let best = 0;
+    let run = 0;
+    let previous = null;
+    for (const day of focusDays) {
+        const time = Date.parse(`${day}T00:00:00Z`);
+        if (previous !== null && previous - time === 0) continue;
+        run = previous !== null && previous - time === DAY ? run + 1 : 1;
+        best = Math.max(best, run);
+        previous = time;
+    }
+    return best;
+}
+
+// The last `count` days up to today, oldest first: [{ day, active }] (active: some focus)
+function recentDays(focusDays, today, count = 7) {
+    const active = new Set(focusDays);
+    const end = Date.parse(`${today}T00:00:00Z`);
+    return Array.from({ length: count }, (_, i) => {
+        const day = new Date(end - (count - 1 - i) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        return { day, active: active.has(day) };
+    });
+}
+
+// The current streak of several people (days with focus in a row up to today, or up to
+// yesterday while today has none yet), each in their own time zone: { [id]: days }
+async function loadStreaks(pool, userIds) {
+    if (userIds.length === 0) return {};
+    const result = await pool.query(
+        `WITH people AS (SELECT id, COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = ANY($1::int[])),
+        b AS (SELECT id, tz, (now() AT TIME ZONE tz)::date AS today FROM people)
+        SELECT b.id, to_char(b.today, 'YYYY-MM-DD') AS today,
+            (SELECT COALESCE(json_agg(to_char(d, 'YYYY-MM-DD') ORDER BY d DESC), '[]')
+                FROM (SELECT ((s.date AT TIME ZONE current_setting('TimeZone')) AT TIME ZONE b.tz)::date AS d
+                        FROM sessions AS s WHERE s.user_id = b.id AND s.time_ms > 0 AND s.date >= b.today - 400
+                    UNION SELECT day FROM shared_time_days WHERE user_id = b.id AND time_ms > 0 AND day >= b.today - 400) AS days) AS focus_days
+        FROM b`,
+        [userIds]
+    );
+    return Object.fromEntries(result.rows.map(row => [row.id,
+        streakToday(row.focus_days, row.today) || streakToday(row.focus_days, dayBefore(row.today))]));
+}
+
 // ---------- the evaluation ----------
 // Looks at my numbers: completes challenges that are reached, raises my level, keeps today's
 // feed entry current and posts milestones. Safe to run at the same time twice: everything that
@@ -410,6 +455,13 @@ async function evaluateProgress(pool, userId, announce = () => {}) {
         daily: dailyOut,
         weekly: weeklyOut,
         streak: streakToday(week.focus_days, week.today) || streakToday(week.focus_days, dayBefore(week.today)),
+        // whether today already counts for the streak, the best one of the last year, the
+        // last seven days (for the dots) and today's focus so far
+        streakToday: streakToday(week.focus_days, week.today) > 0,
+        bestStreak: longestStreak(week.focus_days),
+        recentDays: recentDays(week.focus_days, week.today),
+        todayFocusMin: Math.floor(today.focusMs / 60000),
+        streakMilestones: STREAK_MILESTONES,
         shareActivity: share,
     };
 }
@@ -432,6 +484,6 @@ module.exports = {
     MAX_LEVEL, levelForXp, levelStartXp, levelStepXp,
     PROFILE_COLORS, PROFILE_BANNERS, PROFILE_EMOJIS, AVATAR_FRAMES, PROFILE_TITLES, SHOWCASE_MAX, BADGES,
     requiredLevel, earnedBadges,
-    CHALLENGE_IDS, DAILY_SLOTS, WEEKLY_SLOTS, pick, measure, streakToday,
-    loadXp, unlockLevel, evaluateProgress,
+    CHALLENGE_IDS, DAILY_SLOTS, WEEKLY_SLOTS, pick, measure, streakToday, longestStreak, recentDays,
+    loadXp, loadStreaks, unlockLevel, evaluateProgress,
 };

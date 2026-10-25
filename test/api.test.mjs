@@ -93,7 +93,7 @@ before(async () => {
         cwd: ROOT,
         env: {
             ...process.env, DB_NAME: DB, PORT: String(port), SMTP_HOST: "", CONTACT_TO: "owner@example.com",
-            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200",
+            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", PRESENCE_GRACE_MS: "200",
         },
     });
     server.stdout.on("data", (chunk) => { log += chunk; });
@@ -1222,9 +1222,9 @@ describe("profiles and statistics", () => {
     });
 });
 
-describe("Quidey Family (testers only)", () => {
+describe("Quidey Family", () => {
     let mia, leo, ida, kai;
-    const F = "/api/tester/families";
+    const F = "/api/families";
     const sockets = [];
     const connect = (token) => new Promise((resolve, reject) => {
         const socket = io(API, { auth: { token }, transports: ["websocket"], reconnection: false, forceNew: true });
@@ -1247,15 +1247,17 @@ describe("Quidey Family (testers only)", () => {
         leo = await member("famleo");
         ida = await member("famida");
         kai = await member("famkai");
-        await sql("UPDATE users SET is_tester = true WHERE username IN ('fammia', 'famleo', 'famida')");
         await befriend(mia, leo, "famleo");
         await befriend(mia, ida, "famida");
     });
     after(() => { for (const socket of sockets) socket.disconnect(); });
 
-    test("only testers get in", async () => {
-        assert.equal((await call("GET", F, null, kai.token)).data.code, "TESTER_REQUIRED");
-        assert.equal((await call("POST", F, { name: "Nope" }, kai.token)).status, 403);
+    test("everybody with access to the app gets in, no tester needed", async () => {
+        assert.equal((await call("GET", F)).status, 401);
+        const outsider = await member("famout", { pro: false });
+        assert.equal((await call("GET", F, null, outsider.token)).data.code, "PRO_REQUIRED");
+        assert.equal((await call("POST", F, { name: "Nope" }, outsider.token)).status, 403);
+        assert.deepEqual((await call("GET", F, null, kai.token)).data, { families: [], invites: [] }, "pro without tester");
     });
 
     test("a family invites friends only; invites are joined or declined", async () => {
@@ -1298,7 +1300,7 @@ describe("Quidey Family (testers only)", () => {
         const undated = await call("PATCH", `${F}/${family.id}/tasks/${entry.id}`, { due: null }, mia.token);
         assert.equal(undated.data.tasks[0].due_time, null, "no day, no time");
         assert.equal((await call("PATCH", `${F}/${family.id}/tasks/${entry.id}`, {}, mia.token)).data.code, "NOTHING_TO_CHANGE");
-        assert.equal((await call("PATCH", `${F}/${family.id}/tasks/${entry.id}`, { done: true }, kai.token)).status, 403);
+        assert.equal((await call("PATCH", `${F}/${family.id}/tasks/${entry.id}`, { done: true }, kai.token)).status, 404, "not in it");
 
         const mine = (await call("POST", `${F}/${family.id}/tasks`, { name: "Einkaufen", due: day }, mia.token)).data.tasks.find(t => t.name === "Einkaufen");
         assert.equal((await call("DELETE", `${F}/${family.id}/tasks/${mine.id}`, null, leo.token)).data.code, "NOT_ALLOWED");
@@ -1349,7 +1351,6 @@ describe("Quidey Family (testers only)", () => {
 
     test("a deleted owner hands the family on and takes their messages along", async () => {
         const owner = await member("famowner");
-        await sql("UPDATE users SET is_tester = true WHERE username = 'famowner'");
         await befriend(owner, leo, "famleo");
         const family = (await call("POST", F, { name: "Erbe", friendIds: [leo.id] }, owner.token)).data;
         await call("POST", `${F}/${family.id}/join`, null, leo.token);
@@ -1590,5 +1591,193 @@ describe("feed", () => {
         const seen = (await call("GET", "/api/feed", null, lea.token)).data.entries.filter(e => e.user.id === max.id);
         assert.ok(seen.every(e => e.kind === "post"));
         assert.equal((await call("PUT", "/api/profile", { shareActivity: "no" }, max.token)).status, 400);
+    });
+});
+
+describe("online status", () => {
+    let ona, onb, onc;
+    const sockets = [];
+    const bobSockets = [];
+    const connectBob = async () => { const socket = await connect(onb.token); bobSockets.push(socket); return socket; };
+    const connect = (token) => new Promise((resolve, reject) => {
+        const socket = io(API, { auth: { token }, transports: ["websocket"], reconnection: false, forceNew: true });
+        sockets.push(socket);
+        socket.once("connect", () => resolve(socket));
+        socket.once("connect_error", (err) => reject(err));
+    });
+    // the next presence:changed about `userId`
+    const presence = (socket, userId, ms = 2000) => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { socket.off("presence:changed", handler); reject(new Error(`no presence of ${userId} within ${ms} ms`)); }, ms);
+        const handler = (payload) => {
+            if (payload.userId !== userId) return;
+            clearTimeout(timer);
+            socket.off("presence:changed", handler);
+            resolve(payload);
+        };
+        socket.on("presence:changed", handler);
+    });
+    const silentPresence = (socket, ms = 400) => new Promise((resolve, reject) => {
+        const handler = (payload) => reject(new Error(`unexpected presence ${JSON.stringify(payload)}`));
+        socket.on("presence:changed", handler);
+        setTimeout(() => { socket.off("presence:changed", handler); resolve(); }, ms);
+    });
+    const onlineFriend = async (token, id) => (await call("GET", "/api/friends", null, token)).data.find(f => f.id === id)?.online;
+
+    before(async () => {
+        ona = await member("onlineann");
+        onb = await member("onlinebob");
+        onc = await member("onlinecleo");
+        await befriend(ona, onb, "onlinebob");
+    });
+    after(() => { for (const socket of sockets) socket.disconnect(); });
+
+    test("friends see who has the app open, strangers are not told", async () => {
+        const annLive = await connect(ona.token);
+        const cleoLive = await connect(onc.token);
+        assert.equal(await onlineFriend(ona.token, onb.id), false);
+        const [came] = await Promise.all([presence(annLive, onb.id), silentPresence(cleoLive), connectBob()]);
+        assert.deepEqual(came, { userId: onb.id, online: true });
+        assert.equal(await onlineFriend(ona.token, onb.id), true);
+        assert.equal((await call("GET", "/api/profiles/onlinebob", null, ona.token)).data.online, true);
+        assert.equal((await call("GET", "/api/profiles/onlinebob", null, onc.token)).data.online, undefined, "not a friend");
+    });
+
+    test("a second tab changes nothing; closing the last one is told after a moment", async () => {
+        const annLive = await connect(ona.token);
+        await connectBob();
+        await silentPresence(annLive, 300);
+        const gone = presence(annLive, onb.id);
+        for (const socket of bobSockets.splice(0)) socket.disconnect();
+        assert.deepEqual(await gone, { userId: onb.id, online: false });
+        assert.equal(await onlineFriend(ona.token, onb.id), false);
+    });
+
+    test("whoever switches it off is never shown online", async () => {
+        const annLive = await connect(ona.token);
+        await Promise.all([presence(annLive, onb.id), connectBob()]);
+        const [hidden, saved] = await Promise.all([
+            presence(annLive, onb.id),
+            call("PUT", "/api/profile", { showOnline: false }, onb.token),
+        ]);
+        assert.equal(saved.data.showOnline, false);
+        assert.equal(hidden.online, false);
+        assert.equal(await onlineFriend(ona.token, onb.id), false);
+        assert.equal((await call("PUT", "/api/profile", { showOnline: "yes" }, onb.token)).status, 400);
+        const [shown] = await Promise.all([presence(annLive, onb.id), call("PUT", "/api/profile", { showOnline: true }, onb.token)]);
+        assert.equal(shown.online, true);
+    });
+
+    test("people in an open shared session see each other", async () => {
+        await befriend(ona, onc, "onlinecleo");
+        const session = (await call("POST", "/api/shared-sessions", { name: "Online", friendIds: [onb.id, onc.id] }, ona.token)).data;
+        await call("POST", `/api/shared-sessions/${session.id}/join`, null, onb.token);
+        await call("POST", `/api/shared-sessions/${session.id}/join`, null, onc.token);
+        const people = (await call("GET", `/api/shared-sessions/${session.id}`, null, onc.token)).data.people;
+        assert.equal(people.find(p => p.user.id === onb.id).online, true, "bob is no friend of cleo, but in the session");
+    });
+});
+
+describe("Quidey Family: board, looks, who does what, the week", () => {
+    let fia, fil, fim;
+    const F = "/api/families";
+    let family;
+
+    before(async () => {
+        fia = await member("famxfia");
+        fil = await member("famxfil");
+        fim = await member("famxfim");
+        await befriend(fia, fil, "famxfil");
+        family = (await call("POST", F, { name: "Haus", friendIds: [fil.id] }, fia.token)).data;
+        await call("POST", `${F}/${family.id}/join`, null, fil.token);
+    });
+
+    test("the owner picks emoji and colour; every member writes on the board", async () => {
+        assert.equal((await call("PATCH", `${F}/${family.id}`, { emoji: "🏡", color: "teal" }, fil.token)).data.code, "NOT_OWNER");
+        assert.equal((await call("PATCH", `${F}/${family.id}`, { emoji: "🐙" }, fia.token)).data.field, "emoji");
+        assert.equal((await call("PATCH", `${F}/${family.id}`, { color: "plaid" }, fia.token)).data.field, "color");
+        const looks = (await call("PATCH", `${F}/${family.id}`, { emoji: "🏡", color: "teal" }, fia.token)).data;
+        assert.equal(looks.emoji, "🏡");
+        assert.equal(looks.color, "teal");
+        assert.equal(looks.name, "Haus", "what isn't sent stays");
+        const listed = (await call("GET", F, null, fil.token)).data.families[0];
+        assert.deepEqual([listed.emoji, listed.color], ["🏡", "teal"]);
+
+        const noted = (await call("PATCH", `${F}/${family.id}`, { note: "  Müll raus am Dienstag  " }, fil.token)).data;
+        assert.equal(noted.note.text, "Müll raus am Dienstag");
+        assert.equal(noted.note.updatedBy.id, fil.id);
+        assert.equal((await call("PATCH", `${F}/${family.id}`, { note: "x".repeat(2001) }, fil.token)).data.field, "note");
+        assert.equal((await call("PATCH", `${F}/${family.id}`, { note: "" }, fia.token)).data.note, null);
+        assert.equal((await call("PATCH", `${F}/${family.id}`, {}, fia.token)).data.code, "NOTHING_TO_CHANGE");
+    });
+
+    test("entries go to a member; leaving takes it away again", async () => {
+        assert.equal((await call("POST", `${F}/${family.id}/tasks`, { name: "Einkaufen", assignee_id: fim.id }, fia.token)).data.field, "assignee_id", "not a member");
+        const added = (await call("POST", `${F}/${family.id}/tasks`, { name: "Einkaufen", assignee_id: fil.id }, fia.token)).data;
+        const entry = added.tasks.find(t => t.name === "Einkaufen");
+        assert.equal(entry.assignee.id, fil.id);
+        assert.equal(entry.due, null, "without a day: on the list");
+        const moved = (await call("PATCH", `${F}/${family.id}/tasks/${entry.id}`, { assignee_id: fia.id }, fil.token)).data;
+        assert.equal(moved.tasks.find(t => t.id === entry.id).assignee.id, fia.id);
+        await call("PATCH", `${F}/${family.id}/tasks/${entry.id}`, { assignee_id: fil.id }, fil.token);
+        await call("DELETE", `${F}/${family.id}/members/me`, null, fil.token);
+        const after = (await call("GET", `${F}/${family.id}`, null, fia.token)).data;
+        assert.equal(after.tasks.find(t => t.id === entry.id).assignee, null);
+    });
+
+    test("the week of the members who show their numbers", async () => {
+        await call("POST", `${F}/${family.id}/invites`, { userIds: [fil.id] }, fia.token);
+        await call("POST", `${F}/${family.id}/join`, null, fil.token);
+        await call("POST", "/api/sessions", { totalTime: 30 * 60, workedTasks: [] }, fil.token);
+        const week = (await call("GET", `${F}/${family.id}`, null, fia.token)).data.week;
+        const lil = week.people.find(p => p.userId === fil.id);
+        assert.equal(lil.focusMin, 30);
+        assert.equal(lil.streak, 1);
+        assert.ok(week.weekStart);
+        await sql("UPDATE users SET show_stats = false WHERE id = $1", [fil.id]);
+        const hidden = (await call("GET", `${F}/${family.id}`, null, fia.token)).data.week;
+        assert.deepEqual(hidden.people.map(p => p.userId), [fia.id], "only me");
+        assert.equal((await call("GET", `${F}/${family.id}`, null, fil.token)).data.week.people.some(p => p.userId === fil.id), true, "I always see mine");
+    });
+});
+
+describe("streaks", () => {
+    let sia, sib;
+    before(async () => {
+        sia = await member("streaksia");
+        sib = await member("streaksib");
+        await befriend(sia, sib, "streaksib");
+    });
+
+    test("progress tells whether today counts, the best streak and the last seven days", async () => {
+        const fresh = (await call("GET", "/api/progress", null, sia.token)).data;
+        assert.equal(fresh.streak, 0);
+        assert.equal(fresh.streakToday, false);
+        assert.equal(fresh.bestStreak, 0);
+        assert.equal(fresh.recentDays.length, 7);
+        assert.equal(fresh.recentDays.at(-1).day, fresh.today);
+        assert.ok(fresh.streakMilestones.includes(7));
+
+        // focus yesterday and the day before: the streak runs, today doesn't count yet
+        for (const days of [1, 2]) {
+            await sql("INSERT INTO sessions (user_id, date, time_ms) VALUES ($1, now() - make_interval(days => $2), 600000)", [sia.id, days]);
+        }
+        const before = (await call("GET", "/api/progress", null, sia.token)).data;
+        assert.equal(before.streak, 2);
+        assert.equal(before.streakToday, false);
+        assert.deepEqual(before.recentDays.slice(-3).map(d => d.active), [true, true, false]);
+
+        await call("POST", "/api/sessions", { totalTime: 25 * 60, workedTasks: [] }, sia.token);
+        const now = (await call("GET", "/api/progress", null, sia.token)).data;
+        assert.equal(now.streak, 3);
+        assert.equal(now.streakToday, true);
+        assert.equal(now.bestStreak, 3);
+        assert.equal(now.todayFocusMin, 25);
+    });
+
+    test("the ranking shows each friend's streak", async () => {
+        const ranking = (await call("GET", "/api/progress/friends", null, sib.token)).data.ranking;
+        assert.equal(ranking.find(r => r.user.id === sia.id).streak, 3);
+        assert.equal(ranking.find(r => r.user.id === sia.id).online, false);
+        assert.equal(ranking.find(r => r.me).online, undefined);
     });
 });

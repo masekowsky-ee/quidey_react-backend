@@ -227,7 +227,15 @@ CREATE TABLE public.families (
     name text NOT NULL,
     owner_id integer NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT families_name_check CHECK (((char_length(name) >= 1) AND (char_length(name) <= 60)))
+    note text,
+    note_updated_at timestamp with time zone,
+    note_updated_by integer,
+    emoji text,
+    color text,
+    CONSTRAINT families_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
+    CONSTRAINT families_emoji_check CHECK (((emoji IS NULL) OR (char_length(emoji) <= 16))),
+    CONSTRAINT families_name_check CHECK (((char_length(name) >= 1) AND (char_length(name) <= 60))),
+    CONSTRAINT families_note_check CHECK (((note IS NULL) OR (char_length(note) <= 2000)))
 );
 
 --
@@ -313,6 +321,7 @@ CREATE TABLE public.family_tasks (
     color text,
     added_by integer,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    assignee_id integer,
     CONSTRAINT family_tasks_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
     CONSTRAINT family_tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
     CONSTRAINT family_tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080))))
@@ -884,6 +893,7 @@ CREATE TABLE public.users (
     profile_title text,
     showcase_badges text[] DEFAULT '{}'::text[] NOT NULL,
     share_activity boolean DEFAULT true NOT NULL,
+    show_online boolean DEFAULT true NOT NULL,
     CONSTRAINT users_avatar_emoji_check CHECK (((avatar_emoji IS NULL) OR (length(avatar_emoji) <= 16))),
     CONSTRAINT users_avatar_frame_check CHECK (((avatar_frame IS NULL) OR (avatar_frame = ANY (ARRAY['ring'::text, 'double'::text, 'dotted'::text, 'orbit'::text])))),
     CONSTRAINT users_banner_check CHECK (((banner IS NULL) OR (banner = ANY (ARRAY['gradient'::text, 'aurora'::text, 'dots'::text, 'stripes'::text, 'grid'::text, 'glow'::text, 'rings'::text, 'topo'::text, 'sky'::text])))),
@@ -1311,6 +1321,12 @@ CREATE INDEX family_members_user_idx ON public.family_members USING btree (user_
 CREATE INDEX family_messages_family_idx ON public.family_messages USING btree (family_id, id);
 
 --
+-- Name: family_tasks_assignee_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX family_tasks_assignee_idx ON public.family_tasks USING btree (assignee_id) WHERE (assignee_id IS NOT NULL);
+
+--
 -- Name: family_tasks_family_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1570,6 +1586,13 @@ ALTER TABLE ONLY public.event_types
     ADD CONSTRAINT event_types_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
+-- Name: families families_note_updated_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.families
+    ADD CONSTRAINT families_note_updated_by_fkey FOREIGN KEY (note_updated_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+--
 -- Name: families families_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1617,6 +1640,13 @@ ALTER TABLE ONLY public.family_messages
 
 ALTER TABLE ONLY public.family_tasks
     ADD CONSTRAINT family_tasks_added_by_fkey FOREIGN KEY (added_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+--
+-- Name: family_tasks family_tasks_assignee_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_tasks
+    ADD CONSTRAINT family_tasks_assignee_id_fkey FOREIGN KEY (assignee_id) REFERENCES public.users(id) ON DELETE SET NULL;
 
 --
 -- Name: family_tasks family_tasks_family_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -

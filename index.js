@@ -11,7 +11,7 @@ const { sendVerificationMail, sendContactMail, sendFeedbackMail } = require("./u
 const { startReminderMails } = require("./utils/reminderMails");
 const http = require("node:http");
 const realtime = require("./realtime");
-const { hasAppAccess, hasTesterAccess, APP_ACCESS_SQL, TESTER_ACCESS_SQL } = require("./utils/access");
+const { hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
 const progress = require("./utils/progress");
 const { PROFILE_COLORS, PROFILE_BANNERS, PROFILE_EMOJIS, AVATAR_FRAMES, PROFILE_TITLES, SHOWCASE_MAX, BADGES } = progress;
 
@@ -221,6 +221,7 @@ app.use("/api/event-types", authenticateToken);
 app.use("/api/stats", authenticateToken);
 app.use("/api/feed", authenticateToken);
 app.use("/api/progress", authenticateToken);
+app.use("/api/families", authenticateToken);
 
 // Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
 // Checked against the account on every request (not stored in the token; see loadAccount), so
@@ -234,7 +235,7 @@ function requirePro(req, res, next) {
 }
 
 app.use(
-    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress"],
+    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families"],
     requirePro
 );
 
@@ -2453,13 +2454,48 @@ const friendRequestLimiter = rateLimit({
     message: { error: "Too many requests, please try again later", code: "RATE_LIMITED" },
 });
 
-// Accepted friends, sorted by name
+// ---------- online status ----------
+// Whether somebody has the app open right now (realtime.js counts the open connections). Their
+// friends and the people in their open shared sessions and families see it, unless they
+// switched it off (users.show_online). Nothing about it is stored.
+// `row`: a users row with id and show_online.
+const showsOnline = (row) => Boolean(row.show_online) && realtime.isOnline(row.id);
+
+// Everybody who may see my status: friends, people in my open shared sessions, my families
+async function presenceAudience(userId) {
+    const result = await pool.query(
+        `SELECT friend.id FROM (${friendIdsOf("$1::int")}) AS friend(id)
+        UNION SELECT other.user_id FROM shared_session_members AS mine
+            JOIN shared_sessions ON shared_sessions.id = mine.session_id AND shared_sessions.ended_at IS NULL
+            JOIN shared_session_members AS other ON other.session_id = mine.session_id AND other.status = 'joined'
+            WHERE mine.user_id = $1 AND mine.status = 'joined' AND other.user_id <> $1
+        UNION SELECT other.user_id FROM family_members AS mine
+            JOIN family_members AS other ON other.family_id = mine.family_id AND other.status = 'joined'
+            WHERE mine.user_id = $1 AND mine.status = 'joined' AND other.user_id <> $1`,
+        [userId]
+    );
+    return result.rows.map(row => row.id);
+}
+
+// Tells the people concerned who have the app open that I came online or went away
+async function announcePresence(userId, online) {
+    if (online) {
+        const me = await pool.query("SELECT show_online FROM users WHERE id = $1", [userId]);
+        if (!me.rows[0]?.show_online) return;
+    }
+    for (const id of await presenceAudience(userId)) {
+        if (realtime.isOnline(id)) realtime.toUser(id, "presence:changed", { userId, online });
+    }
+}
+realtime.onPresence(announcePresence);
+
+// Accepted friends, sorted by name; online: has the app open right now (see above)
 app.get("/api/friends", async (req, res) => {
     const userId = req.user.userId;
     try {
         const result = await pool.query(
             `SELECT users.id, users.username, users.display_name, friendships.responded_at AS since,
-                users.avatar_emoji, users.profile_color, users.status_text, users.level
+                users.avatar_emoji, users.profile_color, users.status_text, users.level, users.show_online
             FROM friendships
             JOIN users ON users.id = CASE WHEN friendships.requester_id = $1
                 THEN friendships.addressee_id ELSE friendships.requester_id END
@@ -2472,6 +2508,7 @@ app.get("/api/friends", async (req, res) => {
         res.json(result.rows.map(row => ({
             ...publicUser(row), since: row.since,
             emoji: row.avatar_emoji, color: row.profile_color, status: row.status_text, level: row.level,
+            online: showsOnline(row),
         })));
     } catch (err) {
         serverError(res, err);
@@ -2776,6 +2813,7 @@ async function loadProfile(where, value, viewerId) {
         `SELECT users.id, users.username, users.display_name, users.created_at, users.bio, users.status_text,
             users.study, users.interests, users.profile_color, users.banner, users.avatar_emoji, users.show_stats,
             users.level, users.avatar_frame, users.profile_title, users.showcase_badges, users.share_activity,
+            users.show_online,
             friendships.id AS friendship_id, friendships.status AS friendship_status,
             friendships.requester_id, friendships.responded_at
         FROM users
@@ -2818,7 +2856,7 @@ async function loadProfile(where, value, viewerId) {
     return {
         ...profile,
         memberSince: row.created_at,
-        ...(relation === "friend" ? { friendsSince: row.responded_at } : {}),
+        ...(relation === "friend" ? { friendsSince: row.responded_at, online: showsOnline(row) } : {}),
         bio: row.bio,
         status: row.status_text,
         study: row.study,
@@ -2833,7 +2871,7 @@ async function loadProfile(where, value, viewerId) {
         // pinned badges only while they are earned (the numbers can go down again)
         showcase: stats ? row.showcase_badges.filter(id => BADGES[id]?.(stats)) : row.showcase_badges,
         // only I see the switches themselves; friends see `stats: null` when it is off
-        ...(relation === "self" ? { showStats: row.show_stats, shareActivity: row.share_activity } : {}),
+        ...(relation === "self" ? { showStats: row.show_stats, shareActivity: row.share_activity, showOnline: row.show_online } : {}),
         stats,
         ...(mutual ? {
             mutualFriends: mutual.rows.map(m => ({ ...publicUser(m), emoji: m.avatar_emoji, color: m.profile_color })),
@@ -2866,7 +2904,7 @@ app.get("/api/profile", async (req, res) => {
 
 // Set up my profile. Every field is optional, only the ones sent change; empty text or null clears:
 // { bio, status, study, interests: [...], color, banner, emoji, frame, title, showcase: [...],
-// showStats, shareActivity }. Choices above my level: 403 LEVEL_LOCKED { field, level }.
+// showStats, shareActivity, showOnline }. Choices above my level: 403 LEVEL_LOCKED { field, level }.
 // Answers with my profile.
 app.put("/api/profile", async (req, res) => {
     const body = req.body ?? {};
@@ -2917,7 +2955,7 @@ app.put("/api/profile", async (req, res) => {
         gated.showcase = { column: "showcase_badges", value: list };
     }
 
-    for (const [field, column] of [["showStats", "show_stats"], ["shareActivity", "share_activity"]]) {
+    for (const [field, column] of [["showStats", "show_stats"], ["shareActivity", "share_activity"], ["showOnline", "show_online"]]) {
         if (!(field in body)) continue;
         if (typeof body[field] !== "boolean") return invalidInput(res, field);
         columns[column] = body[field];
@@ -2958,6 +2996,10 @@ app.put("/api/profile", async (req, res) => {
             );
         }
         res.json(await loadProfile("id", req.user.userId, req.user.userId));
+        // switched on or off: the others see it right away
+        if ("show_online" in columns) {
+            await announcePresence(req.user.userId, columns.show_online && realtime.isOnline(req.user.userId));
+        }
     } catch (err) {
         serverError(res, err);
     }
@@ -3272,7 +3314,7 @@ async function loadSharedSession(sessionId, userId) {
             `SELECT shared_session_members.status, shared_session_members.joined_at,
                 CASE WHEN shared_session_members.last_seen_at > now() - make_interval(secs => $2)
                     THEN shared_session_members.current_task_id END AS working_on,
-                users.id, users.username, users.display_name
+                users.id, users.username, users.display_name, users.show_online
             FROM shared_session_members
             JOIN users ON users.id = shared_session_members.user_id
             WHERE shared_session_members.session_id = $1
@@ -3333,6 +3375,7 @@ async function loadSharedSession(sessionId, userId) {
             isOwner: member.id === row.owner_id,
             joinedAt: member.joined_at,
             workingOn: member.working_on,
+            online: member.status === "joined" && showsOnline(member),
             totalMs: 0,
         });
     }
@@ -4015,20 +4058,26 @@ app.delete("/api/shared-sessions/:id", async (req, res) => {
     }
 });
 
-// ---------- Quidey Family (testers only for now) ----------
+// ---------- Quidey Family ----------
 // A fixed group of accounts with a calendar and a chat of their own, apart from the shared
 // sessions. Members are friends of whoever invited them; only joined members see a family
 // (for anybody else it doesn't exist: 404). Everybody in it can add, change and tick off
 // calendar entries; removing one is for whoever added it and the owner.
 // Live: "family:changed" { familyId } (members, name, entries, invites changed: load again)
 // and "family:message" { familyId, message } go to the members' user rooms.
+// Also: a board (one short text any member changes), an emoji and a colour (owner), who takes
+// care of an entry (assignee, any joined member), and the members' week (XP, focus, streak) for
+// those who show their statistics.
 
 const FAMILY_NAME_MAX = 60;
+const FAMILY_NOTE_MAX = 2000;
+// the emojis a family can have (the same list as in the app, src/features/family/family.js)
+const FAMILY_EMOJIS = ["🏡", "🌳", "⭐", "🌻", "🐾", "🎈", "🍀", "🔥", "🌙", "🎵", "☕", "📚", "🏖️", "❤️", "🦊", "🚀"];
 const FAMILY_MEMBER_MAX = 20;
 // families one account can be in (joined or invited)
 const FAMILIES_PER_USER_MAX = 10;
 const FAMILY_MESSAGE_PAGE = 100;
-const familyBase = "/api/tester/families";
+const familyBase = "/api/families";
 
 const familyName = (value) => typeof value === "string" ? value.trim().slice(0, FAMILY_NAME_MAX) : "";
 
@@ -4055,11 +4104,11 @@ async function requireFamily(req, res) {
 }
 
 // Whom to tell about a change: the joined members (with `invited` also the invited people),
-// only those who are still testers (the feature isn't theirs any more otherwise)
+// only those who may still use the app
 async function familyMemberIds(familyId, { invited = false } = {}) {
     const result = await pool.query(
         `SELECT family_members.user_id FROM family_members JOIN users ON users.id = family_members.user_id
-        WHERE family_members.family_id = $1 AND ${TESTER_ACCESS_SQL}
+        WHERE family_members.family_id = $1 AND ${APP_ACCESS_SQL}
             ${invited ? "" : "AND family_members.status = 'joined'"}`,
         [familyId]
     );
@@ -4104,21 +4153,29 @@ const toFamilyMessage = (row) => ({
 });
 
 // Everything the family page shows:
-// { id, name, createdAt, owner, isOwner, me,
-//   people: [{ user, status: 'joined' | 'invited', isOwner, joinedAt }],
+// { id, name, emoji, color, createdAt, owner, isOwner, me,
+//   note: { text, updatedAt, updatedBy } | null,
+//   people: [{ user, status: 'joined' | 'invited', isOwner, joinedAt, online }],
 //   tasks:  [{ id, name, description, done, due, due_time, prio, duration_minutes, location, link,
-//              details, color, addedBy, createdAt }] }
+//              details, color, addedBy, assignee, createdAt }],
+//   week:   { weekStart, people: [{ userId, xp, focusMin, streak }] } (joined members who show
+//           their statistics, and me) }
 async function loadFamily(familyId, userId) {
     const [family, members, tasks] = await Promise.all([
         pool.query(
-            `SELECT families.id, families.name, families.created_at,
-                users.id AS owner_id, users.username AS owner_username, users.display_name AS owner_display_name
+            `SELECT families.id, families.name, families.created_at, families.emoji, families.color,
+                families.note, families.note_updated_at,
+                users.id AS owner_id, users.username AS owner_username, users.display_name AS owner_display_name,
+                editor.id AS editor_id, editor.username AS editor_username, editor.display_name AS editor_display_name,
+                to_char(date_trunc('week', now() AT TIME ZONE COALESCE((SELECT timezone FROM users WHERE id = $2), 'Europe/Berlin')), 'YYYY-MM-DD') AS monday
             FROM families JOIN users ON users.id = families.owner_id
+            LEFT JOIN users AS editor ON editor.id = families.note_updated_by
             WHERE families.id = $1`,
-            [familyId]
+            [familyId, userId]
         ),
         pool.query(
-            `SELECT family_members.status, family_members.joined_at, users.id, users.username, users.display_name
+            `SELECT family_members.status, family_members.joined_at, users.id, users.username, users.display_name,
+                users.show_online, users.show_stats
             FROM family_members JOIN users ON users.id = family_members.user_id
             WHERE family_members.family_id = $1
             ORDER BY family_members.status DESC, family_members.joined_at, family_members.invited_at`,
@@ -4129,8 +4186,10 @@ async function loadFamily(familyId, userId) {
                 family_tasks.due, to_char(family_tasks.due_time, 'HH24:MI') AS due_time, family_tasks.prio,
                 family_tasks.duration_minutes, family_tasks.location, family_tasks.link, family_tasks.details,
                 family_tasks.color, family_tasks.created_at,
-                users.id AS adder_id, users.username AS adder_username, users.display_name AS adder_display_name
+                users.id AS adder_id, users.username AS adder_username, users.display_name AS adder_display_name,
+                assignee.id AS assignee_id, assignee.username AS assignee_username, assignee.display_name AS assignee_display_name
             FROM family_tasks LEFT JOIN users ON users.id = family_tasks.added_by
+            LEFT JOIN users AS assignee ON assignee.id = family_tasks.assignee_id
             WHERE family_tasks.family_id = $1
             ORDER BY family_tasks.due NULLS LAST, family_tasks.due_time NULLS FIRST, family_tasks.id`,
             [familyId]
@@ -4138,19 +4197,42 @@ async function loadFamily(familyId, userId) {
     ]);
     const row = family.rows[0];
     if (!row) return null;
+
+    // the week of the members who show their numbers (and mine)
+    const weekIds = members.rows.filter(m => m.status === "joined" && (m.show_stats || m.id === userId)).map(m => m.id);
+    const [weekXp, streaks] = await Promise.all([progress.loadXp(pool, weekIds, row.monday), progress.loadStreaks(pool, weekIds)]);
+
     return {
         id: row.id,
         name: row.name,
+        emoji: row.emoji,
+        color: row.color,
         createdAt: row.created_at,
         owner: publicUser(row, "owner_"),
         isOwner: row.owner_id === userId,
         me: userId,
+        note: row.note ? {
+            text: row.note,
+            updatedAt: row.note_updated_at,
+            updatedBy: row.editor_id ? publicUser(row, "editor_") : null,
+        } : null,
         people: members.rows.map(member => ({
             user: publicUser(member),
             status: member.status,
             isOwner: member.id === row.owner_id,
             joinedAt: member.joined_at,
+            online: member.status === "joined" && showsOnline(member),
         })),
+        week: {
+            weekStart: row.monday,
+            people: weekIds.map(id => ({
+                userId: id,
+                xp: weekXp[id]?.xp ?? 0,
+                // focus XP is one per minute (at most 600 a day)
+                focusMin: weekXp[id]?.focusXp ?? 0,
+                streak: streaks[id] ?? 0,
+            })),
+        },
         tasks: tasks.rows.map(task => ({
             id: task.id,
             name: task.name,
@@ -4165,9 +4247,24 @@ async function loadFamily(familyId, userId) {
             details: task.details,
             color: task.color,
             addedBy: task.adder_id ? publicUser(task, "adder_") : null,
+            assignee: task.assignee_id ? publicUser(task, "assignee_") : null,
             createdAt: task.created_at,
         })),
     };
+}
+
+// Who takes care of an entry: `assignee_id` from a request, checked to be a joined member.
+// { value } (null: nobody), {} when it wasn't sent, or { error }.
+async function familyAssignee(familyId, body) {
+    if (body?.assignee_id === undefined) return {};
+    if (body.assignee_id === null || body.assignee_id === "") return { value: null };
+    const id = idParam(body.assignee_id);
+    if (!id) return { error: "assignee_id" };
+    const member = await pool.query(
+        "SELECT 1 FROM family_members WHERE family_id = $1 AND user_id = $2 AND status = 'joined'",
+        [familyId, id]
+    );
+    return member.rows.length > 0 ? { value: id } : { error: "assignee_id" };
 }
 
 async function sendFamily(res, familyId, userId, status = 200) {
@@ -4183,6 +4280,7 @@ app.get(familyBase, async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT families.id, families.name, families.owner_id, family_members.status, family_members.invited_at,
+                families.emoji, families.color,
                 owner.username AS owner_username, owner.display_name AS owner_display_name,
                 inviter.id AS inviter_id, inviter.username AS inviter_username, inviter.display_name AS inviter_display_name,
                 (SELECT count(*) FROM family_members AS m WHERE m.family_id = families.id AND m.status = 'joined')::int AS member_count
@@ -4200,6 +4298,8 @@ app.get(familyBase, async (req, res) => {
             owner: publicUser(row, "owner_"),
             isOwner: row.owner_id === userId,
             memberCount: row.member_count,
+            emoji: row.emoji,
+            color: row.color,
         });
         res.json({
             families: result.rows.filter(row => row.status === "joined").map(summary),
@@ -4264,16 +4364,44 @@ app.get(`${familyBase}/:id`, async (req, res) => {
     }
 });
 
-// Rename (owner): { name }
+// Change it: { name?, emoji?, color? } (owner), { note? } (any member; empty or null clears it).
+// Only what is sent changes.
 app.patch(`${familyBase}/:id`, async (req, res) => {
     const userId = req.user.userId;
-    const name = familyName(req.body?.name);
-    if (!name) return fail(res, 400, "NAME_REQUIRED", "Name is required");
+    const body = req.body ?? {};
+    const sets = {};
+    if ("name" in body) {
+        const name = familyName(body.name);
+        if (!name) return fail(res, 400, "NAME_REQUIRED", "Name is required");
+        sets.name = name;
+    }
+    if ("emoji" in body) {
+        if (body.emoji !== null && !FAMILY_EMOJIS.includes(body.emoji)) return invalidInput(res, "emoji");
+        sets.emoji = body.emoji;
+    }
+    if ("color" in body) {
+        if (body.color !== null && !TASK_COLORS.includes(body.color)) return invalidInput(res, "color");
+        sets.color = body.color;
+    }
+    const ownerOnly = Object.keys(sets).length > 0;
+    if ("note" in body) {
+        const note = cleanText(body.note, FAMILY_NOTE_MAX);
+        if (note === undefined) return invalidInput(res, "note");
+        sets.note = note;
+        sets.note_updated_at = note === null ? null : new Date();
+        sets.note_updated_by = note === null ? null : userId;
+    }
+    if (Object.keys(sets).length === 0) return fail(res, 400, "NOTHING_TO_CHANGE", "Send name, emoji, color or note");
     try {
         const family = await requireFamily(req, res);
         if (!family) return;
-        if (!family.isOwner) return fail(res, 403, "NOT_OWNER", "Only the owner can rename the family");
-        await pool.query("UPDATE families SET name = $1 WHERE id = $2", [name, family.familyId]);
+        if (ownerOnly && !family.isOwner) return fail(res, 403, "NOT_OWNER", "Only the owner can change the family");
+        // the column names come from the code above, never from the request
+        const columns = Object.keys(sets);
+        await pool.query(
+            `UPDATE families SET ${columns.map((column, i) => `${column} = $${i + 2}`).join(", ")} WHERE id = $1`,
+            [family.familyId, ...Object.values(sets)]
+        );
         await sendFamily(res, family.familyId, userId);
         await notifyFamily(family.familyId);
     } catch (err) {
@@ -4352,6 +4480,8 @@ app.delete(`${familyBase}/:id/members/:userId`, async (req, res) => {
             [familyId, targetId]
         );
         if (result.rows.length === 0) return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
+        // what they took care of is nobody's again
+        await pool.query("UPDATE family_tasks SET assignee_id = NULL WHERE family_id = $1 AND assignee_id = $2", [familyId, targetId]);
         res.json({ familyId, userId: targetId });
         await notifyFamily(familyId, [targetId]);
     } catch (err) {
@@ -4359,7 +4489,8 @@ app.delete(`${familyBase}/:id/members/:userId`, async (req, res) => {
     }
 });
 
-// A calendar entry: { name, and any of SHARED_TASK_FIELDS }
+// A calendar entry (or, without a day, an item on the family's list):
+// { name, assignee_id?, and any of SHARED_TASK_FIELDS }
 app.post(`${familyBase}/:id/tasks`, async (req, res) => {
     const userId = req.user.userId;
     const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, TASK_NAME_MAX) : "";
@@ -4370,6 +4501,9 @@ app.post(`${familyBase}/:id/tasks`, async (req, res) => {
     try {
         const family = await requireFamily(req, res);
         if (!family) return;
+        const assignee = await familyAssignee(family.familyId, req.body);
+        if (assignee.error) return invalidInput(res, assignee.error);
+        if ("value" in assignee) fields.values.assignee_id = assignee.value;
         const columns = ["family_id", "name", "added_by", ...Object.keys(fields.values)];
         const values = [family.familyId, name, userId, ...Object.values(fields.values)];
         await pool.query(
@@ -4383,7 +4517,7 @@ app.post(`${familyBase}/:id/tasks`, async (req, res) => {
     }
 });
 
-// Change an entry: { done?, name?, and any of SHARED_TASK_FIELDS (null clears one) }
+// Change an entry: { done?, name?, assignee_id?, and any of SHARED_TASK_FIELDS (null clears one) }
 app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
     const userId = req.user.userId;
     const taskId = idParam(req.params.taskId);
@@ -4393,12 +4527,15 @@ app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
     if (done !== undefined && typeof done !== "boolean") return fail(res, 400, "DONE_REQUIRED", "done must be true or false");
     if (name === null || (req.body?.name !== undefined && name === undefined)) return invalidInput(res, "name");
     if (fields.error) return invalidInput(res, fields.error);
-    if (done === undefined && name === undefined && Object.keys(fields.values).length === 0) {
+    if (done === undefined && name === undefined && Object.keys(fields.values).length === 0 && req.body?.assignee_id === undefined) {
         return fail(res, 400, "NOTHING_TO_CHANGE", "Send done, name or a field");
     }
     try {
         const family = await requireFamily(req, res);
         if (!family) return;
+        const assignee = await familyAssignee(family.familyId, req.body);
+        if (assignee.error) return invalidInput(res, assignee.error);
+        if ("value" in assignee) fields.values.assignee_id = assignee.value;
         const before = await pool.query("SELECT due FROM family_tasks WHERE id = $1 AND family_id = $2", [taskId, family.familyId]);
         if (before.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
         // a time of day needs a day; taking the day away takes the time along
@@ -4745,23 +4882,27 @@ app.get("/api/progress", async (req, res) => {
     }
 });
 
-// This week among friends: XP since Monday of me and the friends who show their statistics,
-// most first
+// This week among friends: XP since Monday (and the current streak) of me and the friends who
+// show their statistics, most first
 app.get("/api/progress/friends", async (req, res) => {
     const me = req.user.userId;
     try {
         const people = await pool.query(
-            `SELECT id, username, display_name, avatar_emoji, profile_color, level,
+            `SELECT id, username, display_name, avatar_emoji, profile_color, level, show_online,
                 to_char(date_trunc('week', now() AT TIME ZONE COALESCE((SELECT timezone FROM users WHERE id = $1), 'Europe/Berlin')), 'YYYY-MM-DD') AS monday
             FROM users WHERE id = $1 OR (show_stats AND id IN (${friendIdsOf("$1::int")}))`,
             [me]
         );
         const monday = people.rows.find(row => row.id === me)?.monday ?? null;
-        const xp = await progress.loadXp(pool, people.rows.map(row => row.id), monday);
+        const ids = people.rows.map(row => row.id);
+        const [xp, streaks] = await Promise.all([progress.loadXp(pool, ids, monday), progress.loadStreaks(pool, ids)]);
         const ranking = people.rows
             .map(row => ({
                 user: { ...publicUser(row), emoji: row.avatar_emoji, color: row.profile_color, level: row.level },
                 weekXp: xp[row.id]?.xp ?? 0,
+                // days with focus in a row, and whether they have the app open (not for me)
+                streak: streaks[row.id] ?? 0,
+                ...(row.id === me ? {} : { online: showsOnline(row) }),
                 me: row.id === me,
             }))
             .sort((a, b) => b.weekXp - a.weekXp || a.user.username.localeCompare(b.user.username));

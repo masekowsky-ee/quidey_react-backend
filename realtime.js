@@ -20,10 +20,12 @@
 //   tasks:changed     { taskId }              a task shared with me (or by me) changed
 //   family:changed    { familyId }            a family I'm in or invited to changed (members,
 //                                             name, calendar entries), or it was deleted
-//   family:message    { familyId, message }   a new message in a family's chat (testers only)
+//   family:message    { familyId, message }   a new message in a family's chat
 //   feed:changed      {}                      an entry in my feed came, changed or went (mine
 //                                             or a friend's), or somebody cheered mine on
 //   feed:cheered      { user, entryId }       a friend cheered one of my feed entries on
+//   presence:changed  { userId, online }      a friend (or somebody in one of my open shared
+//                                             sessions or families) opened the app or closed it
 // The *:changed events carry no data on purpose: the app loads what it shows again, so nothing
 // can get out of step, and the server only does that work when something actually changed.
 // From the browser:
@@ -36,8 +38,51 @@ const { hasAppAccess } = require("./utils/access");
 
 // how many session rooms one socket can be in (a page shows one session at a time)
 const MAX_SESSION_ROOMS = 5;
+// A reload or a short network hiccup closes the socket for a moment: somebody only counts as
+// gone when no connection came back within this time
+const PRESENCE_GRACE_MS = Number(process.env.PRESENCE_GRACE_MS) || 8000;
 
 let io = null;
+
+// Online status: who has the app open right now (user id -> number of open sockets). Kept in
+// memory only, never stored. index.js decides who is told (presenceHandler) and hides the
+// status of people who switched it off (users.show_online).
+const connections = new Map();
+const goingAway = new Map();   // user id -> timer until they count as offline
+let presenceHandler = () => {};
+
+// (still during the grace time: the others haven't been told otherwise yet)
+const isOnline = (userId) => connections.has(userId) || goingAway.has(userId);
+
+// handler(userId, online): called once when somebody comes online and once when they're gone
+function onPresence(handler) {
+    presenceHandler = handler;
+}
+
+function tellPresence(userId, online) {
+    Promise.resolve().then(() => presenceHandler(userId, online)).catch(err => console.error(err));
+}
+
+function connected(userId) {
+    connections.set(userId, (connections.get(userId) ?? 0) + 1);
+    // back before the grace time ran out: for the others nothing happened
+    if (goingAway.has(userId)) {
+        clearTimeout(goingAway.get(userId));
+        goingAway.delete(userId);
+        return;
+    }
+    if (connections.get(userId) === 1) tellPresence(userId, true);
+}
+
+function disconnected(userId) {
+    const left = (connections.get(userId) ?? 1) - 1;
+    if (left > 0) return connections.set(userId, left);
+    connections.delete(userId);
+    goingAway.set(userId, setTimeout(() => {
+        goingAway.delete(userId);
+        if (!connections.has(userId)) tellPresence(userId, false);
+    }, PRESENCE_GRACE_MS).unref());
+}
 
 const userRoom = (userId) => `user:${userId}`;
 const sessionRoom = (sessionId) => `session:${sessionId}`;
@@ -84,6 +129,8 @@ function initRealtime(server, { allowedOrigins, tokenAlgorithm }) {
     io.on("connection", (socket) => {
         const userId = socket.data.userId;
         socket.join(userRoom(userId));
+        connected(userId);
+        socket.on("disconnect", () => disconnected(userId));
 
         // Follow a shared session's chat. Only joined members get in; ack({ ok }) says whether.
         socket.on("session:join", async (rawId, ack) => {
@@ -140,4 +187,4 @@ function disconnectUser(userId) {
     io?.in(userRoom(userId)).disconnectSockets(true);
 }
 
-module.exports = { initRealtime, toUser, toSession, leaveSession, closeSession, disconnectUser };
+module.exports = { initRealtime, toUser, toSession, leaveSession, closeSession, disconnectUser, isOnline, onPresence };
