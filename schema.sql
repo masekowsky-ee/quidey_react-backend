@@ -553,6 +553,44 @@ CREATE SEQUENCE public.notifications_id_seq
 ALTER SEQUENCE public.notifications_id_seq OWNED BY public.notifications.id;
 
 --
+-- Name: push_subscriptions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.push_subscriptions (
+    id integer NOT NULL,
+    user_id integer NOT NULL,
+    endpoint text NOT NULL,
+    p256dh text NOT NULL,
+    auth text NOT NULL,
+    plan boolean DEFAULT true NOT NULL,
+    digest boolean DEFAULT true NOT NULL,
+    messages boolean DEFAULT true NOT NULL,
+    social boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT push_subscriptions_endpoint_check CHECK (((endpoint ~ '^https://'::text) AND (char_length(endpoint) <= 1000))),
+    CONSTRAINT push_subscriptions_keys_check CHECK ((((char_length(p256dh) >= 1) AND (char_length(p256dh) <= 200)) AND ((char_length(auth) >= 1) AND (char_length(auth) <= 100))))
+);
+
+--
+-- Name: push_subscriptions_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.push_subscriptions_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: push_subscriptions_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.push_subscriptions_id_seq OWNED BY public.push_subscriptions.id;
+
+--
 -- Name: session_shared_tasks; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -829,6 +867,7 @@ CREATE TABLE public.tasks (
     event_type_id integer,
     repeat_left integer,
     repeat_skip date[] DEFAULT '{}'::date[] NOT NULL,
+    push_sent_for timestamp with time zone,
     CONSTRAINT tasks_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
     CONSTRAINT tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
     CONSTRAINT tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080)))),
@@ -911,6 +950,7 @@ CREATE TABLE public.users (
     showcase_badges text[] DEFAULT '{}'::text[] NOT NULL,
     share_activity boolean DEFAULT true NOT NULL,
     show_online boolean DEFAULT true NOT NULL,
+    push_digest_on date,
     CONSTRAINT users_avatar_emoji_check CHECK (((avatar_emoji IS NULL) OR (length(avatar_emoji) <= 16))),
     CONSTRAINT users_avatar_frame_check CHECK (((avatar_frame IS NULL) OR (avatar_frame = ANY (ARRAY['ring'::text, 'double'::text, 'dotted'::text, 'orbit'::text])))),
     CONSTRAINT users_banner_check CHECK (((banner IS NULL) OR (banner = ANY (ARRAY['gradient'::text, 'aurora'::text, 'dots'::text, 'stripes'::text, 'grid'::text, 'glow'::text, 'rings'::text, 'topo'::text, 'sky'::text])))),
@@ -1020,6 +1060,12 @@ ALTER TABLE ONLY public.notes ALTER COLUMN id SET DEFAULT nextval('public.notes_
 --
 
 ALTER TABLE ONLY public.notifications ALTER COLUMN id SET DEFAULT nextval('public.notifications_id_seq'::regclass);
+
+--
+-- Name: push_subscriptions id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.push_subscriptions ALTER COLUMN id SET DEFAULT nextval('public.push_subscriptions_id_seq'::regclass);
 
 --
 -- Name: sessions id; Type: DEFAULT; Schema: public; Owner: -
@@ -1188,6 +1234,20 @@ ALTER TABLE ONLY public.notes
 
 ALTER TABLE ONLY public.notifications
     ADD CONSTRAINT notifications_pkey PRIMARY KEY (id);
+
+--
+-- Name: push_subscriptions push_subscriptions_endpoint_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.push_subscriptions
+    ADD CONSTRAINT push_subscriptions_endpoint_key UNIQUE (endpoint);
+
+--
+-- Name: push_subscriptions push_subscriptions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.push_subscriptions
+    ADD CONSTRAINT push_subscriptions_pkey PRIMARY KEY (id);
 
 --
 -- Name: session_shared_tasks session_shared_tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -1433,6 +1493,12 @@ CREATE INDEX notifications_unread_idx ON public.notifications USING btree (user_
 --
 
 CREATE INDEX notifications_user_idx ON public.notifications USING btree (user_id, created_at);
+
+--
+-- Name: push_subscriptions_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX push_subscriptions_user_idx ON public.push_subscriptions USING btree (user_id);
 
 --
 -- Name: session_tasks_task_idx; Type: INDEX; Schema: public; Owner: -
@@ -1761,6 +1827,13 @@ ALTER TABLE ONLY public.notifications
 
 ALTER TABLE ONLY public.notifications
     ADD CONSTRAINT notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+--
+-- Name: push_subscriptions push_subscriptions_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.push_subscriptions
+    ADD CONSTRAINT push_subscriptions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
 -- Name: session_shared_tasks session_shared_tasks_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -

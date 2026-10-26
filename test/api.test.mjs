@@ -94,6 +94,8 @@ before(async () => {
         env: {
             ...process.env, DB_NAME: DB, PORT: String(port), SMTP_HOST: "", CONTACT_TO: "owner@example.com",
             RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", PRESENCE_GRACE_MS: "200",
+            // pushes are only logged ("[DEV] Push to user …"), like mails without SMTP_HOST
+            VAPID_PUBLIC_KEY: "", VAPID_PRIVATE_KEY: "",
         },
     });
     server.stdout.on("data", (chunk) => { log += chunk; });
@@ -1830,5 +1832,136 @@ describe("streaks", () => {
         assert.equal(ranking.find(r => r.user.id === sia.id).streak, 3);
         assert.equal(ranking.find(r => r.user.id === sia.id).online, false);
         assert.equal(ranking.find(r => r.me).online, undefined);
+    });
+});
+
+describe("push notifications", () => {
+    let pia, pib, pic;
+    const device = (n) => ({ endpoint: `https://push.example.com/send/device-${n}`, keys: { p256dh: `BKey${n}_-x`, auth: `auth${n}` } });
+    const pushesFor = (user, kind, text) => log.split("\n").filter(line => line.includes(`[DEV] Push to user ${user.id} (${kind}): `) && line.includes(text)).length;
+    async function waitForPushes(user, kind, text, count = 1) {
+        for (let i = 0; i < 40 && pushesFor(user, kind, text) < count; i++) await sleep(100);
+        return pushesFor(user, kind, text);
+    }
+    // "YYYY-MM-DD" and "HH:MM" in UTC, `minutes` from now
+    const utcIn = (minutes) => {
+        const d = new Date(Date.now() + minutes * 60000);
+        return { due: d.toISOString().slice(0, 10), due_time: d.toISOString().slice(11, 16) };
+    };
+
+    before(async () => {
+        pia = await member("pushpia");
+        pib = await member("pushpib");
+        pic = await member("pushpic");
+        await befriend(pia, pib, "pushpib");
+        for (const who of [pia, pib, pic]) await call("PUT", "/api/users/locale", { timezone: "UTC", language: "de" }, who.token);
+    });
+
+    test("a device signs up with its address and keys; kinds start on and change one by one", async () => {
+        assert.deepEqual((await call("GET", "/api/push/key", null, pia.token)).data, { publicKey: null }, "no keys: only logged");
+        assert.equal((await call("PUT", "/api/push/subscription", { ...device(1), endpoint: "http://insecure.example.com/x" }, pia.token)).data.field, "endpoint");
+        assert.equal((await call("PUT", "/api/push/subscription", { ...device(1), keys: { p256dh: "a b", auth: "x" } }, pia.token)).data.field, "keys");
+        assert.equal((await call("PUT", "/api/push/subscription", { ...device(1), kinds: { spam: true } }, pia.token)).data.field, "kinds");
+        assert.equal((await call("PUT", "/api/push/subscription", device(1))).status, 401);
+
+        const fresh = await call("PUT", "/api/push/subscription", device(1), pia.token);
+        assert.deepEqual(fresh.data.kinds, { plan: true, digest: true, messages: true, social: true });
+        const changed = await call("PUT", "/api/push/subscription", { ...device(1), kinds: { digest: false } }, pia.token);
+        assert.deepEqual(changed.data.kinds, { plan: true, digest: false, messages: true, social: true });
+        const again = await call("PUT", "/api/push/subscription", device(1), pia.token);
+        assert.equal(again.data.kinds.digest, false, "kinds not sent stay");
+        assert.equal((await sql("SELECT count(*)::int AS n FROM push_subscriptions WHERE endpoint = $1", [device(1).endpoint]))[0].n, 1);
+    });
+
+    test("only for accounts with app access", async () => {
+        const outsider = await member("pushout", { pro: false });
+        assert.equal((await call("PUT", "/api/push/subscription", device(9), outsider.token)).data.code, "PRO_REQUIRED");
+    });
+
+    test("the same device signed in as somebody else goes over to them", async () => {
+        await call("PUT", "/api/push/subscription", device(2), pic.token);
+        await call("PUT", "/api/push/subscription", device(2), pib.token);
+        const [row] = await sql("SELECT user_id FROM push_subscriptions WHERE endpoint = $1", [device(2).endpoint]);
+        assert.equal(row.user_id, pib.id);
+        // pic can't remove pib's device
+        await call("DELETE", "/api/push/subscription", { endpoint: device(2).endpoint }, pic.token);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM push_subscriptions WHERE endpoint = $1", [device(2).endpoint]))[0].n, 1);
+    });
+
+    test("a test push reaches only a signed-up device of mine", async () => {
+        const sent = await call("POST", "/api/push/test", { endpoint: device(1).endpoint }, pia.token);
+        assert.deepEqual(sent.data, { sent: true });
+        assert.equal(await waitForPushes(pia, "plan", "Benachrichtigungen kommen"), 1);
+        assert.equal((await call("POST", "/api/push/test", { endpoint: device(2).endpoint }, pia.token)).data.code, "NOT_SUBSCRIBED");
+    });
+
+    test("direct messages are pushed to the friend's devices that want them", async () => {
+        await call("POST", `/api/messages/${pib.id}`, { body: "Lernen wir heute?" }, pia.token);
+        assert.equal(await waitForPushes(pib, "messages", "Pushpia — Lernen wir heute?"), 1);
+        await call("PUT", "/api/push/subscription", { ...device(2), kinds: { messages: false } }, pib.token);
+        await call("POST", `/api/messages/${pib.id}`, { body: "Still?" }, pia.token);
+        await sleep(300);
+        assert.equal(pushesFor(pib, "messages", "Still?"), 0);
+    });
+
+    test("a friend request and an invite are pushed", async () => {
+        await call("PUT", "/api/push/subscription", device(3), pic.token);
+        await call("POST", "/api/friends/requests", { username: "pushpic" }, pia.token);
+        assert.equal(await waitForPushes(pic, "social", "Pushpia möchte mit dir lernen."), 1);
+        const [request] = (await call("GET", "/api/friends/requests", null, pic.token)).data.incoming;
+        await call("POST", `/api/friends/requests/${request.id}/accept`, null, pic.token);
+        await call("POST", "/api/shared-sessions", { name: "Klausur", friendIds: [pic.id] }, pia.token);
+        assert.equal(await waitForPushes(pic, "social", "Pushpia lädt dich zu „Klausur“ ein."), 1);
+    });
+
+    test("a task with a time is pushed at its reminder, or at its start without one, once", async () => {
+        const reminded = (await call("POST", "/api/tasks", { name: "Essay abgeben", prio: 50, description: "", ...utcIn(10), reminder_minutes: 15 }, pia.token)).data;
+        await call("POST", "/api/tasks", { name: "Vorlesung", prio: 50, description: "", ...utcIn(-1), kind: "event", location: "Hörsaal 2" }, pia.token);
+        await call("POST", "/api/tasks", { name: "Viel später", prio: 50, description: "", ...utcIn(90) }, pia.token);
+        await call("POST", "/api/tasks", { name: "Ohne Zeit", prio: 50, description: "", due: utcIn(0).due }, pia.token);
+
+        assert.equal(await waitForPushes(pia, "plan", "Essay abgeben — Aufgabe um"), 1);
+        assert.equal(await waitForPushes(pia, "plan", "Vorlesung — Beginnt jetzt"), 1);
+        assert.ok(log.includes("Hörsaal 2"));
+        await sleep(600);
+        assert.equal(pushesFor(pia, "plan", "Essay abgeben"), 1, "only once");
+        assert.equal(pushesFor(pia, "plan", "Viel später"), 0);
+        assert.equal(pushesFor(pia, "plan", "Ohne Zeit"), 0);
+
+        // moved: a new reminder time, pushed again
+        await call("PUT", `/api/tasks/${reminded.id}`, { ...reminded, ...utcIn(11) }, pia.token);
+        assert.equal(await waitForPushes(pia, "plan", "Essay abgeben", 2), 2);
+
+        // somebody without a device that wants "plan" gets nothing
+        await call("PUT", "/api/push/subscription", { ...device(3), kinds: { plan: false } }, pic.token);
+        await call("POST", "/api/tasks", { name: "Leise", prio: 50, description: "", ...utcIn(-1) }, pic.token);
+        await sleep(600);
+        assert.equal(pushesFor(pic, "plan", "Leise"), 0);
+    });
+
+    test("the morning overview comes once a day with what's open today", async () => {
+        // a time zone where it's 09:xx right now
+        const offset = ((9 - new Date().getUTCHours() + 36) % 24) - 12;
+        const zone = offset >= 0 ? `Etc/GMT-${offset}` : `Etc/GMT+${-offset}`;
+        const pid = await member("pushpid");
+        await call("PUT", "/api/users/locale", { timezone: zone }, pid.token);
+        const [{ today }] = await sql("SELECT to_char((now() AT TIME ZONE $1)::date, 'YYYY-MM-DD') AS today", [zone]);
+        await call("POST", "/api/tasks", { name: "Lesen", prio: 50, description: "", due: today }, pid.token);
+        await call("POST", "/api/tasks", { name: "Rechnen", prio: 50, description: "", due: today }, pid.token);
+        await call("PUT", "/api/push/subscription", { ...device(4), kinds: { plan: false } }, pid.token);
+
+        assert.equal(await waitForPushes(pid, "digest", "Dein Tag — Heute: 2 Aufgaben"), 1);
+        await sleep(600);
+        assert.equal(pushesFor(pid, "digest", "Dein Tag"), 1, "once a day");
+        const [row] = await sql("SELECT to_char(push_digest_on, 'YYYY-MM-DD') AS day FROM users WHERE id = $1", [pid.id]);
+        assert.equal(row.day, today);
+    });
+
+    test("turning off removes the device; signing out everywhere removes all of them", async () => {
+        assert.deepEqual((await call("DELETE", "/api/push/subscription", { endpoint: device(1).endpoint }, pia.token)).data, { subscribed: false });
+        assert.equal((await sql("SELECT count(*)::int AS n FROM push_subscriptions WHERE user_id = $1", [pia.id]))[0].n, 0);
+        await call("PUT", "/api/push/subscription", device(5), pic.token);
+        await call("POST", "/api/users/logout-all", null, pic.token);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM push_subscriptions WHERE user_id = $1", [pic.id]))[0].n, 0);
     });
 });

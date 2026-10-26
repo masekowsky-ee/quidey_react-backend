@@ -9,6 +9,7 @@ const jwt = require("jsonwebtoken");
 const { hashToken, createVerificationToken } = require("./utils/verificationToken");
 const { sendVerificationMail, sendContactMail, sendFeedbackMail } = require("./utils/mailer");
 const { startReminderMails } = require("./utils/reminderMails");
+const { PUSH_PUBLIC_KEY, PUSH_KINDS, PUSH_MAX_DEVICES, PUSH_TEXTS, pushLater, deliver, startPushSchedule } = require("./utils/push");
 const http = require("node:http");
 const realtime = require("./realtime");
 const { hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
@@ -222,6 +223,7 @@ app.use("/api/stats", authenticateToken);
 app.use("/api/feed", authenticateToken);
 app.use("/api/progress", authenticateToken);
 app.use("/api/families", authenticateToken);
+app.use("/api/push", authenticateToken);
 
 // Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
 // Checked against the account on every request (not stored in the token; see loadAccount), so
@@ -235,7 +237,7 @@ function requirePro(req, res, next) {
 }
 
 app.use(
-    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families"],
+    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families", "/api/push"],
     requirePro
 );
 
@@ -1553,6 +1555,7 @@ app.post("/api/messages/:userId", directMessageLimiter, async (req, res) => {
         const byId = new Map(people.rows.map(user => [user.id, { id: user.id, username: user.username, displayName: user.display_name }]));
         realtime.toUser(other, "message:new", { user: byId.get(me), message: toMessage(row, other) });
         realtime.toUser(me, "message:new", { user: byId.get(other), message: toMessage(row, me) });
+        pushLater(pool, [other], "messages", () => PUSH_TEXTS.message({ from: byId.get(me), body }));
     } catch (err) {
         serverError(res, err);
     }
@@ -1723,6 +1726,7 @@ app.post("/api/admin/broadcasts", async (req, res) => {
                 id: row.id, kind: row.kind, title: row.title, body: row.body, createdAt: row.created_at, readAt: null,
             });
         }
+        pushLater(pool, sent.rows.map(row => row.user_id), "social", () => PUSH_TEXTS.broadcast({ title, body }));
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
@@ -1992,6 +1996,8 @@ app.put("/api/users/password", authLimiter, async (req, res) => {
             [passwordHash, userId]
         );
         forgetAccount(userId);
+        // the signed-out devices get no more pushes; this one signs up again (the app does that)
+        await pool.query("DELETE FROM push_subscriptions WHERE user_id = $1", [userId]);
         // open sockets used the old token; this device connects again with the new one
         realtime.disconnectUser(userId);
         res.json({ message: "Password changed", token: signToken(updated.rows[0]) });
@@ -2004,6 +2010,8 @@ app.put("/api/users/password", authLimiter, async (req, res) => {
 app.post("/api/users/logout-all", async (req, res) => {
     try {
         await pool.query("UPDATE users SET token_version = token_version + 1 WHERE id = $1", [req.user.userId]);
+        // no device of a signed-out account gets pushes any more
+        await pool.query("DELETE FROM push_subscriptions WHERE user_id = $1", [req.user.userId]);
         forgetAccount(req.user.userId);
         realtime.disconnectUser(req.user.userId);
         res.json({ message: "Signed out everywhere" });
@@ -2714,6 +2722,7 @@ app.post("/api/friends/requests", friendRequestLimiter, async (req, res) => {
             [userId, other.id]
         );
         realtime.toUser(other.id, "friends:changed", {});
+        pushInvite("friendRequest", [other.id], userId);
         res.status(201).json({
             status: "pending",
             request: { id: created.rows[0].id, user: publicUser(other), createdAt: created.rows[0].created_at },
@@ -3160,7 +3169,7 @@ app.post("/api/tasks/:id/shares", friendRequestLimiter, async (req, res) => {
             await client.query("ROLLBACK");
             return fail(res, 409, "TOO_MANY_SHARES", "This task is shared with too many people");
         }
-        await client.query(
+        const shared = await client.query(
             `INSERT INTO task_shares (task_id, user_id, invited_by)
             SELECT $1, friend.id, $2
             FROM unnest($3::int[]) AS friend(id)
@@ -3170,12 +3179,15 @@ app.post("/api/tasks/:id/shares", friendRequestLimiter, async (req, res) => {
                     AND LEAST(requester_id, addressee_id) = LEAST($2::int, friend.id)
                     AND GREATEST(requester_id, addressee_id) = GREATEST($2::int, friend.id)
             )
-            ON CONFLICT (task_id, user_id) DO NOTHING`,
+            ON CONFLICT (task_id, user_id) DO NOTHING
+            RETURNING user_id`,
             [taskId, userId, friendIds]
         );
         await client.query("COMMIT");
-        res.status(201).json(await loadTask(taskId, userId));
+        const sharedTask = await loadTask(taskId, userId);
+        res.status(201).json(sharedTask);
         notifyTaskPeople(await taskPeople(taskId, userId), taskId);
+        pushInvite("taskShared", shared.rows.map(row => row.user_id), userId, sharedTask?.name);
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
@@ -3313,7 +3325,7 @@ const idList = (value) => Array.isArray(value)
 // My membership row joined with the session, or undefined
 async function getMembership(sessionId, userId) {
     const result = await pool.query(
-        `SELECT shared_sessions.owner_id, shared_sessions.ended_at, shared_session_members.status
+        `SELECT shared_sessions.owner_id, shared_sessions.name, shared_sessions.ended_at, shared_session_members.status
         FROM shared_session_members
         JOIN shared_sessions ON shared_sessions.id = shared_session_members.session_id
         WHERE shared_session_members.session_id = $1 AND shared_session_members.user_id = $2`,
@@ -3407,7 +3419,12 @@ async function noticeTaskAssigned(sessionId, taskId, taskName, byId, assigneeId)
             RETURNING id, kind, title, body, data, created_at, read_at`,
             [assigneeId, taskName, taskId, sessionId, byId]
         );
-        if (result.rows[0]) realtime.toUser(assigneeId, "notification:new", toNotice(result.rows[0]));
+        const notice = result.rows[0];
+        if (notice) {
+            realtime.toUser(assigneeId, "notification:new", toNotice(notice));
+            const from = notice.data.by;
+            pushLater(pool, [assigneeId], "social", (language) => PUSH_TEXTS.taskAssigned({ from, name: taskName, session: notice.body, sessionId }, language));
+        }
     } catch (err) {
         console.error(err);
     }
@@ -3743,6 +3760,7 @@ app.post("/api/shared-sessions", async (req, res) => {
         await client.query("COMMIT");
         await sendSharedSession(res, sessionId, userId, 201);
         notifyInvites(invited);
+        pushInvite("sessionInvite", invited, userId, name);
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
@@ -3762,6 +3780,7 @@ app.post("/api/shared-sessions/:id/invites", async (req, res) => {
         await sendSharedSession(res, session.sessionId, userId);
         await notifySession(session.sessionId);
         notifyInvites(invited);
+        pushInvite("sessionInvite", invited, userId, session.name);
     } catch (err) {
         serverError(res, err);
     }
@@ -4208,7 +4227,7 @@ const familyName = (value) => typeof value === "string" ? value.trim().slice(0, 
 // My membership row with the family's owner, or undefined
 async function getFamilyMembership(familyId, userId) {
     const result = await pool.query(
-        `SELECT families.owner_id, family_members.status
+        `SELECT families.owner_id, families.name, family_members.status
         FROM family_members JOIN families ON families.id = family_members.family_id
         WHERE family_members.family_id = $1 AND family_members.user_id = $2`,
         [familyId, userId]
@@ -4224,7 +4243,7 @@ async function requireFamily(req, res) {
         fail(res, 404, "FAMILY_NOT_FOUND", "Family not found");
         return null;
     }
-    return { familyId, isOwner: membership.owner_id === req.user.userId };
+    return { familyId, name: membership.name, isOwner: membership.owner_id === req.user.userId };
 }
 
 // Whom to tell about a change: the joined members (with `invited` also the invited people),
@@ -4470,6 +4489,7 @@ app.post(familyBase, async (req, res) => {
         await client.query("COMMIT");
         await sendFamily(res, familyId, userId, 201);
         for (const id of invited) realtime.toUser(id, "family:changed", { familyId });
+        pushInvite("familyInvite", invited, userId, name);
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         serverError(res, err);
@@ -4559,6 +4579,7 @@ app.post(`${familyBase}/:id/invites`, async (req, res) => {
         if (invited.length === 0) return fail(res, 400, "NOTHING_TO_INVITE", "Nobody new to invite");
         await sendFamily(res, family.familyId, userId);
         await notifyFamily(family.familyId);
+        pushInvite("familyInvite", invited, userId, family.name);
     } catch (err) {
         serverError(res, err);
     }
@@ -5179,6 +5200,121 @@ async function setCheer(req, res, on) {
 app.put("/api/feed/:id/cheer", (req, res) => setCheer(req, res, true));
 app.delete("/api/feed/:id/cheer", (req, res) => setCheer(req, res, false));
 
+// ---------- Push notifications ----------
+// A device (browser) turns them on in the app's settings: it asks its push service for an
+// address and hands it over here with its keys (see utils/push.js). One row per device; the
+// account signed in there last owns it. Kinds per device: plan, digest, messages, social.
+
+// Who did something, for the text of a push: { id, username, displayName }
+async function pushSender(userId) {
+    const result = await pool.query("SELECT id, username, display_name FROM users WHERE id = $1", [userId]);
+    const user = result.rows[0];
+    return user ? { id: user.id, username: user.username, displayName: user.display_name } : null;
+}
+
+// A "social" push to the people somebody just asked or invited; `name` is the session's,
+// family's or task's. Fire and forget, like the realtime signals.
+function pushInvite(text, userIds, fromId, name) {
+    if (userIds.length === 0) return;
+    pushSender(fromId)
+        .then((from) => from && pushLater(pool, userIds, "social", (language) => PUSH_TEXTS[text]({ from, name }, language)))
+        .catch((err) => console.error(err));
+}
+
+const PUSH_ENDPOINT_MAX = 1000;
+const validEndpoint = (value) => typeof value === "string" && value.length <= PUSH_ENDPOINT_MAX && /^https:\/\/[^\s]+$/.test(value);
+const validPushKey = (value, max) => typeof value === "string" && value.length >= 1 && value.length <= max && /^[A-Za-z0-9_=-]+$/.test(value);
+const pushKindsJson = (row) => Object.fromEntries(PUSH_KINDS.map(kind => [kind, row[kind]]));
+
+// The server's public key, which the browser needs to sign up; null: this server sends no pushes
+app.get("/api/push/key", (req, res) => {
+    res.json({ publicKey: PUSH_PUBLIC_KEY || null });
+});
+
+// This device wants pushes (again): { endpoint, keys: { p256dh, auth }, kinds?: { plan, digest, messages, social } }.
+// Also called on every start of the app, so a renewed address or another account on the device
+// is picked up. Kinds not sent stay as they were (all on for a new device). Answers { kinds }.
+app.put("/api/push/subscription", async (req, res) => {
+    const userId = req.user.userId;
+    const { endpoint, keys, kinds } = req.body ?? {};
+    if (!validEndpoint(endpoint)) return invalidInput(res, "endpoint");
+    if (!validPushKey(keys?.p256dh, 200) || !validPushKey(keys?.auth, 100)) return invalidInput(res, "keys");
+    if (kinds !== undefined && (typeof kinds !== "object" || kinds === null || Object.entries(kinds).some(([kind, on]) => !PUSH_KINDS.includes(kind) || typeof on !== "boolean"))) {
+        return invalidInput(res, "kinds");
+    }
+    const wanted = PUSH_KINDS.map(kind => kinds?.[kind] ?? null);
+    try {
+        const saved = await pool.query(
+            `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, plan, digest, messages, social)
+            VALUES ($1, $2, $3, $4, COALESCE($5, true), COALESCE($6, true), COALESCE($7, true), COALESCE($8, true))
+            ON CONFLICT (endpoint) DO UPDATE SET user_id = EXCLUDED.user_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth,
+                plan = COALESCE($5, push_subscriptions.plan), digest = COALESCE($6, push_subscriptions.digest),
+                messages = COALESCE($7, push_subscriptions.messages), social = COALESCE($8, push_subscriptions.social),
+                updated_at = now()
+            RETURNING ${PUSH_KINDS.join(", ")}`,
+            [userId, endpoint, keys.p256dh, keys.auth, ...wanted]
+        );
+        // a few devices per account: the ones not seen for the longest go
+        await pool.query(
+            `DELETE FROM push_subscriptions WHERE user_id = $1 AND id NOT IN (
+                SELECT id FROM push_subscriptions WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2)`,
+            [userId, PUSH_MAX_DEVICES]
+        );
+        res.json({ kinds: pushKindsJson(saved.rows[0]) });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// This device turns them off (or signs out): { endpoint }. Answers the same when it wasn't there.
+app.delete("/api/push/subscription", async (req, res) => {
+    const endpoint = req.body?.endpoint;
+    if (!validEndpoint(endpoint)) return invalidInput(res, "endpoint");
+    try {
+        await pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1 AND user_id = $2", [endpoint, req.user.userId]);
+        res.json({ subscribed: false });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// A test notification to this device: { endpoint }. 404 when it isn't signed up (any more).
+const pushTestLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 5,
+    keyGenerator: (req) => `user:${req.user.userId}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many requests, please try again later", code: "RATE_LIMITED" },
+});
+
+app.post("/api/push/test", pushTestLimiter, async (req, res) => {
+    const endpoint = req.body?.endpoint;
+    if (!validEndpoint(endpoint)) return invalidInput(res, "endpoint");
+    try {
+        const result = await pool.query(
+            `SELECT push_subscriptions.id, push_subscriptions.user_id, push_subscriptions.endpoint, push_subscriptions.p256dh,
+                push_subscriptions.auth, users.language
+            FROM push_subscriptions JOIN users ON users.id = push_subscriptions.user_id
+            WHERE push_subscriptions.endpoint = $1 AND push_subscriptions.user_id = $2`,
+            [endpoint, req.user.userId]
+        );
+        const device = result.rows[0];
+        if (!device) return res.status(404).json({ error: "This device is not signed up", code: "NOT_SUBSCRIBED" });
+        const en = device.language === "en";
+        const sent = await deliver(pool, device, "plan", {
+            title: "Quidey",
+            body: en ? "Notifications work on this device." : "Benachrichtigungen kommen auf diesem Gerät an.",
+            url: "/settings#app",
+            tag: "test",
+        });
+        if (!sent) return res.status(502).json({ error: "The push service refused it", code: "PUSH_FAILED" });
+        res.json({ sent: true });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
 // Unknown routes, and errors no route handled (e.g. invalid JSON): short JSON answers,
 // never Express's HTML page with a stack trace
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
@@ -5196,6 +5332,8 @@ const server = http.createServer(app);
 realtime.initRealtime(server, { allowedOrigins, tokenAlgorithm: TOKEN_ALGORITHM });
 // reminders by mail, checked once a minute
 startReminderMails(pool, limitFromEnv("REMINDER_CHECK_MS", 60 * 1000));
+// push notifications for tasks and events at their time, and the morning overview
+startPushSchedule(pool, limitFromEnv("REMINDER_CHECK_MS", 60 * 1000));
 // events that are over are ticked off, also checked once a minute (first right away)
 closePastEvents();
 setInterval(closePastEvents, limitFromEnv("EVENT_CHECK_MS", 60 * 1000)).unref();
