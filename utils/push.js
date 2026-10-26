@@ -26,6 +26,11 @@ const PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
 const SUBJECT = process.env.VAPID_SUBJECT || "mailto:contact@quidey.com";
 const ENABLED = Boolean(PUBLIC_KEY && PRIVATE_KEY);
 if (ENABLED) webpush.setVapidDetails(SUBJECT, PUBLIC_KEY, PRIVATE_KEY);
+// on the real server that means nobody can turn notifications on (the app says "the server
+// isn't sending any"): say so where the operator looks
+else if (process.env.NODE_ENV === "production") {
+    console.warn("VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY are not set: no push notifications are sent. Make a pair with `npx web-push generate-vapid-keys`.");
+}
 
 const KINDS = ["plan", "digest", "messages", "social"];
 const MAX_DEVICES = 10;
