@@ -77,7 +77,8 @@ async function sendVerificationMail(to, rawToken, language) {
 
 const REMINDER = {
     de: {
-        subject: (name, time) => `Erinnerung: ${name} um ${time}`,
+        subject: (name, time) => (time ? `Erinnerung: ${name} um ${time}` : `Erinnerung: ${name}`),
+        allDay: "ganztägig",
         preheader: (when) => `${when} – deine Erinnerung von Quidey`,
         intro: "Kleine Erinnerung – das steht gleich an:",
         when: "Wann",
@@ -90,7 +91,8 @@ const REMINDER = {
         why: "Du bekommst diese Mail, weil bei dieser Aufgabe „Auch per E-Mail erinnern“ eingeschaltet ist. Ausschalten kannst du das in der Aufgabe unter „Weitere Optionen“.",
     },
     en: {
-        subject: (name, time) => `Reminder: ${name} at ${time}`,
+        subject: (name, time) => (time ? `Reminder: ${name} at ${time}` : `Reminder: ${name}`),
+        allDay: "all day",
         preheader: (when) => `${when} – your reminder from Quidey`,
         intro: "A quick reminder – this is coming up:",
         when: "When",
@@ -127,13 +129,13 @@ function addMinutes(time, minutes) {
 }
 
 // A task's reminder, to its owner.
-// task: { name, due ("YYYY-MM-DD"), due_time ("HH:MM"), duration_minutes, location, link, description }
+// task: { name, due ("YYYY-MM-DD"), due_time ("HH:MM", null: the whole day), duration_minutes, location, link, description }
 // user: { email, language, timezone }
 async function sendReminderMail(task, user) {
     const lang = langOf(user.language);
     const copy = REMINDER[lang];
     const time = task.due_time;
-    const range = task.duration_minutes ? `${time} – ${addMinutes(time, task.duration_minutes)}` : time;
+    const range = !time ? copy.allDay : task.duration_minutes ? `${time} – ${addMinutes(time, task.duration_minutes)}` : time;
     const when = `${dayText(task.due, user.timezone, lang)}, ${range}`;
     const open = `${FRONTEND_URL}/calendar`;
 
@@ -204,14 +206,19 @@ async function sendContactMail({ name, email, message }) {
     });
 }
 
-const FEEDBACK_LABELS = { idea: "Idee", bug: "Fehler", praise: "Lob", other: "Sonstiges" };
+const FEEDBACK_LABELS = { idea: "Idee", bug: "Fehler", praise: "Lob", other: "Sonstiges", rating: "Bewertung" };
 
-// Feedback from a signed-in user to CONTACT_TO; "Antworten" goes to the user
-async function sendFeedbackMail({ category, message, page, user }) {
+// "Gefällt dir Quidey?" from the app: "Ja, ★★★★☆ (4/5)" or "Nicht wirklich"
+const ratingText = (rating) => (rating.liked ? `Ja, ${"★".repeat(rating.stars)}${"☆".repeat(5 - rating.stars)} (${rating.stars}/5)` : "Nicht wirklich");
+
+// Feedback from a signed-in user to CONTACT_TO; "Antworten" goes to the user.
+// rating: { liked, stars } for the category "rating", else null
+async function sendFeedbackMail({ category, message, page, rating = null, user }) {
     const to = process.env.CONTACT_TO;
     const label = FEEDBACK_LABELS[category] ?? category;
     const who = `${user.display_name || user.username} (@${user.username})`;
-    const text = `Feedback aus Quidey: ${label}\n\nVon: ${who}\nE-Mail: ${user.email}\n${page ? `Seite: ${page}\n` : ""}\n${message}\n`;
+    const verdict = rating ? ratingText(rating) : "";
+    const text = `Feedback aus Quidey: ${label}\n\nVon: ${who}\nE-Mail: ${user.email}\n${page ? `Seite: ${page}\n` : ""}${verdict ? `Gefällt Quidey: ${verdict}\n` : ""}\n${message}\n`;
 
     if (!transporter || !to) {
         console.log(`[DEV] Feedback${to ? "" : " (CONTACT_TO is not set)"}:\n${text}`);
@@ -223,16 +230,18 @@ async function sendFeedbackMail({ category, message, page, user }) {
         { label: "E-Mail", value: escapeHtml(user.email) },
     ];
     if (page) details.push({ label: "Seite", value: escapeHtml(page) });
-    details.push({ label: "Nachricht", value: textToHtml(message) });
+    if (verdict) details.push({ label: "Gefällt Quidey", value: escapeHtml(verdict) });
+    if (message) details.push({ label: "Nachricht", value: textToHtml(message) });
+    const summary = message || verdict;
 
     await send({
         from: "Quidey Feedback",
         to,
         replyTo: { name: user.display_name || user.username, address: user.email },
-        subject: `Feedback (${label}): ${message.replace(/\s+/g, " ").slice(0, 60)}`,
+        subject: `Feedback (${label}): ${summary.replace(/\s+/g, " ").slice(0, 60)}`,
         text,
         html: renderMail({
-            preheader: message.slice(0, 120),
+            preheader: summary.slice(0, 120),
             heading: `Feedback: ${label}`,
             details,
             after: ["Mit „Antworten“ schreibst du direkt an die Person."],

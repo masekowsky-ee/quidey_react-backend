@@ -326,6 +326,18 @@ function cleanMinutes(value, min, max) {
     return Number.isInteger(minutes) && minutes >= min && minutes <= max ? minutes : undefined;
 }
 
+// A task's reminders: minutes before its start (0: at the start, up to a week), at most
+// REMINDERS_MAX, given back sorted and without doubles; [] for none, undefined when invalid
+const REMINDERS_MAX = 5;
+function cleanReminders(value) {
+    if (value === null) return [];
+    if (!Array.isArray(value)) return undefined;
+    const minutes = value.map((item) => cleanMinutes(item, 0, MINUTES_PER_WEEK));
+    if (minutes.some((item) => item === null || item === undefined)) return undefined;
+    const unique = [...new Set(minutes)].sort((a, b) => a - b);
+    return unique.length <= REMINDERS_MAX ? unique : undefined;
+}
+
 // A web address. Only http(s): the app shows it as a link, so "javascript:" and the like
 // must never get in. null when empty, undefined when invalid
 function cleanLink(value) {
@@ -359,7 +371,7 @@ const repeatDueSql = (t, n) => `(${t}.due + ${n} * CASE ${t}.repeat
 const TASK_EXTRAS = {
     due_time: cleanTime,
     duration_minutes: (value) => cleanMinutes(value, 1, MINUTES_PER_WEEK),
-    reminder_minutes: (value) => cleanMinutes(value, 0, MINUTES_PER_WEEK),
+    reminders: cleanReminders,
     location: (value) => cleanText(value, TASK_LOCATION_MAX),
     link: cleanLink,
     details: (value) => cleanText(value, TASK_DETAILS_MAX),
@@ -377,6 +389,12 @@ const TASK_EXTRAS = {
 // the fields only a task's owner can change (the others' values are ignored)
 const OWNER_ONLY_FIELDS = ["reminder_email", "kind", "event_type_id"];
 function readTaskExtras(body, fields = TASK_EXTRAS) {
+    // an app from before several reminders sends one as reminder_minutes (null: none)
+    if (fields.reminders && body?.reminders === undefined && body?.reminder_minutes !== undefined) {
+        const one = cleanMinutes(body.reminder_minutes, 0, MINUTES_PER_WEEK);
+        if (one === undefined) return { error: "reminder_minutes" };
+        body = { ...body, reminders: one === null ? [] : [one] };
+    }
     const values = {};
     for (const [field, clean] of Object.entries(fields)) {
         if (body?.[field] === undefined) continue;
@@ -418,7 +436,7 @@ const accessibleTaskIds = (param) =>
 // Add conditions with "AND ...".
 const TASK_SELECT = `
     SELECT tasks.id, tasks.name, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
-        tasks.duration_minutes, tasks.reminder_minutes, tasks.location, tasks.link, tasks.details,
+        tasks.duration_minutes, tasks.reminders, tasks.location, tasks.link, tasks.details,
         tasks.description, tasks.prio, tasks.done, tasks.created_at, tasks.user_id,
         tasks.repeat, tasks.repeat_left,
         ARRAY(SELECT to_char(day, 'YYYY-MM-DD') FROM unnest(tasks.repeat_skip) AS day ORDER BY day) AS repeat_skip,
@@ -457,7 +475,10 @@ function toTaskResponse(row, userId) {
         due: row.due,
         due_time: row.due_time,
         duration_minutes: row.duration_minutes,
-        reminder_minutes: row.reminder_minutes,
+        // minutes before the start, sorted; a task without a time starts at my all-day time
+        reminders: row.reminders,
+        // for apps from before several reminders: the one closest to the start
+        reminder_minutes: row.reminders[0] ?? null,
         location: row.location,
         link: row.link,
         details: row.details,
@@ -705,11 +726,15 @@ app.get("/api/sessions/:id/tasks", async (req, res) => {
 // Who I am and whether I may use the app:
 // { userId, username, isPro (may use the app: pro, tester or admin), isAdmin,
 //   isTester (sees features not released to everyone yet; admins always do),
-//   adminPendingCount (admins only: open beta requests), betaRequest: { status, reason, createdAt } | null }
+//   adminPendingCount (admins only: open beta requests), betaRequest: { status, reason, createdAt } | null,
+//   allDayReminderTime: "HH:MM", when tasks without a time are reminded (see PUT /api/users/reminder-time),
+//   tourSeen: false while a new account hasn't closed the intro tour yet (see PUT /api/users/tour-seen) }
 app.get("/api/me" , authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT users.username, users.is_pro, users.is_admin, users.is_tester,
+                to_char(users.allday_reminder_time, 'HH24:MI') AS allday_reminder_time,
+                users.tour_seen_at IS NOT NULL AS tour_seen,
                 beta_access_requests.status, beta_access_requests.reason, beta_access_requests.created_at,
                 CASE WHEN users.is_admin
                     THEN (SELECT count(*) FROM beta_access_requests WHERE status = 'pending')::int END AS pending_count
@@ -729,6 +754,8 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
             isTester: hasTesterAccess(row),
             ...(row.is_admin ? { adminPendingCount: row.pending_count } : {}),
             betaRequest: row.status ? { status: row.status, reason: row.reason, createdAt: row.created_at } : null,
+            allDayReminderTime: row.allday_reminder_time,
+            tourSeen: row.tour_seen,
         });
     } catch (err) {
         serverError(res, err);
@@ -1387,7 +1414,9 @@ app.post("/api/login", loginAccountLimiter, async (req, res) => {
 // ---------- Feedback ----------
 // { category, message } from a signed-in user, mailed to the operator (CONTACT_TO) with who
 // sent it, so a reply can go to their address. At most 10 per hour.
-const FEEDBACK_CATEGORIES = ["idea", "bug", "praise", "other"];
+// "rating" is the app's question to new users "Gefällt dir Quidey?": { liked: true, stars: 1-5,
+// message optional } or { liked: false, message (what isn't good yet) }.
+const FEEDBACK_CATEGORIES = ["idea", "bug", "praise", "other", "rating"];
 const feedbackLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
     limit: limitFromEnv("RATE_LIMIT_FEEDBACK", 10),
@@ -1404,7 +1433,16 @@ app.post("/api/feedback", authenticateToken, feedbackLimiter, async (req, res) =
     const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
     const page = typeof req.body?.page === "string" ? req.body.page.slice(0, 200) : "";
     if (!FEEDBACK_CATEGORIES.includes(category)) return res.status(400).json({ error: "Invalid category", code: "INVALID_CATEGORY" });
-    if (message.length < 5 || message.length > 5000) {
+    let rating = null;
+    if (category === "rating") {
+        const { liked, stars } = req.body;
+        if (typeof liked !== "boolean") return invalidInput(res, "liked");
+        if (liked && !(Number.isInteger(stars) && stars >= 1 && stars <= 5)) return invalidInput(res, "stars");
+        rating = { liked, stars: liked ? stars : null };
+    }
+    // a "yes" with its stars needs no words
+    const minLength = rating?.liked ? 0 : 5;
+    if (message.length < minLength || message.length > 5000) {
         return res.status(400).json({ error: "Feedback must be 5-5000 characters", code: "INVALID_MESSAGE" });
     }
     // where an answer goes: the account's address unless another one is given
@@ -1415,7 +1453,7 @@ app.post("/api/feedback", authenticateToken, feedbackLimiter, async (req, res) =
 
     try {
         const user = (await pool.query("SELECT username, display_name, email FROM users WHERE id = $1", [req.user.userId])).rows[0];
-        await sendFeedbackMail({ category, message, page, user: replyTo ? { ...user, email: replyTo } : user });
+        await sendFeedbackMail({ category, message, page, rating, user: replyTo ? { ...user, email: replyTo } : user });
         res.json({ sent: true });
     } catch (err) {
         console.error("Feedback mail failed:", err);
@@ -1968,6 +2006,30 @@ app.put("/api/users/locale", async (req, res) => {
     }
 });
 
+// When tasks without a time of day are reminded: { time: "HH:MM" } in my time zone. Their
+// reminders count from it ("at the start" = that time on the day, "1 day before" = the day
+// before), for pushes, mails and in the app. Answers { allDayReminderTime }.
+app.put("/api/users/reminder-time", async (req, res) => {
+    const time = cleanTime(req.body?.time);
+    if (!time) return invalidInput(res, "time");
+    try {
+        await pool.query("UPDATE users SET allday_reminder_time = $1 WHERE id = $2", [time, req.user.userId]);
+        res.json({ allDayReminderTime: time });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// The intro tour was closed (finished or skipped): it doesn't open by itself again, on no device
+app.put("/api/users/tour-seen", async (req, res) => {
+    try {
+        await pool.query("UPDATE users SET tour_seen_at = COALESCE(tour_seen_at, now()) WHERE id = $1", [req.user.userId]);
+        res.json({ tourSeen: true });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
 // Change my password. Needs the current one, so a stolen session can't lock the owner out;
 // failed attempts count towards the same limit as logins.
 app.put("/api/users/password", authLimiter, async (req, res) => {
@@ -2187,10 +2249,10 @@ async function createNextRepeat(db, taskId) {
             LIMIT 1
         )
         INSERT INTO tasks (name, due, description, prio, user_id, due_time, duration_minutes,
-            reminder_minutes, location, link, details, repeat, repeat_from_id, color, reminder_email, kind, event_type_id,
+            reminders, location, link, details, repeat, repeat_from_id, color, reminder_email, kind, event_type_id,
             repeat_left, repeat_skip)
         SELECT source.name, next_due.due, source.description, source.prio, source.user_id, source.due_time,
-            source.duration_minutes, source.reminder_minutes, source.location, source.link, source.details,
+            source.duration_minutes, source.reminders, source.location, source.link, source.details,
             source.repeat, source.id, source.color, source.reminder_email, source.kind, source.event_type_id,
             source.repeat_left - next_due.n,
             ARRAY(SELECT day FROM unnest(source.repeat_skip) AS day WHERE day > next_due.due)
@@ -3435,14 +3497,138 @@ function notifyInvites(userIds) {
     for (const id of userIds) realtime.toUser(id, "invites:changed", {});
 }
 
+// ---------- sub-groups in sessions and families (experimental, testers) ----------
+// A session's or a family's entries sorted into named groups ("Kapitel 1", "Einkauf").
+// Everybody sees them (the session / family carries `groups`, each entry its `groupId`), only
+// testers make or delete them and put entries in (routes under /api/tester, `group_id` on the
+// entry routes). Deleting a group keeps its entries.
+const SUB_GROUP_NAME_MAX = 40;
+const SUB_GROUPS_MAX = 20;
+const SUB_GROUPS = {
+    session: { table: "shared_session_groups", parent: "session_id" },
+    family: { table: "family_groups", parent: "family_id" },
+};
+
+// [{ id, name }] of one session / family, by name
+async function loadSubGroups(kind, parentId) {
+    const { table, parent } = SUB_GROUPS[kind];
+    const result = await pool.query(`SELECT id, name FROM ${table} WHERE ${parent} = $1 ORDER BY lower(name), id`, [parentId]);
+    return result.rows;
+}
+
+// The sub-group an entry goes into: `group_id` from a request, checked to be one of this
+// session's / family's. { value } (null: none), {} when it wasn't sent, { forbidden } for
+// somebody who isn't a tester, or { error }.
+async function readSubGroup(req, kind, parentId) {
+    if (req.body?.group_id === undefined) return {};
+    if (!hasTesterAccess(req.account)) return { forbidden: true };
+    if (req.body.group_id === null || req.body.group_id === "") return { value: null };
+    const id = idParam(req.body.group_id);
+    if (!id) return { error: "group_id" };
+    const { table, parent } = SUB_GROUPS[kind];
+    const found = await pool.query(`SELECT 1 FROM ${table} WHERE id = $1 AND ${parent} = $2`, [id, parentId]);
+    return found.rows.length > 0 ? { value: id } : { error: "group_id" };
+}
+
+const testerRequired = (res) => fail(res, 403, "TESTER_REQUIRED", "Only for testers");
+
+// { name }: a new sub-group. Answers the request itself and resolves to false when it can't be made.
+async function addSubGroup(res, kind, parentId, userId, body) {
+    const name = cleanText(body?.name, SUB_GROUP_NAME_MAX);
+    if (!name) {
+        invalidInput(res, "name");
+        return false;
+    }
+    const { table, parent } = SUB_GROUPS[kind];
+    const existing = await pool.query(
+        `SELECT count(*)::int AS n, COALESCE(bool_or(lower(name) = lower($2)), false) AS taken FROM ${table} WHERE ${parent} = $1`,
+        [parentId, name]
+    );
+    if (existing.rows[0].taken) {
+        fail(res, 409, "SUB_GROUP_EXISTS", "There is a group with this name already");
+        return false;
+    }
+    if (existing.rows[0].n >= SUB_GROUPS_MAX) {
+        fail(res, 409, "SUB_GROUPS_FULL", `At most ${SUB_GROUPS_MAX} groups`);
+        return false;
+    }
+    await pool.query(`INSERT INTO ${table} (${parent}, name, created_by) VALUES ($1, $2, $3)`, [parentId, name, userId]);
+    return true;
+}
+
+// Deletes a sub-group (its entries stay, without a group). Answers 404 itself and resolves to false.
+async function removeSubGroup(res, kind, parentId, groupIdValue) {
+    const { table, parent } = SUB_GROUPS[kind];
+    const groupId = idParam(groupIdValue);
+    const removed = groupId && await pool.query(`DELETE FROM ${table} WHERE id = $1 AND ${parent} = $2 RETURNING id`, [groupId, parentId]);
+    if (!removed || removed.rows.length === 0) {
+        fail(res, 404, "SUB_GROUP_NOT_FOUND", "Group not found");
+        return false;
+    }
+    return true;
+}
+
+app.post("/api/tester/shared-sessions/:id/groups", async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const session = await requireOpenSession(req, res);
+        if (!session) return;
+        if (!await addSubGroup(res, "session", session.sessionId, userId, req.body)) return;
+        await sendSharedSession(res, session.sessionId, userId, 201);
+        await notifySession(session.sessionId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.delete("/api/tester/shared-sessions/:id/groups/:groupId", async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const session = await requireOpenSession(req, res);
+        if (!session) return;
+        if (!await removeSubGroup(res, "session", session.sessionId, req.params.groupId)) return;
+        await sendSharedSession(res, session.sessionId, userId);
+        await notifySession(session.sessionId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.post("/api/tester/families/:id/groups", async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const family = await requireFamily(req, res);
+        if (!family) return;
+        if (!await addSubGroup(res, "family", family.familyId, userId, req.body)) return;
+        await sendFamily(res, family.familyId, userId, 201);
+        await notifyFamily(family.familyId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.delete("/api/tester/families/:id/groups/:groupId", async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const family = await requireFamily(req, res);
+        if (!family) return;
+        if (!await removeSubGroup(res, "family", family.familyId, req.params.groupId)) return;
+        await sendFamily(res, family.familyId, userId);
+        await notifyFamily(family.familyId);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
 // Everything the session page shows:
 // { id, name, createdAt, endedAt, owner, isOwner, me (my user id),
 //   people: [{ user, status: 'joined' | 'invited' | 'left', isOwner, joinedAt, workingOn, totalMs }],
-//   tasks:  [{ id, name, description, done, addedBy, assignee, sourceTaskId, createdAt, totalMs, time: [{ userId, ms }] }],
+//   tasks:  [{ id, name, description, done, addedBy, assignee, sourceTaskId, createdAt, groupId, totalMs, time: [{ userId, ms }] }],
+//   groups: [{ id, name }] (sub-groups, see above),
 //   events: [{ id, type, user, target, taskId, taskName, text, createdAt }] (oldest first, the last EVENT_LIMIT) }
 // 'left' people are no longer members but booked time, so they still show up in the totals.
 async function loadSharedSession(sessionId, userId) {
-    const [session, members, tasks, times, events] = await Promise.all([
+    const [session, members, tasks, times, events, groups] = await Promise.all([
         pool.query(
             `SELECT shared_sessions.id, shared_sessions.name, shared_sessions.created_at, shared_sessions.ended_at,
                 users.id AS owner_id, users.username AS owner_username, users.display_name AS owner_display_name
@@ -3468,7 +3654,7 @@ async function loadSharedSession(sessionId, userId) {
                 shared_session_tasks.due, to_char(shared_session_tasks.due_time, 'HH24:MI') AS due_time,
                 shared_session_tasks.prio, shared_session_tasks.duration_minutes, shared_session_tasks.location,
                 shared_session_tasks.link, shared_session_tasks.details, shared_session_tasks.color,
-                shared_session_tasks.kind,
+                shared_session_tasks.kind, shared_session_tasks.group_id,
                 users.id AS adder_id, users.username AS adder_username, users.display_name AS adder_display_name,
                 assignee.id AS assignee_id, assignee.username AS assignee_username, assignee.display_name AS assignee_display_name
             FROM shared_session_tasks
@@ -3503,6 +3689,7 @@ async function loadSharedSession(sessionId, userId) {
             ) AS latest ORDER BY id`,
             [sessionId, EVENT_LIMIT]
         ),
+        loadSubGroups("session", sessionId),
     ]);
 
     const row = session.rows[0];
@@ -3562,10 +3749,12 @@ async function loadSharedSession(sessionId, userId) {
                 // only the person who shared it can do anything with their own task's id
                 sourceTaskId: task.adder_id === userId ? task.source_task_id : null,
                 createdAt: task.created_at,
+                groupId: task.group_id,
                 totalMs: time.reduce((sum, t) => sum + t.ms, 0),
                 time,
             };
         }),
+        groups,
         events: events.rows.map(event => ({
             id: event.id,
             type: event.type,
@@ -3640,7 +3829,8 @@ app.get("/api/shared-sessions", async (req, res) => {
 });
 
 // The tasks of all running sessions I joined, for the solo home page (one group per session):
-// [{ id, name, me, tasks: [{ id, name, description, done, assignee, myMs, totalMs }] }] (no events)
+// [{ id, name, me, groups: [{ id, name }], tasks: [{ id, name, description, done, assignee, addedBy,
+//   createdAt, groupId, myMs, totalMs }] }] (no events)
 // Registered before /:id, which would otherwise take "my-tasks" for an id.
 app.get("/api/shared-sessions/my-tasks", async (req, res) => {
     const userId = req.user.userId;
@@ -3648,6 +3838,8 @@ app.get("/api/shared-sessions/my-tasks", async (req, res) => {
         const result = await pool.query(
             `SELECT shared_sessions.id AS session_id, shared_sessions.name AS session_name,
                 shared_session_tasks.id, shared_session_tasks.name, shared_session_tasks.description, shared_session_tasks.done,
+                shared_session_tasks.created_at, shared_session_tasks.group_id,
+                adder.id AS adder_id, adder.username AS adder_username, adder.display_name AS adder_display_name,
                 assignee.id AS assignee_id, assignee.username AS assignee_username, assignee.display_name AS assignee_display_name,
                 COALESCE((SELECT time_ms FROM shared_session_time
                     WHERE task_id = shared_session_tasks.id AND user_id = $1), 0) AS my_ms,
@@ -3659,6 +3851,7 @@ app.get("/api/shared-sessions/my-tasks", async (req, res) => {
             LEFT JOIN shared_session_tasks ON shared_session_tasks.session_id = shared_sessions.id
                 AND shared_session_tasks.kind = 'task'
             LEFT JOIN users AS assignee ON assignee.id = shared_session_tasks.assignee_id
+            LEFT JOIN users AS adder ON adder.id = shared_session_tasks.added_by
             WHERE shared_session_members.user_id = $1 AND shared_session_members.status = 'joined'
                 AND shared_sessions.ended_at IS NULL
             ORDER BY lower(shared_sessions.name), shared_sessions.id, shared_session_tasks.id`,
@@ -3667,7 +3860,7 @@ app.get("/api/shared-sessions/my-tasks", async (req, res) => {
         const sessions = new Map();
         for (const row of result.rows) {
             if (!sessions.has(row.session_id)) {
-                sessions.set(row.session_id, { id: row.session_id, name: row.session_name, me: userId, tasks: [] });
+                sessions.set(row.session_id, { id: row.session_id, name: row.session_name, me: userId, groups: [], tasks: [] });
             }
             if (row.id === null) continue; // a session without tasks yet
             sessions.get(row.session_id).tasks.push({
@@ -3676,10 +3869,18 @@ app.get("/api/shared-sessions/my-tasks", async (req, res) => {
                 description: row.description,
                 done: row.done,
                 assignee: row.assignee_id ? publicUser(row, "assignee_") : null,
+                addedBy: row.adder_id ? publicUser(row, "adder_") : null,
+                createdAt: row.created_at,
+                groupId: row.group_id,
                 myMs: Number(row.my_ms),
                 totalMs: Number(row.total_ms),
             });
         }
+        const groups = await pool.query(
+            "SELECT id, name, session_id FROM shared_session_groups WHERE session_id = ANY($1) ORDER BY lower(name), id",
+            [[...sessions.keys()]]
+        );
+        for (const group of groups.rows) sessions.get(group.session_id).groups.push({ id: group.id, name: group.name });
         res.json([...sessions.values()]);
     } catch (err) {
         serverError(res, err);
@@ -3843,12 +4044,16 @@ app.delete("/api/shared-sessions/:id/members/:userId", async (req, res) => {
 });
 
 // Add a task: { taskId } shares one of my own tasks (with its details), { name, ... } creates
-// a new one; besides the name every field of SHARED_TASK_FIELDS is optional.
+// a new one; besides the name every field of SHARED_TASK_FIELDS is optional. group_id (testers):
+// the session's sub-group it goes into.
 app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
     const userId = req.user.userId;
     try {
         const session = await requireOpenSession(req, res);
         if (!session) return;
+        const subGroup = await readSubGroup(req, "session", session.sessionId);
+        if (subGroup.forbidden) return testerRequired(res);
+        if (subGroup.error) return invalidInput(res, subGroup.error);
 
         let task;
         if (req.body?.taskId !== undefined) {
@@ -3874,6 +4079,7 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
             if (fields.values.kind === "event" && !fields.values.due) return invalidInput(res, "due");
             task = { name, fields: fields.values, sourceTaskId: null };
         }
+        if ("value" in subGroup) task.fields.group_id = subGroup.value;
 
         const columns = ["session_id", "name", "added_by", "source_task_id", ...Object.keys(task.fields)];
         const values = [session.sessionId, task.name, userId, task.sourceTaskId, ...Object.values(task.fields)];
@@ -3895,9 +4101,10 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
     }
 });
 
-// Change a task: { done?, assigneeId? (a member's id, or null for nobody), name?, and any of
-// SHARED_TASK_FIELDS (null clears one) }; what isn't sent stays as it is. Every member may change
-// them. Done is also set on the personal task it was shared from, the details are not.
+// Change a task: { done?, assigneeId? (a member's id, or null for nobody), name?, group_id?
+// (testers), and any of SHARED_TASK_FIELDS (null clears one) }; what isn't sent stays as it is.
+// Every member may change them. Done is also set on the personal task it was shared from, the
+// details are not.
 app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
     const userId = req.user.userId;
     const taskId = idParam(req.params.taskId);
@@ -3910,7 +4117,8 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
     if (done !== undefined && typeof done !== "boolean") return fail(res, 400, "DONE_REQUIRED", "done must be true or false");
     if (name === null || (req.body?.name !== undefined && name === undefined)) return invalidInput(res, "name");
     if (fields.error) return invalidInput(res, fields.error);
-    if (done === undefined && !changesAssignee && name === undefined && Object.keys(fields.values).length === 0) {
+    if (done === undefined && !changesAssignee && name === undefined && Object.keys(fields.values).length === 0
+        && req.body?.group_id === undefined) {
         return fail(res, 400, "NOTHING_TO_CHANGE", "Send done, assigneeId or a field");
     }
     if (changesAssignee && req.body.assigneeId !== null && !assigneeId) return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
@@ -3925,6 +4133,10 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
         );
         if (before.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
         const task = before.rows[0];
+        const subGroup = await readSubGroup(req, "session", session.sessionId);
+        if (subGroup.forbidden) return testerRequired(res);
+        if (subGroup.error) return invalidInput(res, subGroup.error);
+        if ("value" in subGroup) fields.values.group_id = subGroup.value;
 
         // a time of day needs a day; taking the day away takes the time along
         const due = "due" in fields.values ? fields.values.due : task.due;
@@ -4300,11 +4512,12 @@ const toFamilyMessage = (row) => ({
 //   note: { text, updatedAt, updatedBy } | null,
 //   people: [{ user, status: 'joined' | 'invited', isOwner, joinedAt, online }],
 //   tasks:  [{ id, name, description, done, due, due_time, prio, duration_minutes, location, link,
-//              details, color, addedBy, assignee, createdAt }],
+//              details, color, addedBy, assignee, createdAt, groupId }],
+//   groups: [{ id, name }] (sub-groups, see loadSubGroups),
 //   week:   { weekStart, people: [{ userId, xp, focusMin, streak }] } (joined members who show
 //           their statistics, and me) }
 async function loadFamily(familyId, userId) {
-    const [family, members, tasks] = await Promise.all([
+    const [family, members, tasks, groups] = await Promise.all([
         pool.query(
             `SELECT families.id, families.name, families.created_at, families.emoji, families.color,
                 families.note, families.note_updated_at,
@@ -4328,7 +4541,7 @@ async function loadFamily(familyId, userId) {
             `SELECT family_tasks.id, family_tasks.name, family_tasks.description, family_tasks.done,
                 family_tasks.due, to_char(family_tasks.due_time, 'HH24:MI') AS due_time, family_tasks.prio,
                 family_tasks.duration_minutes, family_tasks.location, family_tasks.link, family_tasks.details,
-                family_tasks.color, family_tasks.created_at,
+                family_tasks.color, family_tasks.created_at, family_tasks.group_id,
                 users.id AS adder_id, users.username AS adder_username, users.display_name AS adder_display_name,
                 assignee.id AS assignee_id, assignee.username AS assignee_username, assignee.display_name AS assignee_display_name
             FROM family_tasks LEFT JOIN users ON users.id = family_tasks.added_by
@@ -4337,6 +4550,7 @@ async function loadFamily(familyId, userId) {
             ORDER BY family_tasks.due NULLS LAST, family_tasks.due_time NULLS FIRST, family_tasks.id`,
             [familyId]
         ),
+        loadSubGroups("family", familyId),
     ]);
     const row = family.rows[0];
     if (!row) return null;
@@ -4392,7 +4606,9 @@ async function loadFamily(familyId, userId) {
             addedBy: task.adder_id ? publicUser(task, "adder_") : null,
             assignee: task.assignee_id ? publicUser(task, "assignee_") : null,
             createdAt: task.created_at,
+            groupId: task.group_id,
         })),
+        groups,
     };
 }
 
@@ -4635,7 +4851,7 @@ app.delete(`${familyBase}/:id/members/:userId`, async (req, res) => {
 });
 
 // A calendar entry (or, without a day, an item on the family's list):
-// { name, assignee_id?, and any of SHARED_TASK_FIELDS }
+// { name, assignee_id?, group_id? (testers: a sub-group), and any of SHARED_TASK_FIELDS }
 app.post(`${familyBase}/:id/tasks`, async (req, res) => {
     const userId = req.user.userId;
     const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, TASK_NAME_MAX) : "";
@@ -4649,6 +4865,10 @@ app.post(`${familyBase}/:id/tasks`, async (req, res) => {
         const assignee = await familyAssignee(family.familyId, req.body);
         if (assignee.error) return invalidInput(res, assignee.error);
         if ("value" in assignee) fields.values.assignee_id = assignee.value;
+        const subGroup = await readSubGroup(req, "family", family.familyId);
+        if (subGroup.forbidden) return testerRequired(res);
+        if (subGroup.error) return invalidInput(res, subGroup.error);
+        if ("value" in subGroup) fields.values.group_id = subGroup.value;
         const columns = ["family_id", "name", "added_by", ...Object.keys(fields.values)];
         const values = [family.familyId, name, userId, ...Object.values(fields.values)];
         await pool.query(
@@ -4662,7 +4882,7 @@ app.post(`${familyBase}/:id/tasks`, async (req, res) => {
     }
 });
 
-// Change an entry: { done?, name?, assignee_id?, and any of SHARED_TASK_FIELDS (null clears one) }
+// Change an entry: { done?, name?, assignee_id?, group_id? (testers), and any of SHARED_TASK_FIELDS (null clears one) }
 app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
     const userId = req.user.userId;
     const taskId = idParam(req.params.taskId);
@@ -4672,7 +4892,8 @@ app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
     if (done !== undefined && typeof done !== "boolean") return fail(res, 400, "DONE_REQUIRED", "done must be true or false");
     if (name === null || (req.body?.name !== undefined && name === undefined)) return invalidInput(res, "name");
     if (fields.error) return invalidInput(res, fields.error);
-    if (done === undefined && name === undefined && Object.keys(fields.values).length === 0 && req.body?.assignee_id === undefined) {
+    if (done === undefined && name === undefined && Object.keys(fields.values).length === 0 && req.body?.assignee_id === undefined
+        && req.body?.group_id === undefined) {
         return fail(res, 400, "NOTHING_TO_CHANGE", "Send done, name or a field");
     }
     try {
@@ -4681,6 +4902,10 @@ app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
         const assignee = await familyAssignee(family.familyId, req.body);
         if (assignee.error) return invalidInput(res, assignee.error);
         if ("value" in assignee) fields.values.assignee_id = assignee.value;
+        const subGroup = await readSubGroup(req, "family", family.familyId);
+        if (subGroup.forbidden) return testerRequired(res);
+        if (subGroup.error) return invalidInput(res, subGroup.error);
+        if ("value" in subGroup) fields.values.group_id = subGroup.value;
         const before = await pool.query("SELECT due FROM family_tasks WHERE id = $1 AND family_id = $2", [taskId, family.familyId]);
         if (before.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
         // a time of day needs a day; taking the day away takes the time along

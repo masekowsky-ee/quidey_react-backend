@@ -9,7 +9,8 @@
 // only logged ("[DEV] Push …"), like the mails without SMTP_HOST.
 //
 // Kinds, each switched on or off per device (columns of push_subscriptions):
-//   plan      my tasks and events with a time: at the reminder if one is set, else when they start
+//   plan      my tasks and events at each of their reminders (tasks.reminders; one without a time
+//             of day counts from my all-day time, users.allday_reminder_time)
 //   digest    the morning overview of the day (DIGEST_FROM in my time zone)
 //   messages  direct messages
 //   social    friend requests, invites, tasks shared with / given to me, news from the team
@@ -57,7 +58,13 @@ const TEXTS = {
         const event = task.kind === "event";
         const where = task.location ? ` · ${task.location}` : "";
         let body;
-        if (task.reminder_minutes > 0) {
+        if (!task.due_time) {
+            // the whole day: how many days ahead it is, seen from where I am
+            const days = task.days_ahead;
+            body = event
+                ? (days <= 0 ? (en ? "Today" : "Heute") : days === 1 ? (en ? "Tomorrow" : "Morgen") : (en ? `In ${days} days` : `In ${days} Tagen`))
+                : (days <= 0 ? (en ? "Due today" : "Heute fällig") : days === 1 ? (en ? "Due tomorrow" : "Morgen fällig") : (en ? `Due in ${days} days` : `In ${days} Tagen fällig`));
+        } else if (task.reminder_minutes > 0) {
             const word = event ? (en ? "Event" : "Termin") : (en ? "Task" : "Aufgabe");
             body = en ? `${word} at ${task.due_time}, in ${ahead(task.reminder_minutes, language)}` : `${word} um ${task.due_time}, in ${ahead(task.reminder_minutes, language)}`;
         } else {
@@ -162,37 +169,46 @@ const pushLater = (pool, userIds, kind, build) => {
     pushToUsers(pool, userIds, kind, build);
 };
 
-// Tasks and events with a time whose push is due: at the reminder (reminder_minutes before the
-// start) or, without one, at the start, in the owner's time zone. Each is marked with the time it
-// was pushed for in the same statement that picks it (SKIP LOCKED), so it goes out once, and
-// again after it was moved. Only owners with a device that wants "plan".
+// Tasks and events whose push is due: at each of their reminders (tasks.reminders, minutes
+// before the start), in the owner's time zone. A task without a time of day starts at the
+// owner's all-day time (users.allday_reminder_time). Of several reminders due at once (the
+// server was down) only the latest goes out. Each task is marked with the time it was pushed
+// for in the same statement that picks it (SKIP LOCKED): a reminder goes out once, only
+// later ones follow, and after the task moved (it was pushed for a time after its new start)
+// its reminders come again. Only owners with a device that wants "plan".
 const PICK_DUE_ENTRIES = `
     UPDATE tasks SET push_sent_for = ready.push_at
     FROM (
-        SELECT tasks.id, times.push_at
+        SELECT tasks.id, times.push_at, times.minutes,
+            tasks.due - (times.push_at AT TIME ZONE starts.timezone)::date AS days_ahead
         FROM tasks
         JOIN users ON users.id = tasks.user_id
         CROSS JOIN LATERAL (
-            SELECT (tasks.due + tasks.due_time) AT TIME ZONE COALESCE(users.timezone, '${DEFAULT_TIMEZONE}') AS starts_at
+            SELECT (tasks.due + COALESCE(tasks.due_time, users.allday_reminder_time)) AT TIME ZONE COALESCE(users.timezone, '${DEFAULT_TIMEZONE}') AS starts_at,
+                COALESCE(users.timezone, '${DEFAULT_TIMEZONE}') AS timezone
         ) AS starts
         CROSS JOIN LATERAL (
-            SELECT starts.starts_at - make_interval(mins => COALESCE(tasks.reminder_minutes, 0)) AS push_at
+            SELECT starts.starts_at - make_interval(mins => reminder.minutes) AS push_at, reminder.minutes
+            FROM unnest(tasks.reminders) AS reminder(minutes)
+            WHERE starts.starts_at - make_interval(mins => reminder.minutes) <= now()
+                AND now() < starts.starts_at - make_interval(mins => reminder.minutes) + interval '${LATE_LIMIT}'
+            ORDER BY push_at DESC
+            LIMIT 1
         ) AS times
         -- an event is ticked off by the server once it's over, which for one without a length
         -- is its start: it is pushed all the same
-        WHERE (NOT tasks.done OR tasks.kind = 'event') AND tasks.due_time IS NOT NULL
+        WHERE (NOT tasks.done OR tasks.kind = 'event') AND tasks.due IS NOT NULL
             -- reminders reach at most a week ahead; a day of slack either way for the time zones
             AND tasks.due BETWEEN current_date - 2 AND current_date + 9
             AND ${APP_ACCESS_SQL}
             AND EXISTS (SELECT 1 FROM push_subscriptions WHERE push_subscriptions.user_id = tasks.user_id AND push_subscriptions.plan)
-            AND times.push_at <= now() AND now() < times.push_at + interval '${LATE_LIMIT}'
             AND now() < starts.starts_at + interval '15 minutes'
-            AND tasks.push_sent_for IS DISTINCT FROM times.push_at
+            AND (tasks.push_sent_for IS NULL OR tasks.push_sent_for < times.push_at OR tasks.push_sent_for > starts.starts_at)
         FOR UPDATE OF tasks SKIP LOCKED
     ) AS ready
     WHERE tasks.id = ready.id
-    RETURNING tasks.id, tasks.user_id, tasks.name, tasks.kind, tasks.location, tasks.reminder_minutes,
-        to_char(tasks.due_time, 'HH24:MI') AS due_time`;
+    RETURNING tasks.id, tasks.user_id, tasks.name, tasks.kind, tasks.location, ready.minutes AS reminder_minutes,
+        ready.days_ahead, to_char(tasks.due_time, 'HH24:MI') AS due_time`;
 
 async function pushDueEntries(pool) {
     const due = await pool.query(PICK_DUE_ENTRIES);

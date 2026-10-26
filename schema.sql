@@ -257,6 +257,37 @@ CREATE SEQUENCE public.families_id_seq
 ALTER SEQUENCE public.families_id_seq OWNED BY public.families.id;
 
 --
+-- Name: family_groups; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.family_groups (
+    id integer NOT NULL,
+    family_id integer NOT NULL,
+    name text NOT NULL,
+    created_by integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT family_groups_name_check CHECK (((length(name) >= 1) AND (length(name) <= 40)))
+);
+
+--
+-- Name: family_groups_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.family_groups_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: family_groups_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.family_groups_id_seq OWNED BY public.family_groups.id;
+
+--
 -- Name: family_members; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -322,6 +353,7 @@ CREATE TABLE public.family_tasks (
     added_by integer,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     assignee_id integer,
+    group_id integer,
     CONSTRAINT family_tasks_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
     CONSTRAINT family_tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
     CONSTRAINT family_tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080))))
@@ -678,6 +710,37 @@ CREATE SEQUENCE public.shared_session_events_id_seq
 ALTER SEQUENCE public.shared_session_events_id_seq OWNED BY public.shared_session_events.id;
 
 --
+-- Name: shared_session_groups; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.shared_session_groups (
+    id integer NOT NULL,
+    session_id integer NOT NULL,
+    name text NOT NULL,
+    created_by integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT shared_session_groups_name_check CHECK (((length(name) >= 1) AND (length(name) <= 40)))
+);
+
+--
+-- Name: shared_session_groups_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.shared_session_groups_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: shared_session_groups_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.shared_session_groups_id_seq OWNED BY public.shared_session_groups.id;
+
+--
 -- Name: shared_session_members; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -716,6 +779,7 @@ CREATE TABLE public.shared_session_tasks (
     details text,
     color text,
     kind text DEFAULT 'task'::text NOT NULL,
+    group_id integer,
     CONSTRAINT shared_session_tasks_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
     CONSTRAINT shared_session_tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
     CONSTRAINT shared_session_tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080)))),
@@ -853,7 +917,6 @@ CREATE TABLE public.tasks (
     user_id integer,
     due_time time without time zone,
     duration_minutes integer,
-    reminder_minutes integer,
     location text,
     link text,
     details text,
@@ -868,12 +931,13 @@ CREATE TABLE public.tasks (
     repeat_left integer,
     repeat_skip date[] DEFAULT '{}'::date[] NOT NULL,
     push_sent_for timestamp with time zone,
+    reminders integer[] DEFAULT '{}'::integer[] NOT NULL,
     CONSTRAINT tasks_color_check CHECK (((color IS NULL) OR (color = ANY (ARRAY['red'::text, 'orange'::text, 'yellow'::text, 'green'::text, 'teal'::text, 'blue'::text, 'violet'::text, 'pink'::text])))),
     CONSTRAINT tasks_due_time_needs_due_check CHECK (((due_time IS NULL) OR (due IS NOT NULL))),
     CONSTRAINT tasks_duration_minutes_check CHECK (((duration_minutes IS NULL) OR ((duration_minutes >= 1) AND (duration_minutes <= 10080)))),
     CONSTRAINT tasks_event_needs_due_check CHECK (((kind <> 'event'::text) OR (due IS NOT NULL))),
     CONSTRAINT tasks_kind_check CHECK ((kind = ANY (ARRAY['task'::text, 'event'::text]))),
-    CONSTRAINT tasks_reminder_minutes_check CHECK (((reminder_minutes IS NULL) OR ((reminder_minutes >= 0) AND (reminder_minutes <= 10080)))),
+    CONSTRAINT tasks_reminders_check CHECK (((cardinality(reminders) <= 5) AND (array_position(reminders, NULL::integer) IS NULL) AND (0 <= ALL (reminders)) AND (10080 >= ALL (reminders)))),
     CONSTRAINT tasks_repeat_check CHECK (((repeat IS NULL) OR (repeat = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text, 'yearly'::text])))),
     CONSTRAINT tasks_repeat_left_check CHECK (((repeat_left IS NULL) OR ((repeat_left >= 0) AND (repeat_left <= 1000)))),
     CONSTRAINT tasks_repeat_needs_due_check CHECK (((repeat IS NULL) OR (due IS NOT NULL)))
@@ -951,6 +1015,8 @@ CREATE TABLE public.users (
     share_activity boolean DEFAULT true NOT NULL,
     show_online boolean DEFAULT true NOT NULL,
     push_digest_on date,
+    allday_reminder_time time without time zone DEFAULT '12:00:00'::time without time zone NOT NULL,
+    tour_seen_at timestamp with time zone,
     CONSTRAINT users_avatar_emoji_check CHECK (((avatar_emoji IS NULL) OR (length(avatar_emoji) <= 16))),
     CONSTRAINT users_avatar_frame_check CHECK (((avatar_frame IS NULL) OR (avatar_frame = ANY (ARRAY['ring'::text, 'double'::text, 'dotted'::text, 'orbit'::text])))),
     CONSTRAINT users_banner_check CHECK (((banner IS NULL) OR (banner = ANY (ARRAY['gradient'::text, 'aurora'::text, 'dots'::text, 'stripes'::text, 'grid'::text, 'glow'::text, 'rings'::text, 'topo'::text, 'sky'::text])))),
@@ -1012,6 +1078,12 @@ ALTER TABLE ONLY public.event_types ALTER COLUMN id SET DEFAULT nextval('public.
 --
 
 ALTER TABLE ONLY public.families ALTER COLUMN id SET DEFAULT nextval('public.families_id_seq'::regclass);
+
+--
+-- Name: family_groups id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_groups ALTER COLUMN id SET DEFAULT nextval('public.family_groups_id_seq'::regclass);
 
 --
 -- Name: family_messages id; Type: DEFAULT; Schema: public; Owner: -
@@ -1078,6 +1150,12 @@ ALTER TABLE ONLY public.sessions ALTER COLUMN id SET DEFAULT nextval('public.ses
 --
 
 ALTER TABLE ONLY public.shared_session_events ALTER COLUMN id SET DEFAULT nextval('public.shared_session_events_id_seq'::regclass);
+
+--
+-- Name: shared_session_groups id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_groups ALTER COLUMN id SET DEFAULT nextval('public.shared_session_groups_id_seq'::regclass);
 
 --
 -- Name: shared_session_tasks id; Type: DEFAULT; Schema: public; Owner: -
@@ -1164,6 +1242,13 @@ ALTER TABLE ONLY public.event_types
 
 ALTER TABLE ONLY public.families
     ADD CONSTRAINT families_pkey PRIMARY KEY (id);
+
+--
+-- Name: family_groups family_groups_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_groups
+    ADD CONSTRAINT family_groups_pkey PRIMARY KEY (id);
 
 --
 -- Name: family_members family_members_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -1276,6 +1361,13 @@ ALTER TABLE ONLY public.sessions
 
 ALTER TABLE ONLY public.shared_session_events
     ADD CONSTRAINT shared_session_events_pkey PRIMARY KEY (id);
+
+--
+-- Name: shared_session_groups shared_session_groups_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_groups
+    ADD CONSTRAINT shared_session_groups_pkey PRIMARY KEY (id);
 
 --
 -- Name: shared_session_members shared_session_members_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -1405,6 +1497,12 @@ CREATE INDEX family_members_user_idx ON public.family_members USING btree (user_
 CREATE INDEX family_messages_family_idx ON public.family_messages USING btree (family_id, id);
 
 --
+-- Name: family_groups_family_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX family_groups_family_id_idx ON public.family_groups USING btree (family_id);
+
+--
 -- Name: family_tasks_assignee_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1415,6 +1513,12 @@ CREATE INDEX family_tasks_assignee_idx ON public.family_tasks USING btree (assig
 --
 
 CREATE INDEX family_tasks_family_idx ON public.family_tasks USING btree (family_id);
+
+--
+-- Name: family_tasks_group_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX family_tasks_group_id_idx ON public.family_tasks USING btree (group_id) WHERE (group_id IS NOT NULL);
 
 --
 -- Name: feed_cheers_user_created; Type: INDEX; Schema: public; Owner: -
@@ -1535,6 +1639,18 @@ CREATE INDEX shared_session_members_user_idx ON public.shared_session_members US
 --
 
 CREATE INDEX shared_session_tasks_open_events_idx ON public.shared_session_tasks USING btree (due) WHERE ((kind = 'event'::text) AND (NOT done));
+
+--
+-- Name: shared_session_groups_session_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX shared_session_groups_session_id_idx ON public.shared_session_groups USING btree (session_id);
+
+--
+-- Name: shared_session_tasks_group_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX shared_session_tasks_group_id_idx ON public.shared_session_tasks USING btree (group_id) WHERE (group_id IS NOT NULL);
 
 --
 -- Name: shared_session_tasks_session_idx; Type: INDEX; Schema: public; Owner: -
@@ -1696,6 +1812,20 @@ ALTER TABLE ONLY public.families
     ADD CONSTRAINT families_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 --
+-- Name: family_groups family_groups_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_groups
+    ADD CONSTRAINT family_groups_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+--
+-- Name: family_groups family_groups_family_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_groups
+    ADD CONSTRAINT family_groups_family_id_fkey FOREIGN KEY (family_id) REFERENCES public.families(id) ON DELETE CASCADE;
+
+--
 -- Name: family_members family_members_family_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1750,6 +1880,13 @@ ALTER TABLE ONLY public.family_tasks
 
 ALTER TABLE ONLY public.family_tasks
     ADD CONSTRAINT family_tasks_family_id_fkey FOREIGN KEY (family_id) REFERENCES public.families(id) ON DELETE CASCADE;
+
+--
+-- Name: family_tasks family_tasks_group_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.family_tasks
+    ADD CONSTRAINT family_tasks_group_id_fkey FOREIGN KEY (group_id) REFERENCES public.family_groups(id) ON DELETE SET NULL;
 
 --
 -- Name: feed_cheers feed_cheers_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -1920,6 +2057,20 @@ ALTER TABLE ONLY public.shared_session_members
     ADD CONSTRAINT shared_session_members_invited_by_fkey FOREIGN KEY (invited_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 --
+-- Name: shared_session_groups shared_session_groups_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_groups
+    ADD CONSTRAINT shared_session_groups_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+--
+-- Name: shared_session_groups shared_session_groups_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_groups
+    ADD CONSTRAINT shared_session_groups_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.shared_sessions(id) ON DELETE CASCADE;
+
+--
 -- Name: shared_session_members shared_session_members_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1946,6 +2097,13 @@ ALTER TABLE ONLY public.shared_session_tasks
 
 ALTER TABLE ONLY public.shared_session_tasks
     ADD CONSTRAINT shared_session_tasks_assignee_id_fkey FOREIGN KEY (assignee_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+--
+-- Name: shared_session_tasks shared_session_tasks_group_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_session_tasks
+    ADD CONSTRAINT shared_session_tasks_group_id_fkey FOREIGN KEY (group_id) REFERENCES public.shared_session_groups(id) ON DELETE SET NULL;
 
 --
 -- Name: shared_session_tasks shared_session_tasks_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -

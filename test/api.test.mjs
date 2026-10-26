@@ -182,6 +182,35 @@ describe("contact form and feedback", () => {
         await sleep(100);
         assert.match(log, /@fbreply\)\nE-Mail: privat@example\.org/);
     });
+
+    test("a rating: a yes needs its stars, a no needs words", async () => {
+        const bob = await member("fbrating");
+        const rate = (body) => call("POST", "/api/feedback", { category: "rating", ...body }, bob.token);
+        assert.equal((await rate({ message: "Schön." })).data.field, "liked");
+        assert.equal((await rate({ liked: true })).data.field, "stars");
+        assert.equal((await rate({ liked: true, stars: 6 })).data.field, "stars");
+        assert.equal((await rate({ liked: false, message: "" })).data.code, "INVALID_MESSAGE");
+        assert.equal((await rate({ liked: true, stars: 4 })).status, 200);
+        await sleep(100);
+        assert.match(log, /Feedback aus Quidey: Bewertung[\s\S]*@fbrating[\s\S]*Gefällt Quidey: Ja, ★★★★☆ \(4\/5\)/);
+        assert.equal((await rate({ liked: false, message: "Zu viele Knöpfe." })).status, 200);
+        await sleep(100);
+        assert.match(log, /Gefällt Quidey: Nicht wirklich\n\nZu viele Knöpfe\./);
+    });
+});
+
+describe("intro tour", () => {
+    test("a new account hasn't seen it until it says so", async () => {
+        const ann = await member("tournew");
+        assert.equal((await call("GET", "/api/me", null, ann.token)).data.tourSeen, false);
+        assert.deepEqual((await call("PUT", "/api/users/tour-seen", null, ann.token)).data, { tourSeen: true });
+        assert.equal((await call("GET", "/api/me", null, ann.token)).data.tourSeen, true);
+        // the first time stays
+        const [{ tour_seen_at: first }] = await sql("SELECT tour_seen_at FROM users WHERE id = $1", [ann.id]);
+        await call("PUT", "/api/users/tour-seen", null, ann.token);
+        assert.deepEqual((await sql("SELECT tour_seen_at FROM users WHERE id = $1", [ann.id]))[0].tour_seen_at, first);
+        assert.ok([401, 403].includes((await call("PUT", "/api/users/tour-seen")).status));
+    });
 });
 
 describe("repeating tasks and completion time", () => {
@@ -195,7 +224,7 @@ describe("repeating tasks and completion time", () => {
 
     test("done creates the next one once, on the first day not in the past, with fields and groups", async () => {
         const group = (await call("POST", "/api/groups", { name: "Sport", description: "" }, me.token)).data;
-        const task = (await call("POST", "/api/tasks", { name: "Laufen", prio: 60, due: daysFromToday(-10), description: "Park", repeat: "weekly", due_time: "07:30", reminder_minutes: 15 }, me.token)).data;
+        const task = (await call("POST", "/api/tasks", { name: "Laufen", prio: 60, due: daysFromToday(-10), description: "Park", repeat: "weekly", due_time: "07:30", reminders: [15, 0] }, me.token)).data;
         await call("POST", `/api/tasks/${task.id}/groups/${group.id}`, null, me.token);
 
         const done = (await call("PUT", `/api/tasks/${task.id}`, { ...task, due: daysFromToday(-10), done: true }, me.token)).data;
@@ -206,7 +235,7 @@ describe("repeating tasks and completion time", () => {
         assert.equal(due, daysFromToday(4), "two weekly steps: the first one not in the past");
         assert.equal(next.description, "Park");
         assert.equal(next.due_time, "07:30");
-        assert.equal(next.reminder_minutes, 15);
+        assert.deepEqual(next.reminders, [0, 15]);
         assert.deepEqual(next.group_ids, [group.id]);
 
         const reopened = (await call("PUT", `/api/tasks/${task.id}`, { ...task, due: daysFromToday(-10), done: false }, me.token)).data;
@@ -404,11 +433,12 @@ describe("task colours and reminders by mail", () => {
 
     test("a reminder is mailed once when it's due, and again after the task moved", async () => {
         const start = utcIn(3);
-        const task = (await call("POST", "/api/tasks", { name: "Mathe lernen", prio: 50, description: "", ...start, reminder_minutes: 5, reminder_email: true }, ann.token)).data;
+        const task = (await call("POST", "/api/tasks", { name: "Mathe lernen", prio: 50, description: "", ...start, reminders: [5], reminder_email: true }, ann.token)).data;
         assert.equal(task.reminder_email, true);
-        // the same without "by mail", and one whose reminder is still ahead
+        // the same without "by mail" (as an app from before several reminders sends it), and one
+        // whose reminder is still ahead
         await call("POST", "/api/tasks", { name: "Nur in der App", prio: 50, description: "", ...start, reminder_minutes: 5 }, ann.token);
-        await call("POST", "/api/tasks", { name: "Später", prio: 50, description: "", ...utcIn(120), reminder_minutes: 5, reminder_email: true }, ann.token);
+        await call("POST", "/api/tasks", { name: "Später", prio: 50, description: "", ...utcIn(120), reminders: [5], reminder_email: true }, ann.token);
 
         assert.equal(await waitForMails("mailann@example.com", "Mathe lernen", 1), 1);
         await sleep(800);
@@ -421,7 +451,7 @@ describe("task colours and reminders by mail", () => {
         assert.equal(await waitForMails("mailann@example.com", "Mathe lernen", 2), 2, "a new time reminds again");
 
         // done tasks are quiet
-        const done = (await call("POST", "/api/tasks", { name: "Schon erledigt", prio: 50, description: "", ...utcIn(3), reminder_minutes: 10 }, ann.token)).data;
+        const done = (await call("POST", "/api/tasks", { name: "Schon erledigt", prio: 50, description: "", ...utcIn(3), reminders: [10] }, ann.token)).data;
         await call("PUT", `/api/tasks/${done.id}`, { ...done, ...utcIn(3), done: true, reminder_email: true }, ann.token);
         await sleep(800);
         assert.equal(mailsFor("mailann@example.com", "Schon erledigt"), 0);
@@ -429,7 +459,7 @@ describe("task colours and reminders by mail", () => {
 
     test("only the owner turns mails on or off; they reach only the owner", async () => {
         const start = utcIn(3);
-        const task = (await call("POST", "/api/tasks", { name: "Gruppenarbeit", prio: 50, description: "", ...start, reminder_minutes: 30 }, ann.token)).data;
+        const task = (await call("POST", "/api/tasks", { name: "Gruppenarbeit", prio: 50, description: "", ...start, reminders: [30] }, ann.token)).data;
         await call("POST", `/api/tasks/${task.id}/shares`, { userIds: [ben.id] }, ann.token);
         const [share] = (await call("GET", "/api/task-shares", null, ben.token)).data;
         await call("POST", `/api/task-shares/${share.id}/accept`, null, ben.token);
@@ -441,6 +471,43 @@ describe("task colours and reminders by mail", () => {
         await call("PUT", `/api/tasks/${task.id}`, { ...task, ...start, reminder_email: true }, ann.token);
         assert.equal(await waitForMails("mailann@example.com", "Gruppenarbeit", 1), 1);
         assert.equal(mailsFor("mailben@example.com", "Gruppenarbeit"), 0);
+    });
+
+    test("a task has up to 5 reminders, sorted; an app from before sends one as reminder_minutes", async () => {
+        const base = { prio: 50, description: "", ...utcIn(600) };
+        const task = (await call("POST", "/api/tasks", { name: "Viele", ...base, reminders: [60, 0, 0, 15] }, ann.token)).data;
+        assert.deepEqual(task.reminders, [0, 15, 60]);
+        assert.equal(task.reminder_minutes, 0, "the one closest to the start, for older apps");
+        for (const reminders of [[1, 2, 3, 4, 5, 6], [-1], [10081], [1.5], ["x"], "15", { 0: 1 }]) {
+            assert.equal((await call("POST", "/api/tasks", { name: "Falsch", ...base, reminders }, ann.token)).data.field, "reminders", JSON.stringify(reminders));
+        }
+        const old = (await call("POST", "/api/tasks", { name: "Alt", ...base, reminder_minutes: 30 }, ann.token)).data;
+        assert.deepEqual(old.reminders, [30]);
+        assert.deepEqual((await call("PUT", `/api/tasks/${old.id}`, { ...old, ...base, reminders: undefined, reminder_minutes: null }, ann.token)).data.reminders, []);
+        assert.deepEqual((await call("PUT", `/api/tasks/${task.id}`, { ...task, ...base, reminders: [] }, ann.token)).data.reminders, []);
+        // a PUT without the field keeps them
+        const kept = (await call("POST", "/api/tasks", { name: "Bleibt", ...base, reminders: [5] }, ann.token)).data;
+        assert.deepEqual((await call("PUT", `/api/tasks/${kept.id}`, { name: "Bleibt", prio: 50, description: "", due: base.due }, ann.token)).data.reminders, [5]);
+    });
+
+    test("tasks without a time are reminded at my all-day time", async () => {
+        assert.equal((await call("GET", "/api/me", null, ann.token)).data.allDayReminderTime, "12:00");
+        assert.equal((await call("PUT", "/api/users/reminder-time", { time: "25:00" }, ann.token)).data.field, "time");
+        assert.equal((await call("PUT", "/api/users/reminder-time", {}, ann.token)).data.field, "time");
+        assert.equal((await call("PUT", "/api/users/reminder-time", { time: "08:00" })).status, 401);
+
+        // ann lives in UTC (see above): the all-day time is this minute
+        const now = utcIn(0);
+        assert.deepEqual((await call("PUT", "/api/users/reminder-time", { time: now.due_time }, ann.token)).data, { allDayReminderTime: now.due_time });
+        assert.equal((await call("GET", "/api/me", null, ann.token)).data.allDayReminderTime, now.due_time);
+        await call("POST", "/api/tasks", { name: "Ganztags", prio: 50, description: "", due: now.due, reminders: [0], reminder_email: true }, ann.token);
+        await call("POST", "/api/tasks", { name: "Ohne Erinnerung", prio: 50, description: "", due: now.due, reminder_email: true }, ann.token);
+        assert.equal(await waitForMails("mailann@example.com", "Ganztags", 1), 1);
+        assert.ok(log.includes("[DEV] Reminder for mailann@example.com: Ganztags (Today, all day)"));
+        await sleep(600);
+        assert.equal(mailsFor("mailann@example.com", "Ganztags"), 1, "once");
+        assert.equal(mailsFor("mailann@example.com", "Ohne Erinnerung"), 0);
+        await call("PUT", "/api/users/reminder-time", { time: "12:00" }, ann.token);
     });
 });
 
@@ -1914,11 +1981,12 @@ describe("push notifications", () => {
         assert.equal(await waitForPushes(pic, "social", "Pushpia lädt dich zu „Klausur“ ein."), 1);
     });
 
-    test("a task with a time is pushed at its reminder, or at its start without one, once", async () => {
-        const reminded = (await call("POST", "/api/tasks", { name: "Essay abgeben", prio: 50, description: "", ...utcIn(10), reminder_minutes: 15 }, pia.token)).data;
-        await call("POST", "/api/tasks", { name: "Vorlesung", prio: 50, description: "", ...utcIn(-1), kind: "event", location: "Hörsaal 2" }, pia.token);
-        await call("POST", "/api/tasks", { name: "Viel später", prio: 50, description: "", ...utcIn(90) }, pia.token);
+    test("a task is pushed at its reminder, once; without a reminder it stays quiet", async () => {
+        const reminded = (await call("POST", "/api/tasks", { name: "Essay abgeben", prio: 50, description: "", ...utcIn(10), reminders: [15] }, pia.token)).data;
+        await call("POST", "/api/tasks", { name: "Vorlesung", prio: 50, description: "", ...utcIn(-1), kind: "event", location: "Hörsaal 2", reminders: [0] }, pia.token);
+        await call("POST", "/api/tasks", { name: "Viel später", prio: 50, description: "", ...utcIn(90), reminders: [0] }, pia.token);
         await call("POST", "/api/tasks", { name: "Ohne Zeit", prio: 50, description: "", due: utcIn(0).due }, pia.token);
+        await call("POST", "/api/tasks", { name: "Ohne Erinnerung", prio: 50, description: "", ...utcIn(-1) }, pia.token);
 
         assert.equal(await waitForPushes(pia, "plan", "Essay abgeben — Aufgabe um"), 1);
         assert.equal(await waitForPushes(pia, "plan", "Vorlesung — Beginnt jetzt"), 1);
@@ -1927,6 +1995,7 @@ describe("push notifications", () => {
         assert.equal(pushesFor(pia, "plan", "Essay abgeben"), 1, "only once");
         assert.equal(pushesFor(pia, "plan", "Viel später"), 0);
         assert.equal(pushesFor(pia, "plan", "Ohne Zeit"), 0);
+        assert.equal(pushesFor(pia, "plan", "Ohne Erinnerung"), 0);
 
         // moved: a new reminder time, pushed again
         await call("PUT", `/api/tasks/${reminded.id}`, { ...reminded, ...utcIn(11) }, pia.token);
@@ -1934,9 +2003,37 @@ describe("push notifications", () => {
 
         // somebody without a device that wants "plan" gets nothing
         await call("PUT", "/api/push/subscription", { ...device(3), kinds: { plan: false } }, pic.token);
-        await call("POST", "/api/tasks", { name: "Leise", prio: 50, description: "", ...utcIn(-1) }, pic.token);
+        await call("POST", "/api/tasks", { name: "Leise", prio: 50, description: "", ...utcIn(-1), reminders: [0] }, pic.token);
         await sleep(600);
         assert.equal(pushesFor(pic, "plan", "Leise"), 0);
+    });
+
+    test("of several reminders the latest due one is pushed, later ones follow; all-day ones at my all-day time", async () => {
+        // both due (the server was down): only the one at the start
+        await call("POST", "/api/tasks", { name: "Doppelt", prio: 50, description: "", ...utcIn(-1), reminders: [30, 0] }, pia.token);
+        assert.equal(await waitForPushes(pia, "plan", "Doppelt — Jetzt dran"), 1);
+        await sleep(600);
+        assert.equal(pushesFor(pia, "plan", "Doppelt"), 1);
+
+        // the earlier one now, the one at the start once it's there (here: the task moved closer)
+        const twice = (await call("POST", "/api/tasks", { name: "Zweimal", prio: 50, description: "", ...utcIn(3), reminders: [5, 0] }, pia.token)).data;
+        assert.equal(await waitForPushes(pia, "plan", "Zweimal — Aufgabe um"), 1);
+        await call("PUT", `/api/tasks/${twice.id}`, { ...twice, ...utcIn(-1) }, pia.token);
+        assert.equal(await waitForPushes(pia, "plan", "Zweimal — Jetzt dran"), 1);
+        await sleep(600);
+        assert.equal(pushesFor(pia, "plan", "Zweimal"), 2);
+
+        // pia lives in UTC: the all-day time is this minute
+        const now = utcIn(0);
+        const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+        await call("PUT", "/api/users/reminder-time", { time: now.due_time }, pia.token);
+        await call("POST", "/api/tasks", { name: "Ganzer Tag", prio: 50, description: "", due: now.due, reminders: [0] }, pia.token);
+        await call("POST", "/api/tasks", { name: "Tag davor", prio: 50, description: "", due: tomorrow, reminders: [1440] }, pia.token);
+        await call("POST", "/api/tasks", { name: "Ausflug", prio: 50, description: "", due: tomorrow, kind: "event", reminders: [1440] }, pia.token);
+        assert.equal(await waitForPushes(pia, "plan", "Ganzer Tag — Heute fällig"), 1);
+        assert.equal(await waitForPushes(pia, "plan", "Tag davor — Morgen fällig"), 1);
+        assert.equal(await waitForPushes(pia, "plan", "Ausflug — Morgen"), 1);
+        await call("PUT", "/api/users/reminder-time", { time: "12:00" }, pia.token);
     });
 
     test("the morning overview comes once a day with what's open today", async () => {
@@ -1963,5 +2060,75 @@ describe("push notifications", () => {
         await call("PUT", "/api/push/subscription", device(5), pic.token);
         await call("POST", "/api/users/logout-all", null, pic.token);
         assert.equal((await sql("SELECT count(*)::int AS n FROM push_subscriptions WHERE user_id = $1", [pic.id]))[0].n, 0);
+    });
+});
+
+describe("sub-groups in sessions and families (testers)", () => {
+    let tia, tom, sessionId, familyId;
+    before(async () => {
+        tia = await member("subtia");
+        tom = await member("subtom");
+        await sql("UPDATE users SET is_tester = true WHERE username = 'subtia'");
+        await befriend(tia, tom, "subtom");
+        sessionId = (await call("POST", "/api/shared-sessions", { name: "Lernen", friendIds: [tom.id] }, tia.token)).data.id;
+        await call("POST", `/api/shared-sessions/${sessionId}/join`, null, tom.token);
+        familyId = (await call("POST", "/api/families", { name: "WG", friendIds: [tom.id] }, tia.token)).data.id;
+        await call("POST", `/api/families/${familyId}/join`, null, tom.token);
+    });
+
+    test("a tester makes groups in a session and files tasks in them; deleting one keeps its tasks", async () => {
+        const G = `/api/tester/shared-sessions/${sessionId}/groups`;
+        assert.equal((await call("POST", G, { name: "Kapitel 1" }, tom.token)).data.code, "TESTER_REQUIRED");
+        let session = (await call("POST", G, { name: "Kapitel 1" }, tia.token)).data;
+        assert.deepEqual(session.groups.map(g => g.name), ["Kapitel 1"]);
+        assert.equal((await call("POST", G, { name: "kapitel 1" }, tia.token)).data.code, "SUB_GROUP_EXISTS");
+        assert.equal((await call("POST", G, { name: "  " }, tia.token)).data.field, "name");
+        const groupId = session.groups[0].id;
+
+        const T = `/api/shared-sessions/${sessionId}/tasks`;
+        session = (await call("POST", T, { name: "Lesen", group_id: groupId }, tia.token)).data;
+        const task = session.tasks.find(t => t.name === "Lesen");
+        assert.equal(task.groupId, groupId);
+        assert.equal(task.addedBy.username, "subtia");
+        assert.ok(Date.parse(task.createdAt) > Date.now() - 60000, "when it was made");
+        // somebody who isn't a tester can't put tasks in groups, but sees them
+        assert.equal((await call("POST", T, { name: "Nö", group_id: groupId }, tom.token)).data.code, "TESTER_REQUIRED");
+        assert.equal((await call("PATCH", `${T}/${task.id}`, { group_id: null }, tom.token)).data.code, "TESTER_REQUIRED");
+        assert.equal((await call("GET", `/api/shared-sessions/${sessionId}`, null, tom.token)).data.tasks.find(t => t.id === task.id).groupId, groupId);
+        // only this session's groups
+        assert.equal((await call("POST", T, { name: "Falsch", group_id: 999999 }, tia.token)).data.field, "group_id");
+
+        const mine = (await call("GET", "/api/shared-sessions/my-tasks", null, tia.token)).data.find(s => s.id === sessionId);
+        assert.deepEqual(mine.groups, [{ id: groupId, name: "Kapitel 1" }]);
+        assert.equal(mine.tasks.find(t => t.id === task.id).groupId, groupId);
+        assert.equal(mine.tasks.find(t => t.id === task.id).addedBy.username, "subtia");
+
+        session = (await call("PATCH", `${T}/${task.id}`, { group_id: null }, tia.token)).data;
+        assert.equal(session.tasks.find(t => t.id === task.id).groupId, null);
+        await call("PATCH", `${T}/${task.id}`, { group_id: groupId }, tia.token);
+
+        session = (await call("DELETE", `${G}/${groupId}`, null, tia.token)).data;
+        assert.deepEqual(session.groups, []);
+        assert.equal(session.tasks.find(t => t.id === task.id).groupId, null, "the task stays");
+        assert.equal((await call("DELETE", `${G}/${groupId}`, null, tia.token)).data.code, "SUB_GROUP_NOT_FOUND");
+    });
+
+    test("the same in a family", async () => {
+        const G = `/api/tester/families/${familyId}/groups`;
+        let family = (await call("POST", G, { name: "Einkauf" }, tia.token)).data;
+        const groupId = family.groups[0].id;
+        family = (await call("POST", `/api/families/${familyId}/tasks`, { name: "Milch", group_id: groupId }, tia.token)).data;
+        const entry = family.tasks.find(t => t.name === "Milch");
+        assert.equal(entry.groupId, groupId);
+        assert.equal(entry.addedBy.username, "subtia");
+        assert.equal((await call("PATCH", `/api/families/${familyId}/tasks/${entry.id}`, { group_id: null }, tom.token)).data.code, "TESTER_REQUIRED");
+        family = (await call("PATCH", `/api/families/${familyId}/tasks/${entry.id}`, { group_id: null }, tia.token)).data;
+        assert.equal(family.tasks.find(t => t.id === entry.id).groupId, null);
+        // another family's group doesn't fit
+        const otherSession = (await call("POST", `/api/tester/shared-sessions/${sessionId}/groups`, { name: "Anderes" }, tia.token)).data;
+        const foreign = otherSession.groups.find(g => g.name === "Anderes").id;
+        assert.equal((await call("PATCH", `/api/families/${familyId}/tasks/${entry.id}`, { group_id: foreign }, tia.token)).data.field, "group_id");
+        family = (await call("DELETE", `${G}/${groupId}`, null, tia.token)).data;
+        assert.deepEqual(family.groups, []);
     });
 });
