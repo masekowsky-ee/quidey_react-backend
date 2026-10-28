@@ -68,7 +68,7 @@ CREATE TABLE public.admin_actions (
     target_username text NOT NULL,
     action text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT admin_actions_action_check CHECK ((action = ANY (ARRAY['grant_pro'::text, 'revoke_pro'::text, 'grant_admin'::text, 'revoke_admin'::text, 'grant_tester'::text, 'revoke_tester'::text, 'approve_request'::text, 'decline_request'::text, 'reset_request'::text])))
+    CONSTRAINT admin_actions_action_check CHECK ((action = ANY (ARRAY['grant_pro'::text, 'revoke_pro'::text, 'grant_admin'::text, 'revoke_admin'::text, 'grant_tester'::text, 'revoke_tester'::text, 'approve_request'::text, 'decline_request'::text, 'reset_request'::text, 'remove_avatar'::text])))
 );
 
 --
@@ -2260,6 +2260,17 @@ CREATE TABLE IF NOT EXISTS public.notebook_notes (
     updated_at timestamp with time zone NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS notebook_notes_user_updated ON public.notebook_notes (user_id, updated_at DESC);
+
+--
+-- 033: profile pictures (see migrations/033_profile_pictures.sql)
+--
+
+CREATE TABLE IF NOT EXISTS public.user_avatars (
+    user_id integer PRIMARY KEY REFERENCES public.users(id) ON DELETE CASCADE,
+    image bytea NOT NULL,
+    mime text NOT NULL CHECK (mime IN ('image/webp', 'image/jpeg', 'image/png')),
+    updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
 
 --
 -- PostgreSQL database dump complete

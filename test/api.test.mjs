@@ -93,7 +93,7 @@ before(async () => {
         cwd: ROOT,
         env: {
             ...process.env, DB_NAME: DB, PORT: String(port), SMTP_HOST: "", CONTACT_TO: "owner@example.com",
-            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", FOCUS_CHECK_MS: "200", PRESENCE_GRACE_MS: "200",
+            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", FOCUS_CHECK_MS: "200", NOTEBOOK_STORAGE_MAX: "4000", PRESENCE_GRACE_MS: "200",
             // pushes are only logged ("[DEV] Push to user …"), like mails without SMTP_HOST
             VAPID_PUBLIC_KEY: "", VAPID_PRIVATE_KEY: "",
         },
@@ -2063,12 +2063,11 @@ describe("push notifications", () => {
     });
 });
 
-describe("sub-groups in sessions and families (testers)", () => {
+describe("sub-groups in sessions and families (everybody)", () => {
     let tia, tom, sessionId, familyId;
     before(async () => {
         tia = await member("subtia");
         tom = await member("subtom");
-        await sql("UPDATE users SET is_tester = true WHERE username = 'subtia'");
         await befriend(tia, tom, "subtom");
         sessionId = (await call("POST", "/api/shared-sessions", { name: "Lernen", friendIds: [tom.id] }, tia.token)).data.id;
         await call("POST", `/api/shared-sessions/${sessionId}/join`, null, tom.token);
@@ -2076,9 +2075,8 @@ describe("sub-groups in sessions and families (testers)", () => {
         await call("POST", `/api/families/${familyId}/join`, null, tom.token);
     });
 
-    test("a tester makes groups in a session and files tasks in them; deleting one keeps its tasks", async () => {
-        const G = `/api/tester/shared-sessions/${sessionId}/groups`;
-        assert.equal((await call("POST", G, { name: "Kapitel 1" }, tom.token)).data.code, "TESTER_REQUIRED");
+    test("any member makes groups in a session and files tasks in them; deleting one keeps its tasks", async () => {
+        const G = `/api/shared-sessions/${sessionId}/groups`;
         let session = (await call("POST", G, { name: "Kapitel 1" }, tia.token)).data;
         assert.deepEqual(session.groups.map(g => g.name), ["Kapitel 1"]);
         assert.equal((await call("POST", G, { name: "kapitel 1" }, tia.token)).data.code, "SUB_GROUP_EXISTS");
@@ -2091,10 +2089,12 @@ describe("sub-groups in sessions and families (testers)", () => {
         assert.equal(task.groupId, groupId);
         assert.equal(task.addedBy.username, "subtia");
         assert.ok(Date.parse(task.createdAt) > Date.now() - 60000, "when it was made");
-        // somebody who isn't a tester can't put tasks in groups, but sees them
-        assert.equal((await call("POST", T, { name: "Nö", group_id: groupId }, tom.token)).data.code, "TESTER_REQUIRED");
-        assert.equal((await call("PATCH", `${T}/${task.id}`, { group_id: null }, tom.token)).data.code, "TESTER_REQUIRED");
+        // another member (no tester) files tasks in groups too, and sees them
+        const tomsSession = (await call("POST", T, { name: "Auch", group_id: groupId }, tom.token)).data;
+        assert.equal(tomsSession.tasks.find(t => t.name === "Auch").groupId, groupId);
         assert.equal((await call("GET", `/api/shared-sessions/${sessionId}`, null, tom.token)).data.tasks.find(t => t.id === task.id).groupId, groupId);
+        // the old tester address still answers testers, nobody else
+        assert.equal((await call("POST", `/api/tester/shared-sessions/${sessionId}/groups`, { name: "Alt" }, tom.token)).data.code, "TESTER_REQUIRED");
         // only this session's groups
         assert.equal((await call("POST", T, { name: "Falsch", group_id: 999999 }, tia.token)).data.field, "group_id");
 
@@ -2114,18 +2114,17 @@ describe("sub-groups in sessions and families (testers)", () => {
     });
 
     test("the same in a family", async () => {
-        const G = `/api/tester/families/${familyId}/groups`;
-        let family = (await call("POST", G, { name: "Einkauf" }, tia.token)).data;
+        const G = `/api/families/${familyId}/groups`;
+        let family = (await call("POST", G, { name: "Einkauf" }, tom.token)).data;
         const groupId = family.groups[0].id;
         family = (await call("POST", `/api/families/${familyId}/tasks`, { name: "Milch", group_id: groupId }, tia.token)).data;
         const entry = family.tasks.find(t => t.name === "Milch");
         assert.equal(entry.groupId, groupId);
         assert.equal(entry.addedBy.username, "subtia");
-        assert.equal((await call("PATCH", `/api/families/${familyId}/tasks/${entry.id}`, { group_id: null }, tom.token)).data.code, "TESTER_REQUIRED");
-        family = (await call("PATCH", `/api/families/${familyId}/tasks/${entry.id}`, { group_id: null }, tia.token)).data;
+        family = (await call("PATCH", `/api/families/${familyId}/tasks/${entry.id}`, { group_id: null }, tom.token)).data;
         assert.equal(family.tasks.find(t => t.id === entry.id).groupId, null);
         // another family's group doesn't fit
-        const otherSession = (await call("POST", `/api/tester/shared-sessions/${sessionId}/groups`, { name: "Anderes" }, tia.token)).data;
+        const otherSession = (await call("POST", `/api/shared-sessions/${sessionId}/groups`, { name: "Anderes" }, tia.token)).data;
         const foreign = otherSession.groups.find(g => g.name === "Anderes").id;
         assert.equal((await call("PATCH", `/api/families/${familyId}/tasks/${entry.id}`, { group_id: foreign }, tia.token)).data.field, "group_id");
         family = (await call("DELETE", `${G}/${groupId}`, null, tia.token)).data;
@@ -2258,5 +2257,86 @@ describe("Fokusraum: alarm, routines, notebook", () => {
         const left = await sql(`SELECT (SELECT count(*) FROM routines WHERE user_id = $1)::int + (SELECT count(*) FROM notebook_notes WHERE user_id = $1)::int
             + (SELECT count(*) FROM focus_alarms WHERE user_id = $1)::int AS n`, [gone.id]);
         assert.equal(left[0].n, 0);
+    });
+});
+
+describe("upload safety and profile pictures", () => {
+    let pia, pal, stranger, admin, outsider;
+    // 1 × 1 pixel pictures
+    const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const WEBP = "data:image/webp;base64,UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAwA0JaQAA3AA/vuUAAA=";
+    // says PNG, is text
+    const FAKE = `data:image/png;base64,${Buffer.from("<script>alert(1)</script>").toString("base64")}`;
+
+    before(async () => {
+        pia = await member("picpia");
+        pal = await member("picpal");
+        stranger = await member("picstranger");
+        admin = await member("picadmin", { admin: true });
+        outsider = await member("picout", { pro: false });
+        await sql("UPDATE users SET is_tester = true WHERE username = 'picpia'");
+        await befriend(pia, pal, "picpal");
+    });
+
+    test("the notebook reads big bodies only from signed-in accounts", async () => {
+        const big = { body: "x", attachments: [{ kind: "image", data: "data:image/png;base64," + "A".repeat(300 * 1024) }] };
+        assert.equal((await call("POST", "/api/notebook", big)).status, 401, "no account: refused before reading it");
+        assert.equal((await call("POST", "/api/notebook", big, outsider.token)).data.code, "PRO_REQUIRED");
+        // the other routes keep their small limit
+        assert.equal((await call("POST", "/api/tasks", { name: "x".repeat(200 * 1024) }, pia.token)).status, 413);
+    });
+
+    test("pictures must really be pictures", async () => {
+        assert.equal((await call("POST", "/api/notebook", { body: "x", attachments: [{ kind: "image", data: FAKE }] }, pia.token)).data.field, "attachments");
+        assert.equal((await call("POST", "/api/notebook", { body: "x", attachments: [{ kind: "image", data: WEBP }] }, pia.token)).status, 201);
+    });
+
+    test("all pictures of an account together have a limit", async () => {
+        // the test server allows 4000 characters of pictures per account
+        const big = "data:image/png;base64," + Buffer.concat([Buffer.from(PNG.split(",")[1], "base64"), Buffer.alloc(1800)]).toString("base64");
+        const first = await call("POST", "/api/notebook", { body: "eins", attachments: [{ kind: "image", data: big }] }, pal.token);
+        assert.equal(first.status, 201, JSON.stringify(first.data));
+        const second = await call("POST", "/api/notebook", { body: "zwei", attachments: [{ kind: "image", data: big }] }, pal.token);
+        assert.equal(second.data.code, "NOTEBOOK_STORAGE_FULL");
+        // changing the note that holds it doesn't count it twice
+        assert.equal((await call("PUT", `/api/notebook/${first.data.id}`, { attachments: [{ kind: "image", data: big }] }, pal.token)).status, 200);
+        await call("DELETE", `/api/notebook/${first.data.id}`, null, pal.token);
+        assert.equal((await call("POST", "/api/notebook", { body: "drei", attachments: [{ kind: "image", data: big }] }, pal.token)).status, 201);
+    });
+
+    test("testers set a profile picture; friends see it, strangers don't", async () => {
+        assert.equal((await call("PUT", "/api/tester/avatar", { data: WEBP }, pal.token)).data.code, "TESTER_REQUIRED");
+        assert.equal((await call("PUT", "/api/tester/avatar", { data: FAKE }, pia.token)).data.field, "data");
+        assert.equal((await call("PUT", "/api/tester/avatar", { data: "data:image/gif;base64,R0lGODlhAQABAAAAACw=" }, pia.token)).data.field, "data", "no GIF");
+        const set = await call("PUT", "/api/tester/avatar", { data: WEBP }, pia.token);
+        assert.equal(set.status, 200);
+        assert.ok(set.data.avatar);
+
+        const forPal = (await call("GET", `/api/avatars?ids=${pia.id},${stranger.id}`, null, pal.token)).data;
+        assert.deepEqual(Object.keys(forPal), [String(pia.id)]);
+        const res = await fetch(`${API}/api/avatars/${pia.id}?v=1`, { headers: { Authorization: `Bearer ${pal.token}` } });
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("content-type"), "image/webp");
+        assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+        assert.equal(Buffer.from(await res.arrayBuffer()).toString("latin1", 8, 12), "WEBP");
+
+        assert.deepEqual((await call("GET", `/api/avatars?ids=${pia.id}`, null, stranger.token)).data, {});
+        assert.equal((await call("GET", `/api/avatars/${pia.id}`, null, stranger.token)).status, 404);
+        assert.equal((await call("GET", `/api/avatars?ids=${pia.id}`, null, outsider.token)).data.code, "PRO_REQUIRED");
+        assert.equal((await fetch(`${API}/api/avatars/${pia.id}`)).status, 401);
+    });
+
+    test("anyone takes their own picture away, an admin anybody's (logged)", async () => {
+        await call("PUT", "/api/tester/avatar", { data: PNG }, pia.token);
+        assert.equal((await call("GET", "/api/admin/users?q=picpia", null, admin.token)).data.find(u => u.username === "picpia")?.hasAvatar, true);
+        assert.equal((await call("DELETE", `/api/admin/users/${pia.id}/avatar`, null, pal.token)).status, 403);
+        assert.equal((await call("DELETE", `/api/admin/users/${pia.id}/avatar`, null, admin.token)).status, 200);
+        const log = await sql("SELECT action, target_username FROM admin_actions WHERE action = 'remove_avatar'");
+        assert.deepEqual(log.at(-1), { action: "remove_avatar", target_username: "picpia" });
+        assert.deepEqual((await call("GET", `/api/avatars?ids=${pia.id}`, null, pal.token)).data, {});
+
+        await call("PUT", "/api/tester/avatar", { data: PNG }, pia.token);
+        assert.equal((await call("DELETE", "/api/profile/avatar", null, pia.token)).status, 200);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM user_avatars WHERE user_id = $1", [pia.id]))[0].n, 0);
     });
 });
