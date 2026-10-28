@@ -78,8 +78,11 @@ app.use(cors({
         callback(null, false); // no CORS headers: the browser blocks the response
     },
 }));
-app.use("/api/notebook", express.json({ limit: "4mb" })); // notes carry small pictures
-app.use(express.json({ limit: "100kb" })); // parse json bodies; bigger ones are refused
+// parse json bodies; bigger ones are refused. The notebook (notes carry small pictures) gets a
+// larger limit, but only further down, once the request is signed in, has beta access and passed
+// the rate limit: nobody without an account can make the server read megabytes.
+const smallJson = express.json({ limit: "100kb" });
+app.use((req, res, next) => (req.path.startsWith("/api/notebook") ? next() : smallJson(req, res, next)));
 
 // Slows down password guessing: 10 failed attempts per IP per 15 minutes on login and register.
 // Successful requests and CORS preflights (OPTIONS) don't count.
@@ -226,6 +229,7 @@ app.use("/api/feed", authenticateToken);
 app.use("/api/progress", authenticateToken);
 app.use("/api/families", authenticateToken);
 app.use("/api/push", authenticateToken);
+app.use("/api/avatars", authenticateToken);
 app.use("/api/focus", authenticateToken);
 app.use("/api/routines", authenticateToken);
 app.use("/api/notebook", authenticateToken);
@@ -242,7 +246,7 @@ function requirePro(req, res, next) {
 }
 
 app.use(
-    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families", "/api/push", "/api/focus", "/api/routines", "/api/notebook"],
+    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families", "/api/push", "/api/focus", "/api/routines", "/api/notebook", "/api/avatars"],
     requirePro
 );
 
@@ -269,6 +273,8 @@ app.use("/api", rateLimit({
     legacyHeaders: false,
     message: { error: "Too many requests, please slow down", code: "RATE_LIMITED" },
 }));
+
+app.use("/api/notebook", express.json({ limit: "4mb" }));
 
 // ---------- input checks ----------
 // Ids from the URL: a positive integer, or null (answered with 404 instead of a database error)
@@ -301,6 +307,24 @@ function cleanPrio(value) {
     if (value === undefined || value === null || value === "") return null;
     const prio = Number(value);
     return Number.isInteger(prio) && prio >= 0 && prio <= 1000 ? prio : undefined;
+}
+
+// A picture sent as a data: URL ("data:image/png;base64,…"): one of `types`, at most `max`
+// characters, and the bytes must really start like that kind of picture (magic numbers), so
+// nothing else hides behind an image label. → { mime, bytes } or null.
+const IMAGE_SIGNATURES = {
+    png: (b) => b.length > 8 && b[0] === 0x89 && b.toString("latin1", 1, 4) === "PNG",
+    jpeg: (b) => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff,
+    gif: (b) => b.length > 6 && b.toString("latin1", 0, 4) === "GIF8",
+    webp: (b) => b.length > 12 && b.toString("latin1", 0, 4) === "RIFF" && b.toString("latin1", 8, 12) === "WEBP",
+};
+function readImageData(value, max, types) {
+    if (typeof value !== "string" || value.length > max) return null;
+    const match = value.match(/^data:image\/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/]+=*)$/);
+    if (!match || !types.includes(match[1])) return null;
+    const bytes = Buffer.from(match[2], "base64");
+    if (!IMAGE_SIGNATURES[match[1]](bytes)) return null;
+    return { mime: `image/${match[1]}`, bytes };
 }
 
 const invalidInput = (res, field) => res.status(400).json({ error: `Invalid ${field}`, code: "INVALID_INPUT", field });
@@ -3502,11 +3526,12 @@ function notifyInvites(userIds) {
     for (const id of userIds) realtime.toUser(id, "invites:changed", {});
 }
 
-// ---------- sub-groups in sessions and families (experimental, testers) ----------
-// A session's or a family's entries sorted into named groups ("Kapitel 1", "Einkauf").
-// Everybody sees them (the session / family carries `groups`, each entry its `groupId`), only
-// testers make or delete them and put entries in (routes under /api/tester, `group_id` on the
-// entry routes). Deleting a group keeps its entries.
+// ---------- sub-groups in sessions and families ----------
+// A session's or a family's entries sorted into named groups ("Kapitel 1", "Einkauf"). For
+// everybody since 2026-10-28 (tested by testers before): any member makes or deletes them and puts
+// entries in (`group_id` on the entry routes); the session / family carries `groups`, each entry
+// its `groupId`. Deleting a group keeps its entries. The old /api/tester/... addresses still
+// answer, for apps that haven't loaded the new version yet.
 const SUB_GROUP_NAME_MAX = 40;
 const SUB_GROUPS_MAX = 20;
 const SUB_GROUPS = {
@@ -3522,11 +3547,9 @@ async function loadSubGroups(kind, parentId) {
 }
 
 // The sub-group an entry goes into: `group_id` from a request, checked to be one of this
-// session's / family's. { value } (null: none), {} when it wasn't sent, { forbidden } for
-// somebody who isn't a tester, or { error }.
+// session's / family's. { value } (null: none), {} when it wasn't sent, or { error }.
 async function readSubGroup(req, kind, parentId) {
     if (req.body?.group_id === undefined) return {};
-    if (!hasTesterAccess(req.account)) return { forbidden: true };
     if (req.body.group_id === null || req.body.group_id === "") return { value: null };
     const id = idParam(req.body.group_id);
     if (!id) return { error: "group_id" };
@@ -3534,8 +3557,6 @@ async function readSubGroup(req, kind, parentId) {
     const found = await pool.query(`SELECT 1 FROM ${table} WHERE id = $1 AND ${parent} = $2`, [id, parentId]);
     return found.rows.length > 0 ? { value: id } : { error: "group_id" };
 }
-
-const testerRequired = (res) => fail(res, 403, "TESTER_REQUIRED", "Only for testers");
 
 // { name }: a new sub-group. Answers the request itself and resolves to false when it can't be made.
 async function addSubGroup(res, kind, parentId, userId, body) {
@@ -3573,7 +3594,7 @@ async function removeSubGroup(res, kind, parentId, groupIdValue) {
     return true;
 }
 
-app.post("/api/tester/shared-sessions/:id/groups", async (req, res) => {
+app.post(["/api/shared-sessions/:id/groups", "/api/tester/shared-sessions/:id/groups"], async (req, res) => {
     const userId = req.user.userId;
     try {
         const session = await requireOpenSession(req, res);
@@ -3586,7 +3607,7 @@ app.post("/api/tester/shared-sessions/:id/groups", async (req, res) => {
     }
 });
 
-app.delete("/api/tester/shared-sessions/:id/groups/:groupId", async (req, res) => {
+app.delete(["/api/shared-sessions/:id/groups/:groupId", "/api/tester/shared-sessions/:id/groups/:groupId"], async (req, res) => {
     const userId = req.user.userId;
     try {
         const session = await requireOpenSession(req, res);
@@ -3599,7 +3620,7 @@ app.delete("/api/tester/shared-sessions/:id/groups/:groupId", async (req, res) =
     }
 });
 
-app.post("/api/tester/families/:id/groups", async (req, res) => {
+app.post(["/api/families/:id/groups", "/api/tester/families/:id/groups"], async (req, res) => {
     const userId = req.user.userId;
     try {
         const family = await requireFamily(req, res);
@@ -3612,7 +3633,7 @@ app.post("/api/tester/families/:id/groups", async (req, res) => {
     }
 });
 
-app.delete("/api/tester/families/:id/groups/:groupId", async (req, res) => {
+app.delete(["/api/families/:id/groups/:groupId", "/api/tester/families/:id/groups/:groupId"], async (req, res) => {
     const userId = req.user.userId;
     try {
         const family = await requireFamily(req, res);
@@ -4049,15 +4070,14 @@ app.delete("/api/shared-sessions/:id/members/:userId", async (req, res) => {
 });
 
 // Add a task: { taskId } shares one of my own tasks (with its details), { name, ... } creates
-// a new one; besides the name every field of SHARED_TASK_FIELDS is optional. group_id (testers):
-// the session's sub-group it goes into.
+// a new one; besides the name every field of SHARED_TASK_FIELDS is optional. group_id: the
+// session's sub-group it goes into.
 app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
     const userId = req.user.userId;
     try {
         const session = await requireOpenSession(req, res);
         if (!session) return;
         const subGroup = await readSubGroup(req, "session", session.sessionId);
-        if (subGroup.forbidden) return testerRequired(res);
         if (subGroup.error) return invalidInput(res, subGroup.error);
 
         let task;
@@ -4139,7 +4159,6 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
         if (before.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
         const task = before.rows[0];
         const subGroup = await readSubGroup(req, "session", session.sessionId);
-        if (subGroup.forbidden) return testerRequired(res);
         if (subGroup.error) return invalidInput(res, subGroup.error);
         if ("value" in subGroup) fields.values.group_id = subGroup.value;
 
@@ -4871,7 +4890,6 @@ app.post(`${familyBase}/:id/tasks`, async (req, res) => {
         if (assignee.error) return invalidInput(res, assignee.error);
         if ("value" in assignee) fields.values.assignee_id = assignee.value;
         const subGroup = await readSubGroup(req, "family", family.familyId);
-        if (subGroup.forbidden) return testerRequired(res);
         if (subGroup.error) return invalidInput(res, subGroup.error);
         if ("value" in subGroup) fields.values.group_id = subGroup.value;
         const columns = ["family_id", "name", "added_by", ...Object.keys(fields.values)];
@@ -4908,7 +4926,6 @@ app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
         if (assignee.error) return invalidInput(res, assignee.error);
         if ("value" in assignee) fields.values.assignee_id = assignee.value;
         const subGroup = await readSubGroup(req, "family", family.familyId);
-        if (subGroup.forbidden) return testerRequired(res);
         if (subGroup.error) return invalidInput(res, subGroup.error);
         if ("value" in subGroup) fields.values.group_id = subGroup.value;
         const before = await pool.query("SELECT due FROM family_tasks WHERE id = $1 AND family_id = $2", [taskId, family.familyId]);
@@ -5755,7 +5772,25 @@ const NOTEBOOK_BODY_MAX = 20000;
 const NOTEBOOK_ATTACHMENTS_MAX = 10;
 const NOTEBOOK_IMAGES_MAX = 4;
 const NOTEBOOK_IMAGE_MAX = 400 * 1024;
-const IMAGE_DATA = /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+=*$/;
+// all pictures of one account's notes together (as sent, base64): a few hundred photos, not gigabytes
+const NOTEBOOK_STORAGE_MAX = limitFromEnv("NOTEBOOK_STORAGE_MAX", 25 * 1024 * 1024);
+
+const imageChars = (attachmentsJson) => JSON.parse(attachmentsJson)
+    .filter(item => item.kind === "image").reduce((sum, item) => sum + item.data.length, 0);
+
+// Whether these attachments still fit, with the pictures of my other notes (not this one)
+async function notebookHasRoom(userId, noteId, attachmentsJson) {
+    const adding = imageChars(attachmentsJson);
+    if (adding === 0) return true;
+    const used = await pool.query(
+        `SELECT COALESCE(sum(length(item->>'data')), 0)::bigint AS chars
+        FROM notebook_notes, jsonb_array_elements(notebook_notes.attachments) AS item
+        WHERE notebook_notes.user_id = $1 AND notebook_notes.id <> $2 AND item->>'kind' = 'image'`,
+        [userId, noteId ?? 0]
+    );
+    return Number(used.rows[0].chars) + adding <= NOTEBOOK_STORAGE_MAX;
+}
+const storageFull = (res) => res.status(413).json({ error: "Your notes hold too many pictures", code: "NOTEBOOK_STORAGE_FULL" });
 const LINK_URL = /^https?:\/\/[^\s]+$/i;
 
 function cleanAttachments(list) {
@@ -5768,7 +5803,7 @@ function cleanAttachments(list) {
             if (title === undefined) return undefined;
             clean.push({ kind: "link", url: item.url, ...(title ? { title } : {}) });
         } else if (item?.kind === "image") {
-            if (typeof item.data !== "string" || item.data.length > NOTEBOOK_IMAGE_MAX || !IMAGE_DATA.test(item.data)) return undefined;
+            if (!readImageData(item.data, NOTEBOOK_IMAGE_MAX, ["png", "jpeg", "webp", "gif"])) return undefined;
             const name = cleanText(item.name, 120);
             if (name === undefined) return undefined;
             clean.push({ kind: "image", data: item.data, ...(name ? { name } : {}) });
@@ -5858,6 +5893,7 @@ app.post("/api/notebook", async (req, res) => {
         if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");
         const count = await pool.query("SELECT count(*)::int AS n FROM notebook_notes WHERE user_id = $1", [req.user.userId]);
         if (count.rows[0].n >= NOTEBOOK_MAX) return res.status(409).json({ error: "Too many notes", code: "NOTEBOOK_LIMIT" });
+        if (values.attachments && !await notebookHasRoom(req.user.userId, null, values.attachments)) return storageFull(res);
         const saved = await pool.query(
             `INSERT INTO notebook_notes (user_id, task_id, title, body, pinned, attachments)
             VALUES ($1, $2, $3, $4, COALESCE($5, false), COALESCE($6::jsonb, '[]'::jsonb)) RETURNING *`,
@@ -5877,6 +5913,7 @@ app.put("/api/notebook/:id", async (req, res) => {
     const columns = Object.keys(values);
     try {
         if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");
+        if (values.attachments && !await notebookHasRoom(req.user.userId, id, values.attachments)) return storageFull(res);
         const sets = columns.map((column, i) => `${column} = $${i + 3}${column === "attachments" ? "::jsonb" : ""}`);
         const result = await pool.query(
             `UPDATE notebook_notes SET ${[...sets, "updated_at = now()"].join(", ")} WHERE id = $1 AND user_id = $2 RETURNING *`,
@@ -5896,6 +5933,105 @@ app.delete("/api/notebook/:id", async (req, res) => {
         const result = await pool.query("DELETE FROM notebook_notes WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
         if (result.rows.length === 0) return notFound(res, "Note");
         res.json({ deleted: id });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- profile pictures (testers first) ----------
+// One square picture per account (user_avatars), made small by the app (WebP / JPEG / PNG, at
+// most AVATAR_DATA_MAX characters as a data: URL). Testers can set one (PUT /api/tester/avatar);
+// anybody can take theirs away (DELETE /api/profile/avatar), admins anybody's
+// (DELETE /api/admin/users/:id/avatar). A picture is seen by its owner and the people who also
+// see the owner's online status: friends, people in open shared sessions and families.
+// The app asks which of the people it shows have one (GET /api/avatars?ids=…, answers
+// { id: version }) and loads each with its version in the address (GET /api/avatars/:id?v=…).
+const AVATAR_DATA_MAX = 120 * 1024;
+
+// The people who see a picture load it again: avatars:changed { userId }
+async function announceAvatar(ownerId) {
+    for (const id of [ownerId, ...await presenceAudience(ownerId)]) realtime.toUser(id, "avatars:changed", { userId: ownerId });
+}
+
+// The ids among `ids` whose picture this viewer may see (themselves included)
+async function visibleAvatarOwners(viewerId, ids) {
+    if (ids.length === 0) return new Set();
+    const audience = new Set(await presenceAudience(viewerId));
+    audience.add(viewerId);
+    return new Set(ids.filter(id => audience.has(id)));
+}
+
+app.put("/api/tester/avatar", async (req, res) => {
+    const picture = readImageData(req.body?.data, AVATAR_DATA_MAX, ["webp", "jpeg", "png"]);
+    if (!picture) return invalidInput(res, "data");
+    try {
+        const saved = await pool.query(
+            `INSERT INTO user_avatars (user_id, image, mime) VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE SET image = EXCLUDED.image, mime = EXCLUDED.mime, updated_at = now()
+            RETURNING updated_at`,
+            [req.user.userId, picture.bytes, picture.mime]
+        );
+        await announceAvatar(req.user.userId);
+        res.json({ avatar: saved.rows[0].updated_at });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.delete("/api/profile/avatar", async (req, res) => {
+    try {
+        await pool.query("DELETE FROM user_avatars WHERE user_id = $1", [req.user.userId]);
+        await announceAvatar(req.user.userId);
+        res.json({ avatar: null });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ?ids=1,2,3 → { "1": "2026-10-28T…" } for the ones with a picture this account may see
+app.get("/api/avatars", async (req, res) => {
+    const ids = [...new Set(String(req.query.ids ?? "").split(",").map(idParam).filter(Boolean))].slice(0, 200);
+    try {
+        const visible = [...await visibleAvatarOwners(req.user.userId, ids)];
+        if (visible.length === 0) return res.json({});
+        const result = await pool.query("SELECT user_id, updated_at FROM user_avatars WHERE user_id = ANY($1::int[])", [visible]);
+        res.json(Object.fromEntries(result.rows.map(row => [row.user_id, row.updated_at])));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// The picture itself. The address carries its version (?v=), so it may be kept a day.
+app.get("/api/avatars/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Picture");
+    try {
+        if (!(await visibleAvatarOwners(req.user.userId, [id])).has(id)) return notFound(res, "Picture");
+        const result = await pool.query("SELECT image, mime FROM user_avatars WHERE user_id = $1", [id]);
+        if (result.rows.length === 0) return notFound(res, "Picture");
+        res.set({
+            "Content-Type": result.rows[0].mime,
+            "Cache-Control": "private, max-age=86400",
+            "Content-Security-Policy": "default-src 'none'",
+            "X-Content-Type-Options": "nosniff",
+        });
+        res.send(result.rows[0].image);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.delete("/api/admin/users/:id/avatar", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "User");
+    try {
+        const target = await pool.query("SELECT id, username FROM users WHERE id = $1", [id]);
+        if (target.rows.length === 0) return notFound(res, "User");
+        const removed = await pool.query("DELETE FROM user_avatars WHERE user_id = $1 RETURNING user_id", [id]);
+        if (removed.rows.length === 0) return notFound(res, "Picture");
+        await logAdminAction(pool, req.admin, target.rows[0], "remove_avatar");
+        await announceAvatar(id);
+        res.json({ avatar: null });
     } catch (err) {
         serverError(res, err);
     }
