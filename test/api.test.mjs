@@ -2328,6 +2328,7 @@ describe("upload safety and profile pictures", () => {
 
     test("anyone takes their own picture away, an admin anybody's (logged)", async () => {
         await call("PUT", "/api/tester/avatar", { data: PNG }, pia.token);
+        assert.equal((await call("GET", "/api/admin/users?q=picpia", null, admin.token)).data.find(u => u.username === "picpia")?.hasAvatar, true);
         assert.equal((await call("DELETE", `/api/admin/users/${pia.id}/avatar`, null, pal.token)).status, 403);
         assert.equal((await call("DELETE", `/api/admin/users/${pia.id}/avatar`, null, admin.token)).status, 200);
         const log = await sql("SELECT action, target_username FROM admin_actions WHERE action = 'remove_avatar'");

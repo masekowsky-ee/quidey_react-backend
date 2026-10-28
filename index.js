@@ -1713,6 +1713,7 @@ async function logAdminAction(db, admin, target, action) {
 const ADMIN_USER_SELECT = `
     SELECT users.id, users.username, users.display_name, users.email, users.created_at,
         users.is_pro, users.is_admin, users.is_tester,
+        EXISTS (SELECT 1 FROM user_avatars WHERE user_avatars.user_id = users.id) AS has_avatar,
         beta_access_requests.status AS request_status, beta_access_requests.reason AS request_reason,
         beta_access_requests.created_at AS request_created_at, beta_access_requests.decided_at AS request_decided_at
     FROM users
@@ -1728,6 +1729,8 @@ const toAdminUser = (row) => ({
     isPro: row.is_pro,
     isAdmin: row.is_admin,
     isTester: row.is_tester,
+    // a profile picture admins may take down
+    hasAvatar: Boolean(row.has_avatar),
     request: row.request_status ? {
         status: row.request_status,
         reason: row.request_reason,
