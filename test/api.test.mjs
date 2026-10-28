@@ -93,7 +93,7 @@ before(async () => {
         cwd: ROOT,
         env: {
             ...process.env, DB_NAME: DB, PORT: String(port), SMTP_HOST: "", CONTACT_TO: "owner@example.com",
-            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", PRESENCE_GRACE_MS: "200",
+            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", FOCUS_CHECK_MS: "200", PRESENCE_GRACE_MS: "200",
             // pushes are only logged ("[DEV] Push to user …"), like mails without SMTP_HOST
             VAPID_PUBLIC_KEY: "", VAPID_PRIVATE_KEY: "",
         },
@@ -2130,5 +2130,133 @@ describe("sub-groups in sessions and families (testers)", () => {
         assert.equal((await call("PATCH", `/api/families/${familyId}/tasks/${entry.id}`, { group_id: foreign }, tia.token)).data.field, "group_id");
         family = (await call("DELETE", `${G}/${groupId}`, null, tia.token)).data;
         assert.deepEqual(family.groups, []);
+    });
+});
+
+describe("Fokusraum: alarm, routines, notebook", () => {
+    let fa, fb, outsider;
+    const device = { endpoint: "https://push.example.com/send/focus-device", keys: { p256dh: "BKeyFocus_-x", auth: "authFocus" } };
+    const pushesFor = (user, text) => log.split("\n").filter(line => line.includes(`[DEV] Push to user ${user.id} (plan): `) && line.includes(text)).length;
+    async function waitForPush(user, text) {
+        for (let i = 0; i < 40 && pushesFor(user, text) < 1; i++) await sleep(100);
+        return pushesFor(user, text);
+    }
+
+    before(async () => {
+        fa = await member("focusfa");
+        fb = await member("focusfb");
+        outsider = await member("focusout", { pro: false });
+        await call("PUT", "/api/push/subscription", device, fa.token);
+    });
+
+    test("the end of a countdown is pushed once, and not after pause", async () => {
+        const soon = new Date(Date.now() + 300).toISOString();
+        const r = await call("PUT", "/api/focus/alarm", { endsAt: soon, phase: "focus" }, fa.token);
+        assert.equal(r.status, 200);
+        assert.equal(await waitForPush(fa, "Pause!"), 1);
+        await sleep(500);
+        assert.equal(pushesFor(fa, "Pause!"), 1, "only once");
+        assert.equal((await sql("SELECT count(*)::int AS n FROM focus_alarms WHERE user_id = $1", [fa.id]))[0].n, 0);
+
+        // set again and taken away (pause): nothing comes
+        await call("PUT", "/api/focus/alarm", { endsAt: new Date(Date.now() + 400).toISOString(), phase: "timer" }, fa.token);
+        assert.equal((await call("DELETE", "/api/focus/alarm", null, fa.token)).status, 200);
+        await sleep(800);
+        assert.equal(pushesFor(fa, "Zeit ist um"), 0);
+    });
+
+    test("alarm input is checked and needs app access", async () => {
+        const inAMinute = new Date(Date.now() + 60e3).toISOString();
+        assert.equal((await call("PUT", "/api/focus/alarm", { endsAt: "soon", phase: "focus" }, fa.token)).data.field, "endsAt");
+        assert.equal((await call("PUT", "/api/focus/alarm", { endsAt: new Date(Date.now() + 9 * 3600e3).toISOString(), phase: "focus" }, fa.token)).data.field, "endsAt");
+        assert.equal((await call("PUT", "/api/focus/alarm", { endsAt: inAMinute, phase: "nap" }, fa.token)).data.field, "phase");
+        assert.equal((await call("PUT", "/api/focus/alarm", { endsAt: inAMinute, phase: "focus" }, outsider.token)).data.code, "PRO_REQUIRED");
+        assert.equal((await call("PUT", "/api/focus/alarm", { endsAt: inAMinute, phase: "focus" })).status, 401);
+    });
+
+    test("routines: create, plan, change, run and delete, only my own", async () => {
+        const steps = [{ title: "Fenster auf", minutes: 1 }, { title: "Schreibtisch frei", minutes: 5 }, { title: "Boden saugen", minutes: 10 }];
+        let r = await call("POST", "/api/routines", { name: "Putzen", emoji: "\u{1F9FD}", steps, days: [6, 1, 6], atTime: "18:30" }, fa.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        const routine = r.data;
+        assert.deepEqual(routine.days, [1, 6]);
+        assert.equal(routine.atTime, "18:30");
+        assert.equal(routine.steps.length, 3);
+        assert.equal(routine.doneToday, false);
+
+        assert.equal((await call("POST", "/api/routines", { name: "", steps }, fa.token)).data.field, "name");
+        assert.equal((await call("POST", "/api/routines", { name: "Leer", steps: [] }, fa.token)).data.field, "steps");
+        assert.equal((await call("POST", "/api/routines", { name: "X", steps, days: [8] }, fa.token)).data.field, "days");
+        assert.equal((await call("POST", "/api/routines", { name: "X", steps, atTime: "25:00" }, fa.token)).data.field, "atTime");
+
+        r = await call("PUT", `/api/routines/${routine.id}`, { atTime: null, remind: false }, fa.token);
+        assert.equal(r.data.atTime, null);
+        assert.equal(r.data.remind, false);
+        assert.equal((await call("PUT", `/api/routines/${routine.id}`, { name: "Meins" }, fb.token)).status, 404);
+
+        r = await call("POST", `/api/routines/${routine.id}/runs`, { startedAt: new Date(Date.now() - 600e3).toISOString(), stepsDone: 3, stepsTotal: 3, seconds: 600 }, fa.token);
+        assert.equal(r.status, 201);
+        assert.equal(r.data.doneToday, true);
+        assert.equal(r.data.runsThisWeek, 1);
+        assert.equal((await call("POST", `/api/routines/${routine.id}/runs`, { startedAt: new Date().toISOString(), stepsDone: 4, stepsTotal: 3, seconds: 1 }, fa.token)).data.field, "stepsDone");
+        assert.equal((await call("POST", `/api/routines/${routine.id}/runs`, { startedAt: new Date().toISOString(), stepsDone: 1, stepsTotal: 3, seconds: 1 }, fb.token)).status, 404);
+
+        assert.equal((await call("GET", "/api/routines", null, fb.token)).data.length, 0);
+        assert.equal((await call("DELETE", `/api/routines/${routine.id}`, null, fb.token)).status, 404);
+        assert.equal((await call("DELETE", `/api/routines/${routine.id}`, null, fa.token)).status, 200);
+        assert.equal((await call("GET", "/api/routines", null, fa.token)).data.length, 0);
+    });
+
+    test("a routine planned for now is pushed once today", async () => {
+        const [{ now, weekday }] = await sql("SELECT to_char(now() AT TIME ZONE 'Europe/Berlin' - interval '1 minute', 'HH24:MI') AS now, extract(isodow FROM now() AT TIME ZONE 'Europe/Berlin' - interval '1 minute')::int AS weekday");
+        const r = await call("POST", "/api/routines", { name: "Lernstart", steps: [{ title: "Handy weg", minutes: 0 }], days: [weekday], atTime: now }, fa.token);
+        assert.equal(r.status, 201);
+        assert.equal(await waitForPush(fa, "Lernstart"), 1);
+        await sleep(500);
+        assert.equal(pushesFor(fa, "Lernstart"), 1);
+    });
+
+    test("notebook: notes with checklist, links and a picture; the list leaves picture data out", async () => {
+        const created = (await call("POST", "/api/tasks", { name: "Klausur Mathe" }, fa.token)).data;
+        const taskId = created.id ?? created.task?.id;
+        assert.ok(taskId, JSON.stringify(created));
+        const picture = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let r = await call("POST", "/api/notebook", {
+            title: "Formeln", body: "- [ ] Ableitungen\n- [x] Integrale", taskId,
+            attachments: [{ kind: "link", url: "https://de.wikipedia.org/wiki/Ableitung", title: "Wiki" }, { kind: "image", data: picture, name: "tafel.png" }],
+        }, fa.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        const note = r.data;
+        assert.equal(note.attachments[1].data, picture);
+        assert.equal(note.taskId, taskId);
+
+        const list = (await call("GET", "/api/notebook", null, fa.token)).data;
+        assert.equal(list.length, 1);
+        assert.deepEqual(list[0].attachments[1], { kind: "image", name: "tafel.png" });
+        assert.equal((await call("GET", `/api/notebook/${note.id}`, null, fa.token)).data.attachments[1].data, picture);
+
+        assert.equal((await call("POST", "/api/notebook", { title: "", body: " " }, fa.token)).data.field, "body");
+        assert.equal((await call("POST", "/api/notebook", { body: "x", attachments: [{ kind: "link", url: "javascript:alert(1)" }] }, fa.token)).data.field, "attachments");
+        assert.equal((await call("POST", "/api/notebook", { body: "x", attachments: [{ kind: "image", data: "data:image/svg+xml;base64,PHN2Zz4=" }] }, fa.token)).data.field, "attachments");
+        assert.equal((await call("POST", "/api/notebook", { body: "x", taskId }, fb.token)).status, 404, "not somebody else's task");
+
+        r = await call("PUT", `/api/notebook/${note.id}`, { pinned: true, body: "- [x] Ableitungen" }, fa.token);
+        assert.equal(r.data.pinned, true);
+        assert.equal(r.data.title, "Formeln", "fields not sent stay");
+        assert.equal((await call("GET", `/api/notebook/${note.id}`, null, fb.token)).status, 404);
+        assert.equal((await call("DELETE", `/api/notebook/${note.id}`, null, fb.token)).status, 404);
+        assert.equal((await call("DELETE", `/api/notebook/${note.id}`, null, fa.token)).status, 200);
+    });
+
+    test("everything goes with the account", async () => {
+        const gone = await member("focusgone");
+        await call("POST", "/api/routines", { name: "R", steps: [{ title: "a", minutes: 1 }] }, gone.token);
+        await call("POST", "/api/notebook", { body: "n" }, gone.token);
+        await call("PUT", "/api/focus/alarm", { endsAt: new Date(Date.now() + 3600e3).toISOString(), phase: "timer" }, gone.token);
+        const r = await call("DELETE", "/api/users", { password: PW }, gone.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        const left = await sql(`SELECT (SELECT count(*) FROM routines WHERE user_id = $1)::int + (SELECT count(*) FROM notebook_notes WHERE user_id = $1)::int
+            + (SELECT count(*) FROM focus_alarms WHERE user_id = $1)::int AS n`, [gone.id]);
+        assert.equal(left[0].n, 0);
     });
 });

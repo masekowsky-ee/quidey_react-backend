@@ -9,6 +9,7 @@ const jwt = require("jsonwebtoken");
 const { hashToken, createVerificationToken } = require("./utils/verificationToken");
 const { sendVerificationMail, sendContactMail, sendFeedbackMail } = require("./utils/mailer");
 const { startReminderMails } = require("./utils/reminderMails");
+const { startFocusSchedule } = require("./utils/focus");
 const { PUSH_PUBLIC_KEY, PUSH_KINDS, PUSH_MAX_DEVICES, PUSH_TEXTS, pushLater, deliver, startPushSchedule } = require("./utils/push");
 const http = require("node:http");
 const realtime = require("./realtime");
@@ -77,6 +78,7 @@ app.use(cors({
         callback(null, false); // no CORS headers: the browser blocks the response
     },
 }));
+app.use("/api/notebook", express.json({ limit: "4mb" })); // notes carry small pictures
 app.use(express.json({ limit: "100kb" })); // parse json bodies; bigger ones are refused
 
 // Slows down password guessing: 10 failed attempts per IP per 15 minutes on login and register.
@@ -224,6 +226,9 @@ app.use("/api/feed", authenticateToken);
 app.use("/api/progress", authenticateToken);
 app.use("/api/families", authenticateToken);
 app.use("/api/push", authenticateToken);
+app.use("/api/focus", authenticateToken);
+app.use("/api/routines", authenticateToken);
+app.use("/api/notebook", authenticateToken);
 
 // Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
 // Checked against the account on every request (not stored in the token; see loadAccount), so
@@ -237,7 +242,7 @@ function requirePro(req, res, next) {
 }
 
 app.use(
-    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families", "/api/push"],
+    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families", "/api/push", "/api/focus", "/api/routines", "/api/notebook"],
     requirePro
 );
 
@@ -5540,6 +5545,362 @@ app.post("/api/push/test", pushTestLimiter, async (req, res) => {
     }
 });
 
+// ---------- Fokusraum: the alarm at the end of a countdown ----------
+// The app sets it on start: { endsAt (ISO time), phase: 'timer' | 'focus' | 'short' | 'long' };
+// the server pushes then (utils/focus.js). Pause and stop take it away. One per account.
+const FOCUS_PHASES = ["timer", "focus", "short", "long"];
+const FOCUS_ALARM_MAX_AHEAD = 6 * 60 * 60 * 1000;
+
+app.put("/api/focus/alarm", async (req, res) => {
+    const { endsAt, phase } = req.body ?? {};
+    const at = typeof endsAt === "string" && endsAt.length <= 40 ? Date.parse(endsAt) : NaN;
+    if (Number.isNaN(at) || at < Date.now() - 60 * 1000 || at > Date.now() + FOCUS_ALARM_MAX_AHEAD) return invalidInput(res, "endsAt");
+    if (!FOCUS_PHASES.includes(phase)) return invalidInput(res, "phase");
+    try {
+        await pool.query(
+            `INSERT INTO focus_alarms (user_id, fire_at, phase) VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE SET fire_at = EXCLUDED.fire_at, phase = EXCLUDED.phase`,
+            [req.user.userId, new Date(at).toISOString(), phase]
+        );
+        res.json({ endsAt: new Date(at).toISOString(), phase });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.delete("/api/focus/alarm", async (req, res) => {
+    try {
+        await pool.query("DELETE FROM focus_alarms WHERE user_id = $1", [req.user.userId]);
+        res.json({ alarm: null });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- Routines ----------
+// A routine: { name, emoji?, steps: [{ title, minutes }], days: [1..7] (Monday = 1), atTime:
+// "HH:MM" | null, remind }. The app guides through the steps; a finished (or ended) run is
+// booked with POST /api/routines/:id/runs. Planned ones are pushed at their time (utils/focus.js).
+const ROUTINE_MAX = 50;
+const ROUTINE_STEPS_MAX = 30;
+const ROUTINE_NAME_MAX = 60;
+const ROUTINE_STEP_MAX = 80;
+
+function cleanRoutine(body, partial) {
+    const out = {};
+    if (!partial || body.name !== undefined) {
+        const name = cleanText(body.name, ROUTINE_NAME_MAX);
+        if (!name) return { field: "name" };
+        out.name = name;
+    }
+    if (body.emoji !== undefined) {
+        const emoji = cleanText(body.emoji, 8);
+        if (emoji === undefined) return { field: "emoji" };
+        out.emoji = emoji;
+    }
+    if (!partial || body.steps !== undefined) {
+        const steps = body.steps;
+        if (!Array.isArray(steps) || steps.length < 1 || steps.length > ROUTINE_STEPS_MAX) return { field: "steps" };
+        const clean = [];
+        for (const step of steps) {
+            const title = cleanText(step?.title, ROUTINE_STEP_MAX);
+            const minutes = Number(step?.minutes ?? 0);
+            if (!title || !Number.isInteger(minutes) || minutes < 0 || minutes > 240) return { field: "steps" };
+            clean.push({ title, minutes });
+        }
+        out.steps = JSON.stringify(clean);
+    }
+    if (body.days !== undefined) {
+        const days = body.days;
+        if (!Array.isArray(days) || days.length > 7 || days.some(day => !Number.isInteger(day) || day < 1 || day > 7)) return { field: "days" };
+        out.days = [...new Set(days)].sort();
+    }
+    if (body.atTime !== undefined) {
+        if (body.atTime !== null && (typeof body.atTime !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(body.atTime))) return { field: "atTime" };
+        out.at_time = body.atTime;
+    }
+    if (body.remind !== undefined) {
+        if (typeof body.remind !== "boolean") return { field: "remind" };
+        out.remind = body.remind;
+    }
+    return { values: out };
+}
+
+// how a routine is answered; the runs (routine_runs) as lastRunAt, doneToday (in my time zone)
+// and runsThisWeek (the last 7 days)
+const ROUTINE_SELECT = `
+    SELECT routines.*, to_char(routines.at_time, 'HH24:MI') AS at_time_text,
+        runs.last_run_at, runs.done_today, runs.runs_week
+    FROM routines
+    JOIN users ON users.id = routines.user_id
+    LEFT JOIN LATERAL (
+        SELECT max(finished_at) AS last_run_at,
+            bool_or((finished_at AT TIME ZONE COALESCE(users.timezone, 'Europe/Berlin'))::date = (now() AT TIME ZONE COALESCE(users.timezone, 'Europe/Berlin'))::date) AS done_today,
+            count(*) FILTER (WHERE finished_at > now() - interval '7 days')::int AS runs_week
+        FROM routine_runs WHERE routine_runs.routine_id = routines.id
+    ) AS runs ON true`;
+
+const routineJson = (row) => ({
+    id: row.id,
+    name: row.name,
+    emoji: row.emoji,
+    steps: row.steps,
+    days: row.days ?? [],
+    atTime: row.at_time_text ?? null,
+    remind: row.remind,
+    lastRunAt: row.last_run_at ?? null,
+    doneToday: Boolean(row.done_today),
+    runsThisWeek: row.runs_week ?? 0,
+});
+
+async function loadRoutine(id, userId) {
+    const result = await pool.query(`${ROUTINE_SELECT} WHERE routines.id = $1 AND routines.user_id = $2`, [id, userId]);
+    return result.rows[0] ? routineJson(result.rows[0]) : null;
+}
+
+app.get("/api/routines", async (req, res) => {
+    try {
+        const result = await pool.query(`${ROUTINE_SELECT} WHERE routines.user_id = $1 ORDER BY routines.at_time NULLS LAST, routines.id`, [req.user.userId]);
+        res.json(result.rows.map(routineJson));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.post("/api/routines", async (req, res) => {
+    const { field, values } = cleanRoutine(req.body ?? {}, false);
+    if (field) return invalidInput(res, field);
+    try {
+        const count = await pool.query("SELECT count(*)::int AS n FROM routines WHERE user_id = $1", [req.user.userId]);
+        if (count.rows[0].n >= ROUTINE_MAX) return res.status(409).json({ error: "Too many routines", code: "ROUTINE_LIMIT" });
+        const saved = await pool.query(
+            `INSERT INTO routines (user_id, name, emoji, steps, days, at_time, remind)
+            VALUES ($1, $2, $3, $4::jsonb, COALESCE($5::smallint[], '{}'), $6, COALESCE($7, true)) RETURNING id`,
+            [req.user.userId, values.name, values.emoji ?? null, values.steps, values.days ?? null, values.at_time ?? null, values.remind ?? null]
+        );
+        res.status(201).json(await loadRoutine(saved.rows[0].id, req.user.userId));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.put("/api/routines/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Routine");
+    const { field, values } = cleanRoutine(req.body ?? {}, true);
+    if (field) return invalidInput(res, field);
+    const columns = Object.keys(values);
+    try {
+        if (columns.length > 0) {
+            const sets = columns.map((column, i) => `${column} = $${i + 3}${column === "steps" ? "::jsonb" : ""}`);
+            // a changed plan may remind again today
+            if (values.at_time !== undefined || values.days !== undefined) sets.push("reminded_on = NULL");
+            const result = await pool.query(
+                `UPDATE routines SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 AND user_id = $2 RETURNING id`,
+                [id, req.user.userId, ...columns.map(column => values[column])]
+            );
+            if (result.rows.length === 0) return notFound(res, "Routine");
+        }
+        const routine = await loadRoutine(id, req.user.userId);
+        if (!routine) return notFound(res, "Routine");
+        res.json(routine);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.delete("/api/routines/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Routine");
+    try {
+        const result = await pool.query("DELETE FROM routines WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
+        if (result.rows.length === 0) return notFound(res, "Routine");
+        res.json({ deleted: id });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// A run through it: { startedAt, stepsDone, stepsTotal, seconds }
+app.post("/api/routines/:id/runs", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Routine");
+    const { startedAt, stepsDone, stepsTotal, seconds } = req.body ?? {};
+    const started = typeof startedAt === "string" && startedAt.length <= 40 ? Date.parse(startedAt) : NaN;
+    if (Number.isNaN(started) || started > Date.now() + 60 * 1000 || started < Date.now() - 24 * 60 * 60 * 1000) return invalidInput(res, "startedAt");
+    if (!Number.isInteger(stepsTotal) || stepsTotal < 1 || stepsTotal > ROUTINE_STEPS_MAX) return invalidInput(res, "stepsTotal");
+    if (!Number.isInteger(stepsDone) || stepsDone < 0 || stepsDone > stepsTotal) return invalidInput(res, "stepsDone");
+    if (!Number.isInteger(seconds) || seconds < 0 || seconds > 24 * 60 * 60) return invalidInput(res, "seconds");
+    try {
+        const result = await pool.query(
+            `INSERT INTO routine_runs (routine_id, user_id, started_at, steps_done, steps_total, seconds)
+            SELECT id, user_id, $3, $4, $5, $6 FROM routines WHERE id = $1 AND user_id = $2
+            RETURNING id`,
+            [id, req.user.userId, new Date(started).toISOString(), stepsDone, stepsTotal, seconds]
+        );
+        if (result.rows.length === 0) return notFound(res, "Routine");
+        res.status(201).json(await loadRoutine(id, req.user.userId));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- Notebook (Fokusraum) ----------
+// Notes of my own, on their own or about a task: { title, body, taskId?, pinned, attachments }.
+// attachments: [{ kind: 'link', url, title? } | { kind: 'image', data: 'data:image/…;base64,…', name? }]
+// (pictures made small by the app). The list leaves the pictures' data out (GET one note for it).
+const NOTEBOOK_MAX = 300;
+const NOTEBOOK_TITLE_MAX = 120;
+const NOTEBOOK_BODY_MAX = 20000;
+const NOTEBOOK_ATTACHMENTS_MAX = 10;
+const NOTEBOOK_IMAGES_MAX = 4;
+const NOTEBOOK_IMAGE_MAX = 400 * 1024;
+const IMAGE_DATA = /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+=*$/;
+const LINK_URL = /^https?:\/\/[^\s]+$/i;
+
+function cleanAttachments(list) {
+    if (!Array.isArray(list) || list.length > NOTEBOOK_ATTACHMENTS_MAX) return undefined;
+    const clean = [];
+    for (const item of list) {
+        if (item?.kind === "link") {
+            if (typeof item.url !== "string" || item.url.length > 2000 || !LINK_URL.test(item.url)) return undefined;
+            const title = cleanText(item.title, 120);
+            if (title === undefined) return undefined;
+            clean.push({ kind: "link", url: item.url, ...(title ? { title } : {}) });
+        } else if (item?.kind === "image") {
+            if (typeof item.data !== "string" || item.data.length > NOTEBOOK_IMAGE_MAX || !IMAGE_DATA.test(item.data)) return undefined;
+            const name = cleanText(item.name, 120);
+            if (name === undefined) return undefined;
+            clean.push({ kind: "image", data: item.data, ...(name ? { name } : {}) });
+        } else {
+            return undefined;
+        }
+    }
+    if (clean.filter(item => item.kind === "image").length > NOTEBOOK_IMAGES_MAX) return undefined;
+    return clean;
+}
+
+function cleanNote(body, partial) {
+    const out = {};
+    if (!partial || body.title !== undefined) {
+        const title = cleanText(body.title ?? "", NOTEBOOK_TITLE_MAX);
+        if (title === undefined) return { field: "title" };
+        out.title = title ?? "";
+    }
+    if (!partial || body.body !== undefined) {
+        if (body.body !== undefined && body.body !== null && (typeof body.body !== "string" || body.body.length > NOTEBOOK_BODY_MAX)) return { field: "body" };
+        out.body = body.body ?? "";
+    }
+    if (body.pinned !== undefined) {
+        if (typeof body.pinned !== "boolean") return { field: "pinned" };
+        out.pinned = body.pinned;
+    }
+    if (body.taskId !== undefined) {
+        if (body.taskId !== null && !idParam(body.taskId)) return { field: "taskId" };
+        out.task_id = body.taskId === null ? null : idParam(body.taskId);
+    }
+    if (body.attachments !== undefined) {
+        const attachments = cleanAttachments(body.attachments);
+        if (!attachments) return { field: "attachments" };
+        out.attachments = JSON.stringify(attachments);
+    }
+    if (!partial && !out.title && !out.body.trim() && !(body.attachments?.length)) return { field: "body" };
+    return { values: out };
+}
+
+// full: with the pictures' data; otherwise only that they are there
+const noteJson = (row, full) => ({
+    id: row.id,
+    title: row.title,
+    body: row.body,
+    taskId: row.task_id,
+    pinned: row.pinned,
+    attachments: full ? row.attachments : row.attachments.map(item => item.kind === "image" ? { kind: "image", name: item.name ?? null } : item),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+});
+
+// a task the note is about must be one I can see
+async function taskVisible(taskId, userId) {
+    if (!taskId) return true;
+    const check = await pool.query(`SELECT 1 FROM (${accessibleTaskIds("$2")}) AS mine WHERE id = $1`, [taskId, userId]);
+    return check.rows.length > 0;
+}
+
+app.get("/api/notebook", async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT * FROM notebook_notes WHERE user_id = $1 ORDER BY pinned DESC, updated_at DESC",
+            [req.user.userId]
+        );
+        res.json(result.rows.map(row => noteJson(row, false)));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.get("/api/notebook/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Note");
+    try {
+        const result = await pool.query("SELECT * FROM notebook_notes WHERE id = $1 AND user_id = $2", [id, req.user.userId]);
+        if (result.rows.length === 0) return notFound(res, "Note");
+        res.json(noteJson(result.rows[0], true));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.post("/api/notebook", async (req, res) => {
+    const { field, values } = cleanNote(req.body ?? {}, false);
+    if (field) return invalidInput(res, field);
+    try {
+        if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");
+        const count = await pool.query("SELECT count(*)::int AS n FROM notebook_notes WHERE user_id = $1", [req.user.userId]);
+        if (count.rows[0].n >= NOTEBOOK_MAX) return res.status(409).json({ error: "Too many notes", code: "NOTEBOOK_LIMIT" });
+        const saved = await pool.query(
+            `INSERT INTO notebook_notes (user_id, task_id, title, body, pinned, attachments)
+            VALUES ($1, $2, $3, $4, COALESCE($5, false), COALESCE($6::jsonb, '[]'::jsonb)) RETURNING *`,
+            [req.user.userId, values.task_id ?? null, values.title, values.body, values.pinned ?? null, values.attachments ?? null]
+        );
+        res.status(201).json(noteJson(saved.rows[0], true));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.put("/api/notebook/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Note");
+    const { field, values } = cleanNote(req.body ?? {}, true);
+    if (field) return invalidInput(res, field);
+    const columns = Object.keys(values);
+    try {
+        if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");
+        const sets = columns.map((column, i) => `${column} = $${i + 3}${column === "attachments" ? "::jsonb" : ""}`);
+        const result = await pool.query(
+            `UPDATE notebook_notes SET ${[...sets, "updated_at = now()"].join(", ")} WHERE id = $1 AND user_id = $2 RETURNING *`,
+            [id, req.user.userId, ...columns.map(column => values[column])]
+        );
+        if (result.rows.length === 0) return notFound(res, "Note");
+        res.json(noteJson(result.rows[0], true));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.delete("/api/notebook/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Note");
+    try {
+        const result = await pool.query("DELETE FROM notebook_notes WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
+        if (result.rows.length === 0) return notFound(res, "Note");
+        res.json({ deleted: id });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
 // Unknown routes, and errors no route handled (e.g. invalid JSON): short JSON answers,
 // never Express's HTML page with a stack trace
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
@@ -5559,6 +5920,8 @@ realtime.initRealtime(server, { allowedOrigins, tokenAlgorithm: TOKEN_ALGORITHM 
 startReminderMails(pool, limitFromEnv("REMINDER_CHECK_MS", 60 * 1000));
 // push notifications for tasks and events at their time, and the morning overview
 startPushSchedule(pool, limitFromEnv("REMINDER_CHECK_MS", 60 * 1000));
+// the end of a countdown (Fokusraum) and planned routines, every few seconds
+startFocusSchedule(pool, limitFromEnv("FOCUS_CHECK_MS", 5 * 1000));
 // events that are over are ticked off, also checked once a minute (first right away)
 closePastEvents();
 setInterval(closePastEvents, limitFromEnv("EVENT_CHECK_MS", 60 * 1000)).unref();
