@@ -814,6 +814,7 @@ app.post("/api/beta-requests", authenticateToken, async (req, res) => {
         }
         const row = result.rows[0];
         res.status(201).json({ status: row.status, reason: row.reason, createdAt: row.created_at });
+        pushBetaRequest(userId, row.reason);
     } catch (err) {
         serverError(res, err);
     }
@@ -5468,6 +5469,14 @@ function pushInvite(text, userIds, fromId, name) {
     if (userIds.length === 0) return;
     pushSender(fromId)
         .then((from) => from && pushLater(pool, userIds, "social", (language) => PUSH_TEXTS[text]({ from, name }, language)))
+        .catch((err) => console.error(err));
+}
+
+// A "social" push to every admin when somebody asks for beta access, so the request can be
+// answered from the phone. Fire and forget.
+function pushBetaRequest(fromId, reason) {
+    Promise.all([pushSender(fromId), pool.query("SELECT id FROM users WHERE is_admin OR is_owner")])
+        .then(([from, admins]) => from && pushLater(pool, admins.rows.map(row => row.id), "social", (language) => PUSH_TEXTS.betaRequest({ from, reason }, language)))
         .catch((err) => console.error(err));
 }
 

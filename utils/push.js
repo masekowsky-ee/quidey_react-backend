@@ -13,7 +13,8 @@
 //             of day counts from my all-day time, users.allday_reminder_time)
 //   digest    the morning overview of the day (DIGEST_FROM in my time zone)
 //   messages  direct messages
-//   social    friend requests, invites, tasks shared with / given to me, news from the team
+//   social    friend requests, invites, tasks shared with / given to me, news from the team;
+//             for admins also new beta requests
 // Only accounts with app access get anything (closed beta). A device the push service no longer
 // knows (404 / 410) is forgotten.
 
@@ -117,6 +118,13 @@ const TEXTS = {
         return language === "en"
             ? { title: "A task for you", body: `${who} gave you “${clip(name, 80)}” in “${session}”.`, url: `/together/${sessionId}`, tag: `assigned-${sessionId}` }
             : { title: "Eine Aufgabe für dich", body: `${who} hat dir „${clip(name, 80)}“ in „${session}“ gegeben.`, url: `/together/${sessionId}`, tag: `assigned-${sessionId}` };
+    },
+    // for the admins: somebody asks to get into the closed beta
+    betaRequest({ from, reason }, language) {
+        const who = from.displayName || from.username;
+        return language === "en"
+            ? { title: "New beta request", body: `${who}: ${clip(reason, 160)}`, url: "/admin", tag: "beta-request", renotify: true }
+            : { title: "Neue Beta-Anfrage", body: `${who}: ${clip(reason, 160)}`, url: "/admin", tag: "beta-request", renotify: true };
     },
     broadcast({ title, body }) {
         return { title: clip(title, 120), body: clip(body, 180), url: "/inbox?tab=notices", tag: "broadcast" };

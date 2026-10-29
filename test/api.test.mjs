@@ -1981,6 +1981,17 @@ describe("push notifications", () => {
         assert.equal(await waitForPushes(pic, "social", "Pushpia lädt dich zu „Klausur“ ein."), 1);
     });
 
+    test("a beta request is pushed to the admins, not to anybody else", async () => {
+        const boss = await member("pushboss", { admin: true });
+        await call("PUT", "/api/push/subscription", device(6), boss.token);
+        const asker = await member("pushask", { pro: false });
+        const asked = await call("POST", "/api/beta-requests", { reason: "Ich will besser lernen." }, asker.token);
+        assert.equal(asked.status, 201);
+        assert.equal(await waitForPushes(boss, "social", "Neue Beta-Anfrage — Pushask: Ich will besser lernen."), 1);
+        await sleep(300);
+        assert.equal(pushesFor(pic, "social", "Beta-Anfrage"), 0);
+    });
+
     test("a task is pushed at its reminder, once; without a reminder it stays quiet", async () => {
         const reminded = (await call("POST", "/api/tasks", { name: "Essay abgeben", prio: 50, description: "", ...utcIn(10), reminders: [15] }, pia.token)).data;
         await call("POST", "/api/tasks", { name: "Vorlesung", prio: 50, description: "", ...utcIn(-1), kind: "event", location: "Hörsaal 2", reminders: [0] }, pia.token);
