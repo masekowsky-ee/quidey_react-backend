@@ -16,9 +16,19 @@ const FRONTEND_URL = (process.env.FRONTEND_URL || "http://localhost:5173").repla
 // The two languages of the app; anything else gets German
 const langOf = (language) => (language === "en" ? "en" : "de");
 
-// Every mail goes out with a text and an HTML part (some people read mails as plain text)
+// The sender address must be on the domain verified at the mail service (Resend: mail.quidey.com,
+// whose DNS has the DKIM key and the SPF/bounce records). Any other address fails DKIM and SPF,
+// and Gmail / iCloud put such mails into spam or refuse them.
+if (transporter && !process.env.MAIL_FROM) {
+    console.warn("SMTP_HOST is set but MAIL_FROM is not: mails can't be sent. Use an address on the verified domain, e.g. hallo@mail.quidey.com.");
+}
+
+// Every mail goes out with a text and an HTML part (some people read mails as plain text).
+// "Antworten" goes to MAIL_REPLY_TO when it is set (an inbox somebody reads), unless the mail
+// names its own (contact form, feedback).
 async function send({ from = "Quidey", ...mail }) {
-    await transporter.sendMail({ from: `"${from}" <${process.env.MAIL_FROM}>`, ...mail });
+    const replyTo = process.env.MAIL_REPLY_TO;
+    await transporter.sendMail({ from: `"${from}" <${process.env.MAIL_FROM}>`, ...(replyTo ? { replyTo } : {}), ...mail });
 }
 
 const linkHtml = (url) =>
