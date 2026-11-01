@@ -17,10 +17,14 @@
 //             for admins also new beta requests
 // Only accounts with app access get anything (closed beta). A device the push service no longer
 // knows (404 / 410) is forgotten.
+//
+// Devices of the Android app don't use Web Push: their endpoint is 'fcm:<token>' and they get
+// their messages through Firebase Cloud Messaging (utils/fcm.js, FIREBASE_SERVICE_ACCOUNT_FILE).
 
 const webpush = require("web-push");
 const { APP_ACCESS_SQL } = require("./access");
 const { DEFAULT_TIMEZONE } = require("./reminderMails");
+const { FCM_ENABLED, isFcmEndpoint, sendFcm } = require("./fcm");
 
 const PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 const PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
@@ -135,9 +139,15 @@ const TEXTS = {
 // Returns true when it was handed over.
 async function deliver(pool, device, kind, message) {
     const payload = { ...message, kind };
-    if (!ENABLED) {
-        console.log(`[DEV] Push to user ${device.user_id} (${kind}): ${payload.title} — ${payload.body}`);
+    const fcm = isFcmEndpoint(device.endpoint);
+    if (!(fcm ? FCM_ENABLED : ENABLED)) {
+        console.log(`[DEV] Push to user ${device.user_id} (${kind}${fcm ? ", app" : ""}): ${payload.title} — ${payload.body}`);
         return true;
+    }
+    if (fcm) {
+        const result = await sendFcm(device.endpoint, kind, message, TTL[kind] ?? 3600);
+        if (result === "gone") await pool.query("DELETE FROM push_subscriptions WHERE id = $1", [device.id]).catch(() => {});
+        return result === "sent";
     }
     try {
         await webpush.sendNotification(
@@ -288,6 +298,6 @@ function startPushSchedule(pool, everyMs = 60 * 1000) {
 }
 
 module.exports = {
-    PUSH_ENABLED: ENABLED, PUSH_PUBLIC_KEY: PUBLIC_KEY, PUSH_KINDS: KINDS, PUSH_MAX_DEVICES: MAX_DEVICES, PUSH_TEXTS: TEXTS,
+    PUSH_ENABLED: ENABLED, PUSH_PUBLIC_KEY: PUBLIC_KEY, PUSH_FCM_ENABLED: FCM_ENABLED, PUSH_KINDS: KINDS, PUSH_MAX_DEVICES: MAX_DEVICES, PUSH_TEXTS: TEXTS,
     pushToUsers, pushLater, deliver, startPushSchedule, pushDueEntries, pushDigests,
 };

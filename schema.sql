@@ -592,16 +592,20 @@ CREATE TABLE public.push_subscriptions (
     id integer NOT NULL,
     user_id integer NOT NULL,
     endpoint text NOT NULL,
-    p256dh text NOT NULL,
-    auth text NOT NULL,
+    p256dh text,
+    auth text,
     plan boolean DEFAULT true NOT NULL,
     digest boolean DEFAULT true NOT NULL,
     messages boolean DEFAULT true NOT NULL,
     social boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT push_subscriptions_endpoint_check CHECK (((endpoint ~ '^https://'::text) AND (char_length(endpoint) <= 1000))),
-    CONSTRAINT push_subscriptions_keys_check CHECK ((((char_length(p256dh) >= 1) AND (char_length(p256dh) <= 200)) AND ((char_length(auth) >= 1) AND (char_length(auth) <= 100))))
+    CONSTRAINT push_subscriptions_endpoint_check CHECK (((char_length(endpoint) <= 1000) AND ((endpoint ~ '^https://'::text) OR (endpoint ~ '^fcm:[A-Za-z0-9_:-]+$'::text)))),
+    CONSTRAINT push_subscriptions_keys_check CHECK (
+CASE
+    WHEN (endpoint ~ '^fcm:'::text) THEN ((p256dh IS NULL) AND (auth IS NULL))
+    ELSE (((char_length(p256dh) >= 1) AND (char_length(p256dh) <= 200)) AND ((char_length(auth) >= 1) AND (char_length(auth) <= 100)))
+END)
 );
 
 --
@@ -1017,6 +1021,8 @@ CREATE TABLE public.users (
     push_digest_on date,
     allday_reminder_time time without time zone DEFAULT '12:00:00'::time without time zone NOT NULL,
     tour_seen_at timestamp with time zone,
+    google_sub text,
+    has_password boolean DEFAULT true NOT NULL,
     CONSTRAINT users_avatar_emoji_check CHECK (((avatar_emoji IS NULL) OR (length(avatar_emoji) <= 16))),
     CONSTRAINT users_avatar_frame_check CHECK (((avatar_frame IS NULL) OR (avatar_frame = ANY (ARRAY['ring'::text, 'double'::text, 'dotted'::text, 'orbit'::text])))),
     CONSTRAINT users_banner_check CHECK (((banner IS NULL) OR (banner = ANY (ARRAY['gradient'::text, 'aurora'::text, 'dots'::text, 'stripes'::text, 'grid'::text, 'glow'::text, 'rings'::text, 'topo'::text, 'sky'::text])))),
@@ -1736,6 +1742,13 @@ CREATE INDEX tester_feedback_topic_idx ON public.tester_feedback USING btree (to
 
 CREATE UNIQUE INDEX users_email_lower_unique ON public.users USING btree (lower(email));
 
+
+--
+-- Name: users_google_sub_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX users_google_sub_key ON public.users USING btree (google_sub);
+
 --
 -- Name: users_username_lower_unique; Type: INDEX; Schema: public; Owner: -
 --
@@ -2271,6 +2284,34 @@ CREATE TABLE IF NOT EXISTS public.user_avatars (
     mime text NOT NULL CHECK (mime IN ('image/webp', 'image/jpeg', 'image/png')),
     updated_at timestamp with time zone NOT NULL DEFAULT now()
 );
+
+--
+-- 035: Quidey Pro subscriptions (see migrations/035_pro_subscriptions.sql)
+--
+
+CREATE TABLE IF NOT EXISTS public.subscriptions (
+    id serial PRIMARY KEY,
+    user_id integer REFERENCES public.users(id) ON DELETE SET NULL,
+    provider text NOT NULL,
+    provider_id text NOT NULL,
+    plan text NOT NULL,
+    status text NOT NULL,
+    current_period_end timestamp with time zone,
+    cancel_at_period_end boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT subscriptions_provider_check CHECK (provider IN ('stripe', 'play')),
+    CONSTRAINT subscriptions_plan_check CHECK (plan IN ('monthly', 'yearly')),
+    CONSTRAINT subscriptions_provider_id_check CHECK (char_length(provider_id) BETWEEN 1 AND 1000),
+    CONSTRAINT subscriptions_status_check CHECK (char_length(status) BETWEEN 1 AND 40),
+    CONSTRAINT subscriptions_provider_key UNIQUE (provider, provider_id)
+);
+
+CREATE INDEX IF NOT EXISTS subscriptions_user_idx ON public.subscriptions USING btree (user_id);
+
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS pro_until timestamp with time zone;
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS stripe_customer_id text;
+CREATE UNIQUE INDEX IF NOT EXISTS users_stripe_customer_key ON public.users USING btree (stripe_customer_id);
 
 --
 -- PostgreSQL database dump complete

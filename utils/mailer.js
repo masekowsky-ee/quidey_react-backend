@@ -260,4 +260,54 @@ async function sendFeedbackMail({ category, message, page, rating = null, user }
     });
 }
 
-module.exports = { sendVerificationMail, sendReminderMail, sendContactMail, sendFeedbackMail };
+// The confirmation of a cancellation through the cancel button (§ 312k BGB: right away, in text
+// form, with what was cancelled and when it came in) to the address given there, and a copy to
+// CONTACT_TO so the operator sees every one (also those that matched no subscription).
+// found: how many running subscriptions it matched (0: the operator looks into it by hand).
+async function sendCancellationMail({ name, email, username, reason, explanation, receivedAt, found }, lang = "de") {
+    const en = lang === "en";
+    const when = receivedAt.toLocaleString(en ? "en-GB" : "de-DE", { timeZone: "Europe/Berlin", dateStyle: "long", timeStyle: "short" });
+    const kind = reason === "extraordinary" ? (en ? "extraordinary (for good cause)" : "außerordentlich (aus wichtigem Grund)") : (en ? "ordinary, at the next possible date" : "ordentlich, zum nächstmöglichen Zeitpunkt");
+    const heading = en ? "We have received your cancellation" : "Deine Kündigung ist eingegangen";
+    const intro = en
+        ? `Hello ${name}, thank you for having supported Quidey. Your cancellation of Quidey Pro reached us on ${when} (Berlin time).`
+        : `Hallo ${name}, danke, dass du Quidey unterstützt hast. Deine Kündigung von Quidey Pro ist am ${when} (Berliner Zeit) bei uns eingegangen.`;
+    const next = found > 0
+        ? (en ? "Your subscription ends at the end of the period already paid; nothing more will be charged. Until then you keep Pro." : "Dein Abo endet zum Ende des bereits bezahlten Zeitraums; danach wird nichts mehr abgebucht. Bis dahin behältst du Pro.")
+        : (en ? "We couldn't match it to a subscription right away and will look into it by hand; you'll hear from us. Subscriptions bought in Google Play are cancelled in the Play Store (Payments & subscriptions)." : "Wir konnten sie nicht sofort einem Abo zuordnen und kümmern uns persönlich darum; du hörst von uns. Abos aus Google Play kündigst du im Play Store (Zahlungen & Abos).");
+    const details = [
+        { label: en ? "Contract" : "Vertrag", value: "Quidey Pro" },
+        { label: en ? "Type" : "Art", value: escapeHtml(kind) },
+        { label: "Name", value: escapeHtml(name) },
+        { label: en ? "Email" : "E-Mail", value: escapeHtml(email) },
+    ];
+    if (username) details.push({ label: en ? "Username" : "Benutzername", value: escapeHtml(username) });
+    if (explanation) details.push({ label: en ? "Reason" : "Grund", value: textToHtml(explanation) });
+    details.push({ label: en ? "Received" : "Eingegangen", value: escapeHtml(when) });
+    const lines = [
+        `${en ? "Contract" : "Vertrag"}: Quidey Pro`, `${en ? "Type" : "Art"}: ${kind}`, `Name: ${name}`,
+        `${en ? "Email" : "E-Mail"}: ${email}`, username && `${en ? "Username" : "Benutzername"}: ${username}`,
+        explanation && `${en ? "Reason" : "Grund"}: ${explanation}`, `${en ? "Received" : "Eingegangen"}: ${when}`,
+    ].filter(Boolean);
+    const text = `${heading}\n\n${intro}\n\n${lines.join("\n")}\n\n${next}\n`;
+
+    if (!transporter) {
+        console.log(`[DEV] Cancellation confirmation to ${email} (matched ${found}):\n${text}`);
+        return;
+    }
+    const html = renderMail({ lang, preheader: intro.slice(0, 120), heading, paragraphs: [escapeHtml(intro)], details, after: [escapeHtml(next)], homeUrl: FRONTEND_URL });
+    await send({ to: email, subject: en ? "Quidey Pro: cancellation received" : "Quidey Pro: Kündigung eingegangen", text, html });
+    const to = process.env.CONTACT_TO;
+    if (to) {
+        await send({
+            from: "Quidey Kündigung",
+            to,
+            replyTo: { name, address: email },
+            subject: `Kündigung Quidey Pro: ${name}${found > 0 ? "" : " (nicht zugeordnet, bitte prüfen)"}`,
+            text,
+            html,
+        });
+    }
+}
+
+module.exports = { sendVerificationMail, sendReminderMail, sendContactMail, sendFeedbackMail, sendCancellationMail };

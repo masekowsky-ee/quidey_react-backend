@@ -12,11 +12,22 @@ import net from "node:net";
 import pg from "pg";
 import dotenv from "dotenv";
 import { io } from "socket.io-client";
+import { generateKeyPairSync } from "node:crypto";
+import jwt from "jsonwebtoken";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 dotenv.config({ path: join(ROOT, ".env"), quiet: true });
 
 const DB = `quidey_test_${process.pid}`;
+// Sign in with Google: the server checks the tests' own tokens with this key (GOOGLE_TEST_CERTS)
+const GOOGLE_CLIENT = "test-client.apps.googleusercontent.com";
+const GOOGLE_KEY = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const GOOGLE_KID = "test-key";
+const googleToken = (claims) => jwt.sign(
+    { iss: "https://accounts.google.com", aud: GOOGLE_CLIENT, email_verified: true, ...claims },
+    GOOGLE_KEY.privateKey.export({ type: "pkcs8", format: "pem" }),
+    { algorithm: "RS256", keyid: GOOGLE_KID, expiresIn: "5m" }
+);
 const PW = "Sup3r-secret-pass!";
 const conn = (database) => ({
     user: process.env.DB_USER, password: process.env.DB_PASSWORD,
@@ -96,6 +107,10 @@ before(async () => {
             RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", FOCUS_CHECK_MS: "200", NOTEBOOK_STORAGE_MAX: "4000", PRESENCE_GRACE_MS: "200",
             // pushes are only logged ("[DEV] Push to user …"), like mails without SMTP_HOST
             VAPID_PUBLIC_KEY: "", VAPID_PRIVATE_KEY: "",
+            // the Android app's pushes are only logged too; no payments set up
+            FIREBASE_SERVICE_ACCOUNT_FILE: "", STRIPE_SECRET_KEY: "", PLAY_SERVICE_ACCOUNT_FILE: "", ACCESS_MODE: "beta",
+            GOOGLE_CLIENT_IDS: GOOGLE_CLIENT,
+            GOOGLE_TEST_CERTS: JSON.stringify({ [GOOGLE_KID]: GOOGLE_KEY.publicKey.export({ type: "spki", format: "pem" }) }),
         },
     });
     server.stdout.on("data", (chunk) => { log += chunk; });
@@ -1925,7 +1940,7 @@ describe("push notifications", () => {
     });
 
     test("a device signs up with its address and keys; kinds start on and change one by one", async () => {
-        assert.deepEqual((await call("GET", "/api/push/key", null, pia.token)).data, { publicKey: null }, "no keys: only logged");
+        assert.deepEqual((await call("GET", "/api/push/key", null, pia.token)).data, { publicKey: null, fcm: false }, "no keys: only logged");
         assert.equal((await call("PUT", "/api/push/subscription", { ...device(1), endpoint: "http://insecure.example.com/x" }, pia.token)).data.field, "endpoint");
         assert.equal((await call("PUT", "/api/push/subscription", { ...device(1), keys: { p256dh: "a b", auth: "x" } }, pia.token)).data.field, "keys");
         assert.equal((await call("PUT", "/api/push/subscription", { ...device(1), kinds: { spam: true } }, pia.token)).data.field, "kinds");
@@ -2349,5 +2364,166 @@ describe("upload safety and profile pictures", () => {
         await call("PUT", "/api/tester/avatar", { data: PNG }, pia.token);
         assert.equal((await call("DELETE", "/api/profile/avatar", null, pia.token)).status, 200);
         assert.equal((await sql("SELECT count(*)::int AS n FROM user_avatars WHERE user_id = $1", [pia.id]))[0].n, 0);
+    });
+});
+
+describe("sign in with Google", () => {
+    const nonce = async () => (await call("GET", "/api/auth/google/nonce")).data.nonce;
+    const signIn = async (claims) => call("POST", "/api/auth/google", { idToken: googleToken({ nonce: await nonce(), ...claims }) });
+    const consents = { accept_terms: true, accept_privacy: true, confirm_age: true };
+
+    test("a new Google account asks for the rest, then signs in; the nonce works once", async () => {
+        const n = await nonce();
+        const idToken = googleToken({ sub: "g-new-1", email: "gnew@example.com", name: "Gina New", nonce: n });
+        const first = await call("POST", "/api/auth/google", { idToken });
+        assert.equal(first.status, 200);
+        assert.equal(first.data.signup.email, "gnew@example.com");
+        assert.equal(first.data.signup.username, "gnew");
+        assert.equal((await call("POST", "/api/auth/google", { idToken })).data.code, "GOOGLE_INVALID", "used up");
+
+        const form = { signupToken: first.data.signup.token, username: "gina", display_name: "Gina", birth_date: "2000-01-01", ...consents };
+        assert.equal((await call("POST", "/api/auth/google/register", { ...form, birth_date: daysFromToday(-365 * 10) })).data.code, "TOO_YOUNG");
+        assert.equal((await call("POST", "/api/auth/google/register", { ...form, accept_terms: false })).data.code, "TERMS_REQUIRED");
+        assert.equal((await call("POST", "/api/auth/google/register", { ...form, signupToken: "x" })).data.code, "GOOGLE_SIGNUP_EXPIRED");
+        const made = await call("POST", "/api/auth/google/register", form);
+        assert.equal(made.status, 201);
+        const [row] = await sql("SELECT email_verified, has_password, google_sub, is_tester, is_pro FROM users WHERE username = 'gina'");
+        assert.deepEqual(row, { email_verified: true, has_password: false, google_sub: "g-new-1", is_tester: false, is_pro: false });
+        const me = (await call("GET", "/api/me", null, made.data.token)).data;
+        assert.equal(me.isPro, false, "closed beta: no access yet");
+        assert.equal(me.hasPassword, false);
+        assert.equal(me.googleLinked, true);
+        assert.equal((await call("POST", "/api/login", { username: "gina", password: PW })).status, 401, "no password to sign in with");
+
+        const again = await signIn({ sub: "g-new-1", email: "gnew@example.com" });
+        assert.equal(again.data.username, "gina");
+    });
+
+    test("a token for another client, without a confirmed address or a nonce of ours is refused", async () => {
+        assert.equal((await signIn({ sub: "g-x", email: "x@example.com", aud: "someone-else" })).data.code, "GOOGLE_INVALID");
+        assert.equal((await signIn({ sub: "g-x", email: "x@example.com", email_verified: false })).data.code, "GOOGLE_INVALID");
+        const forged = googleToken({ sub: "g-x", email: "x@example.com", nonce: "made-up" });
+        assert.equal((await call("POST", "/api/auth/google", { idToken: forged })).data.code, "GOOGLE_INVALID");
+    });
+
+    test("an existing account is found by its address; an unconfirmed one loses its password", async () => {
+        const ok = await member("gold");
+        const linked = await signIn({ sub: "g-gold", email: "GOLD@example.com" });
+        assert.equal(linked.data.username, "gold");
+        assert.equal((await call("POST", "/api/login", { username: "gold", password: PW })).status, 200, "a confirmed account keeps its password");
+        assert.equal((await call("GET", "/api/users", null, ok.token)).status, 200, "and its logins");
+        assert.equal((await signIn({ sub: "g-other", email: "gold@example.com" })).data.code, "GOOGLE_OTHER_ACCOUNT");
+
+        await register("squatter", "victim@example.com");
+        const taken = await signIn({ sub: "g-victim", email: "victim@example.com" });
+        assert.equal(taken.data.username, "squatter");
+        assert.equal((await call("POST", "/api/login", { username: "squatter", password: PW })).status, 401, "whoever made it can't get in any more");
+        const [row] = await sql("SELECT email_verified, has_password FROM users WHERE username = 'squatter'");
+        assert.deepEqual(row, { email_verified: true, has_password: false });
+    });
+
+    test("an account without a password sets its first one freely and deletes itself with its username", async () => {
+        const make = async (sub, username) => {
+            const signup = (await signIn({ sub, email: `${username}@example.com` })).data.signup;
+            return (await call("POST", "/api/auth/google/register", { signupToken: signup.token, username, display_name: "G", birth_date: "1990-01-01", ...consents })).data;
+        };
+        const made = await make("g-del", "gdel");
+        assert.equal((await call("DELETE", "/api/users", { password: "x" }, made.token)).data.code, "WRONG_USERNAME");
+        const set = await call("PUT", "/api/users/password", { newPassword: "a-new-password" }, made.token);
+        assert.equal(set.status, 200);
+        assert.equal((await call("POST", "/api/login", { username: "gdel", password: "a-new-password" })).status, 200);
+        assert.equal((await call("PUT", "/api/users/password", { newPassword: "another-pass" }, set.data.token)).data.code, "WRONG_PASSWORD", "now it needs the current one");
+
+        const made2 = await make("g-del2", "gdel2");
+        assert.equal((await call("DELETE", "/api/users", { confirmUsername: "nope" }, made2.token)).data.code, "WRONG_USERNAME");
+        assert.equal((await call("DELETE", "/api/users", { confirmUsername: "GDEL2" }, made2.token)).status, 200);
+    });
+});
+
+describe("access: testers, Pro and admins", () => {
+    test("beta access makes a tester; Pro is paid (pro_until) or a gift; taking tester away ends the access", async () => {
+        const tess = await member("tessa", { pro: false });
+        const boss = await member("tessboss", { admin: true });
+        assert.equal((await call("GET", "/api/tasks", null, tess.token)).data.code, "PRO_REQUIRED");
+        await call("POST", "/api/beta-requests", { reason: "I want to try it out please" }, tess.token);
+        await call("POST", `/api/admin/requests/${tess.id}/approve`, null, boss.token);
+        const [row] = await sql("SELECT is_tester, is_pro FROM users WHERE id = $1", [tess.id]);
+        assert.deepEqual(row, { is_tester: true, is_pro: false });
+        const me = (await call("GET", "/api/me", null, tess.token)).data;
+        assert.equal(me.isPro, true, "may use the app");
+        assert.equal(me.isTester, true);
+        assert.equal(me.pro.active, false);
+        assert.equal(me.accessMode, "beta");
+        assert.equal(me.limits, null);
+
+        await call("PATCH", `/api/admin/users/${tess.id}`, { isTester: false }, boss.token);
+        assert.equal((await call("GET", "/api/tasks", null, tess.token)).data.code, "PRO_REQUIRED");
+
+        // paid: the account is read fresh after a payment (the cache is skipped by signing in anew is
+        // not enough, so this waits out nothing: /api/me reads the row itself)
+        await sql("UPDATE users SET pro_until = now() + interval '30 days' WHERE id = $1", [tess.id]);
+        const proMe = (await call("GET", "/api/me", null, tess.token)).data;
+        assert.equal(proMe.isPro, true, "paid Pro gets in");
+        assert.equal(proMe.isTester, false, "but sees nothing in test");
+        assert.equal(proMe.pro.active, true);
+    });
+});
+
+describe("Android app: push through Firebase", () => {
+    const token = "fcm-token_abc:DEF-0123456789xyz";
+    test("a device signs up with its FCM token and no keys; pushes to it are logged as the app's", async () => {
+        const ana = await member("fcmana");
+        assert.equal((await call("PUT", "/api/push/subscription", { endpoint: `fcm:${token}`, keys: { p256dh: "a", auth: "b" } }, ana.token)).data.field, "keys");
+        assert.equal((await call("PUT", "/api/push/subscription", { endpoint: "fcm:short" }, ana.token)).data.field, "endpoint");
+        const saved = await call("PUT", "/api/push/subscription", { endpoint: `fcm:${token}` }, ana.token);
+        assert.equal(saved.status, 200);
+        assert.deepEqual(saved.data.kinds, { plan: true, digest: true, messages: true, social: true });
+        assert.equal((await call("POST", "/api/push/test", { endpoint: `fcm:${token}` }, ana.token)).data.sent, true);
+        const line = `[DEV] Push to user ${ana.id} (plan, app): Quidey`;
+        for (let i = 0; i < 20 && !log.includes(line); i++) await sleep(50);
+        assert.ok(log.includes(line));
+        assert.equal((await call("DELETE", "/api/push/subscription", { endpoint: `fcm:${token}` }, ana.token)).status, 200);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM push_subscriptions WHERE user_id = $1", [ana.id]))[0].n, 0);
+    });
+});
+
+describe("Quidey Pro: billing", () => {
+    test("without payments set up: the status answers, buying says it's off; anyone signed in may ask", async () => {
+        const out = await member("buyer", { pro: false });
+        const status = (await call("GET", "/api/billing", null, out.token)).data;
+        assert.equal(status.active, false);
+        assert.equal(status.stripe, false);
+        assert.equal(status.play, false);
+        assert.deepEqual(status.prices, { currency: "EUR", monthly: 2.99, yearly: 25 });
+        assert.match(status.playAccountId, /^[0-9a-f]{64}$/);
+        assert.equal((await call("POST", "/api/billing/checkout", { plan: "monthly" }, out.token)).data.code, "BILLING_DISABLED");
+        assert.equal((await call("POST", "/api/billing/play", { purchaseToken: "abcdefghijkl" }, out.token)).data.code, "BILLING_DISABLED");
+        assert.equal((await call("GET", "/api/billing")).status, 401);
+        assert.equal((await fetch(`${API}/api/billing/play-notifications?token=x`, { method: "POST" })).status, 403);
+    });
+
+    test("a running subscription gives Pro until its end; a cancelled one runs to its end", async () => {
+        const sub = await member("subber", { pro: false });
+        await sql(
+            `INSERT INTO subscriptions (user_id, provider, provider_id, plan, status, current_period_end, cancel_at_period_end)
+            VALUES ($1, 'stripe', 'sub_test_1', 'yearly', 'active', now() + interval '200 days', true)`,
+            [sub.id]
+        );
+        await sql("UPDATE users SET pro_until = (SELECT current_period_end FROM subscriptions WHERE provider_id = 'sub_test_1') WHERE id = $1", [sub.id]);
+        const status = (await call("GET", "/api/billing", null, sub.token)).data;
+        assert.equal(status.active, true);
+        assert.equal(status.subscription.plan, "yearly");
+        assert.equal(status.subscription.cancelAtPeriodEnd, true);
+    });
+
+    test("the cancel button needs no sign-in, confirms right away and never says whether an account matched", async () => {
+        assert.equal((await call("POST", "/api/billing/cancel", { name: "", email: "x@example.com" })).data.field, "name");
+        assert.equal((await call("POST", "/api/billing/cancel", { name: "A", email: "x@example.com", reason: "extraordinary" })).data.field, "explanation");
+        const res = await call("POST", "/api/billing/cancel", { name: "Nobody", email: "nobody@example.com", reason: "ordinary" });
+        assert.equal(res.status, 200);
+        assert.equal(res.data.received, true);
+        const line = "[DEV] Cancellation confirmation to nobody@example.com (matched 0)";
+        for (let i = 0; i < 20 && !log.includes(line); i++) await sleep(50);
+        assert.ok(log.includes(line));
     });
 });
