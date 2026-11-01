@@ -97,7 +97,7 @@ async function accountFor(token, algorithm) {
         return null;
     }
     const result = await pool.query(
-        "SELECT id, is_pro, is_tester, is_admin, token_version FROM users WHERE id = $1",
+        "SELECT id, is_pro, pro_until, is_tester, is_admin, token_version FROM users WHERE id = $1",
         [payload.userId]
     );
     const account = result.rows[0];

@@ -6,14 +6,19 @@ const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
 const pool = require("./db");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const crypto = require("node:crypto");
+const { OAuth2Client } = require("google-auth-library");
 const { hashToken, createVerificationToken } = require("./utils/verificationToken");
-const { sendVerificationMail, sendContactMail, sendFeedbackMail } = require("./utils/mailer");
+const { sendVerificationMail, sendContactMail, sendFeedbackMail, sendCancellationMail } = require("./utils/mailer");
+const billing = require("./utils/billing");
 const { startReminderMails } = require("./utils/reminderMails");
 const { startFocusSchedule } = require("./utils/focus");
-const { PUSH_PUBLIC_KEY, PUSH_KINDS, PUSH_MAX_DEVICES, PUSH_TEXTS, pushLater, deliver, startPushSchedule } = require("./utils/push");
+const { PUSH_PUBLIC_KEY, PUSH_FCM_ENABLED, PUSH_KINDS, PUSH_MAX_DEVICES, PUSH_TEXTS, pushLater, deliver, startPushSchedule } = require("./utils/push");
 const http = require("node:http");
 const realtime = require("./realtime");
-const { hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
+const { ACCESS_MODE, hasPro, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
+const { FREE_LIMITS, FREE_STATS_DAYS, limited, usage, refuseOverLimit } = require("./utils/limits");
+const { FCM_ENDPOINT, isFcmEndpoint } = require("./utils/fcm");
 const progress = require("./utils/progress");
 const { PROFILE_COLORS, PROFILE_BANNERS, PROFILE_EMOJIS, AVATAR_FRAMES, PROFILE_TITLES, SHOWCASE_MAX, BADGES } = progress;
 
@@ -82,7 +87,8 @@ app.use(cors({
 // larger limit, but only further down, once the request is signed in, has beta access and passed
 // the rate limit: nobody without an account can make the server read megabytes.
 const smallJson = express.json({ limit: "100kb" });
-app.use((req, res, next) => (req.path.startsWith("/api/notebook") ? next() : smallJson(req, res, next)));
+// (Stripe's webhook reads its body raw: the signature is over the exact bytes)
+app.use((req, res, next) => (req.path.startsWith("/api/notebook") || req.path === "/api/billing/stripe-webhook" ? next() : smallJson(req, res, next)));
 
 // Slows down password guessing: 10 failed attempts per IP per 15 minutes on login and register.
 // Successful requests and CORS preflights (OPTIONS) don't count.
@@ -166,7 +172,7 @@ async function loadAccount(userId) {
     const cached = accountCache.get(userId);
     if (cached && Date.now() - cached.at < ACCOUNT_CACHE_MS) return cached.account;
     const result = await pool.query(
-        "SELECT id, username, is_pro, is_tester, is_admin, token_version FROM users WHERE id = $1",
+        "SELECT id, username, is_pro, pro_until, is_tester, is_admin, token_version FROM users WHERE id = $1",
         [userId]
     );
     const account = result.rows[0] ?? null;
@@ -240,6 +246,7 @@ app.use("/api/notebook", authenticateToken);
 // /api/me, /api/users (own account) and /api/beta-requests stay open, for the beta screen.
 function requirePro(req, res, next) {
     if (!hasAppAccess(req.account)) {
+        // (the code is older than Pro: it means "no access", the app then shows the beta page)
         return res.status(403).json({ error: "Quidey is in closed beta", code: "PRO_REQUIRED" });
     }
     next();
@@ -761,7 +768,8 @@ app.get("/api/sessions/:id/tasks", async (req, res) => {
 app.get("/api/me" , authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
-            `SELECT users.username, users.is_pro, users.is_admin, users.is_tester,
+            `SELECT users.id, users.username, users.is_pro, users.pro_until, users.is_admin, users.is_tester, users.has_password,
+                users.google_sub IS NOT NULL AS google_linked,
                 to_char(users.allday_reminder_time, 'HH24:MI') AS allday_reminder_time,
                 users.tour_seen_at IS NOT NULL AS tour_seen,
                 beta_access_requests.status, beta_access_requests.reason, beta_access_requests.created_at,
@@ -778,6 +786,7 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
         res.json({
             userId: req.user.userId,
             username: row.username,
+            // isPro: may use the app (the name is older than Pro; old app versions read it)
             isPro: hasAppAccess(row),
             isAdmin: row.is_admin,
             isTester: hasTesterAccess(row),
@@ -785,6 +794,13 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
             betaRequest: row.status ? { status: row.status, reason: row.reason, createdAt: row.created_at } : null,
             allDayReminderTime: row.allday_reminder_time,
             tourSeen: row.tour_seen,
+            accessMode: ACCESS_MODE,
+            // Pro: paid (pro_until ahead) or a gift (is_pro); limits/usage only on the free plan
+            pro: { active: hasPro(row), gift: row.is_pro, until: row.pro_until },
+            limits: limited(row) ? { ...FREE_LIMITS, statsDays: FREE_STATS_DAYS } : null,
+            usage: limited(row) ? await usage(pool, row.id) : null,
+            hasPassword: row.has_password,
+            googleLinked: row.google_linked,
         });
     } catch (err) {
         serverError(res, err);
@@ -799,7 +815,7 @@ app.post("/api/beta-requests", authenticateToken, async (req, res) => {
     if (reason.length > 1000) return res.status(400).json({ error: "The reason is too long", code: "REASON_TOO_LONG" });
 
     try {
-        const user = await pool.query("SELECT is_pro, is_tester, is_admin FROM users WHERE id = $1", [userId]);
+        const user = await pool.query("SELECT is_pro, pro_until, is_tester, is_admin FROM users WHERE id = $1", [userId]);
         if (user.rows.length === 0) return res.status(401).json({ error: "User not found" });
         if (hasAppAccess(user.rows[0])) return res.status(409).json({ error: "You already have access", code: "ALREADY_PRO" });
 
@@ -841,6 +857,8 @@ app.post("/api/tasks", async (req, res) => {
     if (extras.values.kind !== "event") delete extras.values.event_type_id;
     // an end only for something that repeats
     if (!extras.values.repeat) delete extras.values.repeat_left;
+    // the free plan's limits (utils/limits.js)
+    if (await refuseOverLimit(pool, res, req.account, extras.values.kind === "event" ? "events" : "tasks")) return;
 
     const columns = ["name", "due", "description", "prio", "user_id", ...Object.keys(extras.values)];
     const values = [name, due, description, prio, userId, ...Object.values(extras.values)];
@@ -980,6 +998,7 @@ app.post("/api/groups", async (req, res) => {
     const color = req.body?.color === undefined ? null : TASK_EXTRAS.color(req.body.color);
     if (!name) return invalidInput(res, "name");
     if (description === undefined) return invalidInput(res, "description");
+    if (await refuseOverLimit(pool, res, req.account, "groups")) return;
     if (color === undefined) return invalidInput(res, "color");
 
     try {
@@ -1441,6 +1460,191 @@ app.post("/api/login", loginAccountLimiter, async (req, res) => {
     }
 });
 
+// ---------- Sign in with Google ----------
+// The app gets an ID token from Google (web: Google's sign-in page sends the person back with
+// it; Android: the system's account picker) and hands it over here. GOOGLE_CLIENT_IDS lists the
+// OAuth client ids such a token may be made for (the web client; the Android app asks for tokens
+// for the same one). Without it these routes answer 503 GOOGLE_DISABLED and the app hides the button.
+//
+// Every token must carry a nonce this server handed out just before (GET /api/auth/google/nonce),
+// and each nonce works once and for 10 minutes: a token that leaked can't be used again.
+//
+// An account is found by users.google_sub, else by its email address (then Google is linked to
+// it). Nobody yet: the answer is { signup } with a short-lived token for POST
+// /api/auth/google/register, which asks for what every account needs (username, birth date,
+// consents). Accounts made that way have no password (users.has_password = false).
+const GOOGLE_CLIENT_IDS = (process.env.GOOGLE_CLIENT_IDS || "").split(",").map(id => id.trim()).filter(Boolean);
+const GOOGLE_ISSUERS = ["accounts.google.com", "https://accounts.google.com"];
+const googleClient = new OAuth2Client();
+// the tests sign their own tokens with these certificates (never on the real server)
+const GOOGLE_TEST_CERTS = !IS_PRODUCTION && process.env.GOOGLE_TEST_CERTS ? JSON.parse(process.env.GOOGLE_TEST_CERTS) : null;
+const GOOGLE_NONCE_TTL_MS = 10 * 60 * 1000;
+const GOOGLE_NONCES_MAX = 10000;
+const googleNonces = new Map();
+const GOOGLE_SIGNUP_PURPOSE = "google-signup";
+
+const googleDisabled = (res) => res.status(503).json({ error: "Sign in with Google is not set up", code: "GOOGLE_DISABLED" });
+
+// Google's ID token, checked: signature, audience, issuer, expiry, a verified address and one of
+// our nonces (used up here). Answers { sub, email, name } or null.
+async function googleIdentity(idToken) {
+    if (typeof idToken !== "string" || idToken.length > 4096) return null;
+    let payload;
+    try {
+        const ticket = GOOGLE_TEST_CERTS
+            ? await googleClient.verifySignedJwtWithCertsAsync(idToken, GOOGLE_TEST_CERTS, GOOGLE_CLIENT_IDS, GOOGLE_ISSUERS)
+            : await googleClient.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_IDS });
+        payload = ticket.getPayload();
+    } catch {
+        return null;
+    }
+    const expires = googleNonces.get(payload?.nonce);
+    if (!expires) return null;
+    googleNonces.delete(payload.nonce);
+    if (expires < Date.now() || !payload.sub || !payload.email || payload.email_verified !== true) return null;
+    return {
+        sub: String(payload.sub),
+        email: String(payload.email).slice(0, 254),
+        name: typeof payload.name === "string" ? payload.name.trim().slice(0, 50) : "",
+    };
+}
+
+// A username to start from: the address's local part, cleaned, made free with a number
+async function suggestUsername(email) {
+    let base = email.split("@")[0].replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 24);
+    if (base.length < 3) base = `${base}user`.slice(0, 24);
+    for (let attempt = 0; attempt < 5; attempt++) {
+        const candidate = attempt === 0 ? base : `${base}${Math.floor(100 + Math.random() * 900)}`;
+        const taken = await pool.query("SELECT 1 FROM users WHERE lower(username) = lower($1)", [candidate]);
+        if (taken.rows.length === 0) return candidate;
+    }
+    return "";
+}
+
+// a password hash nobody knows: accounts made with Google can't sign in with a password
+const unusablePasswordHash = () => bcrypt.hash(crypto.randomBytes(32).toString("hex"), 10);
+
+app.use("/api/auth", authLimiter);
+
+// A fresh nonce for one sign-in with Google: { nonce }
+app.get("/api/auth/google/nonce", (req, res) => {
+    if (GOOGLE_CLIENT_IDS.length === 0) return googleDisabled(res);
+    const now = Date.now();
+    // the oldest first (a Map keeps the order): expired ones go, and the oldest when it's full
+    for (const [nonce, expires] of googleNonces) {
+        if (expires < now || googleNonces.size >= GOOGLE_NONCES_MAX) googleNonces.delete(nonce);
+        else break;
+    }
+    const nonce = crypto.randomBytes(24).toString("base64url");
+    googleNonces.set(nonce, now + GOOGLE_NONCE_TTL_MS);
+    res.json({ nonce });
+});
+
+// Sign in with Google: { idToken }. Answers { token, username } like /api/login, or { signup:
+// { token, email, name, username } } when there is no account for this Google account yet.
+app.post("/api/auth/google", async (req, res) => {
+    if (GOOGLE_CLIENT_IDS.length === 0) return googleDisabled(res);
+    const google = await googleIdentity(req.body?.idToken);
+    if (!google) return res.status(401).json({ error: "Google sign in failed", code: "GOOGLE_INVALID" });
+    try {
+        let user = (await pool.query("SELECT id, username, token_version FROM users WHERE google_sub = $1", [google.sub])).rows[0];
+        if (!user) {
+            const byEmail = (await pool.query(
+                "SELECT id, username, token_version, email_verified, google_sub FROM users WHERE lower(email) = lower($1)",
+                [google.email]
+            )).rows[0];
+            if (byEmail?.google_sub) {
+                // the address belongs to an account that is linked to another Google account
+                return res.status(409).json({ error: "This account is linked to another Google account", code: "GOOGLE_OTHER_ACCOUNT" });
+            }
+            if (byEmail) {
+                // Google vouches for the address, so it counts as confirmed now. An account whose
+                // address was never confirmed could have been made by somebody else with this
+                // address: its password stops working and its logins end, so only the owner of the
+                // address gets in.
+                const passwordHash = byEmail.email_verified ? null : await unusablePasswordHash();
+                user = (await pool.query(
+                    `UPDATE users SET google_sub = $2, email_verified = true,
+                        password_hash = COALESCE($3, password_hash),
+                        has_password = CASE WHEN $3::text IS NULL THEN has_password ELSE false END,
+                        token_version = token_version + CASE WHEN $3::text IS NULL THEN 0 ELSE 1 END
+                    WHERE id = $1 RETURNING id, username, token_version`,
+                    [byEmail.id, google.sub, passwordHash]
+                )).rows[0];
+                forgetAccount(user.id);
+                if (passwordHash) realtime.disconnectUser(user.id);
+            }
+        }
+        if (user) return res.json({ token: signToken(user), username: user.username });
+
+        const signupToken = jwt.sign(
+            { purpose: GOOGLE_SIGNUP_PURPOSE, sub: google.sub, email: google.email, name: google.name },
+            process.env.JWT_SECRET,
+            { algorithm: TOKEN_ALGORITHM, expiresIn: "30m" }
+        );
+        res.json({ signup: { token: signupToken, email: google.email, name: google.name, username: await suggestUsername(google.email) } });
+    } catch (err) {
+        if (err.code === "23505") return res.status(409).json({ error: "Already linked", code: "GOOGLE_OTHER_ACCOUNT" });
+        serverError(res, err);
+    }
+});
+
+// A new account with Google: { signupToken, username, display_name, birth_date, accept_terms,
+// accept_privacy, confirm_age, language? }. The address is Google's (confirmed), there is no
+// password. Answers 201 { token, username }; the account is in the closed beta like any new one.
+app.post("/api/auth/google/register", registerLimiter, async (req, res) => {
+    if (GOOGLE_CLIENT_IDS.length === 0) return googleDisabled(res);
+    const fail = (status, code, error) => res.status(status).json({ error, code });
+    let google;
+    try {
+        google = jwt.verify(String(req.body?.signupToken ?? ""), process.env.JWT_SECRET, { algorithms: [TOKEN_ALGORITHM] });
+    } catch {
+        return fail(401, "GOOGLE_SIGNUP_EXPIRED", "Please sign in with Google again");
+    }
+    if (google?.purpose !== GOOGLE_SIGNUP_PURPOSE || typeof google.sub !== "string" || typeof google.email !== "string") {
+        return fail(401, "GOOGLE_SIGNUP_EXPIRED", "Please sign in with Google again");
+    }
+    const username = typeof req.body?.username === "string" ? req.body.username.trim() : "";
+    const displayName = typeof req.body?.display_name === "string" ? req.body.display_name.trim() : "";
+    const language = LANGUAGES.includes(req.body?.language) ? req.body.language : null;
+    const birthDate = req.body?.birth_date;
+    if (!USERNAME_PATTERN.test(username)) return fail(400, "INVALID_USERNAME", "Username must be 3-30 letters, digits, _ . or -");
+    if (!displayName || displayName.length > 50) return fail(400, "INVALID_DISPLAY_NAME", "Display name must be 1-50 characters");
+    const age = ageFromBirthDate(birthDate);
+    if (age === null || age > 130) return fail(400, "INVALID_BIRTH_DATE", "Invalid birth date");
+    if (age < MIN_AGE) return fail(400, "TOO_YOUNG", `You must be at least ${MIN_AGE} years old`);
+    if (req.body?.accept_terms !== true) return fail(400, "TERMS_REQUIRED", "The terms of use must be accepted");
+    if (req.body?.accept_privacy !== true) return fail(400, "PRIVACY_REQUIRED", "The privacy policy must be acknowledged");
+    if (req.body?.confirm_age !== true) return fail(400, "AGE_CONFIRMATION_REQUIRED", "The age must be confirmed");
+
+    try {
+        const taken = await pool.query(
+            `SELECT bool_or(lower(username) = lower($1)) AS username_taken,
+                bool_or(lower(email) = lower($2) OR google_sub = $3) AS account_exists
+            FROM users WHERE lower(username) = lower($1) OR lower(email) = lower($2) OR google_sub = $3`,
+            [username, google.email, google.sub]
+        );
+        if (taken.rows[0]?.username_taken) return fail(409, "USERNAME_TAKEN", "This username is taken");
+        // meanwhile an account for this address / Google account came about: sign in instead
+        if (taken.rows[0]?.account_exists) return fail(409, "EMAIL_TAKEN", "This email is already registered");
+
+        const user = (await pool.query(
+            `INSERT INTO users (username, password_hash, has_password, display_name, birth_date, email, email_verified, google_sub,
+                language, terms_accepted_at, privacy_accepted_at)
+            VALUES ($1, $2, false, $3, $4, $5, true, $6, $7, now(), now())
+            RETURNING id, username, token_version`,
+            [username, await unusablePasswordHash(), displayName, birthDate, google.email, google.sub, language]
+        )).rows[0];
+        res.status(201).json({ token: signToken(user), username: user.username });
+    } catch (err) {
+        if (err.code === "23505") {
+            const field = /username/.test(err.constraint ?? "") ? "USERNAME_TAKEN" : "EMAIL_TAKEN";
+            return fail(409, field, "Already registered");
+        }
+        serverError(res, err);
+    }
+});
+
 // ---------- Feedback ----------
 // { category, message } from a signed-in user, mailed to the operator (CONTACT_TO) with who
 // sent it, so a reply can go to their address. At most 10 per hour.
@@ -1713,7 +1917,7 @@ async function logAdminAction(db, admin, target, action) {
 // A user as the admin panel shows them (incl. email, which only admins ever see)
 const ADMIN_USER_SELECT = `
     SELECT users.id, users.username, users.display_name, users.email, users.created_at,
-        users.is_pro, users.is_admin, users.is_tester,
+        users.is_pro, users.pro_until, users.is_admin, users.is_tester,
         EXISTS (SELECT 1 FROM user_avatars WHERE user_avatars.user_id = users.id) AS has_avatar,
         beta_access_requests.status AS request_status, beta_access_requests.reason AS request_reason,
         beta_access_requests.created_at AS request_created_at, beta_access_requests.decided_at AS request_decided_at
@@ -1727,7 +1931,9 @@ const toAdminUser = (row) => ({
     displayName: row.display_name,
     email: row.email,
     createdAt: row.created_at,
+    // isPro: Pro as a gift (admin panel); proUntil: the end of a paid subscription
     isPro: row.is_pro,
+    proUntil: row.pro_until,
     isAdmin: row.is_admin,
     isTester: row.is_tester,
     // a profile picture admins may take down
@@ -1854,7 +2060,7 @@ app.get("/api/admin/requests", async (req, res) => {
     }
 });
 
-// Approve (gives pro) or decline an open request. Answers with the updated user.
+// Approve (makes a tester: beta access, sees what is in test) or decline an open request. Answers with the updated user.
 for (const decision of ["approve", "decline"]) {
     app.post(`/api/admin/requests/:userId/${decision}`, async (req, res) => {
         const targetId = idParam(req.params.userId);
@@ -1873,7 +2079,7 @@ for (const decision of ["approve", "decline"]) {
                 return adminFail(res, 404, "REQUEST_NOT_FOUND", "No open request from this user");
             }
             const target = await client.query("SELECT id, username FROM users WHERE id = $1", [targetId]);
-            if (decision === "approve") await client.query("UPDATE users SET is_pro = true WHERE id = $1", [targetId]);
+            if (decision === "approve") await client.query("UPDATE users SET is_tester = true WHERE id = $1", [targetId]);
             await logAdminAction(client, req.admin, target.rows[0], `${decision}_request`);
             await client.query("COMMIT");
             forgetAccount(targetId);
@@ -2064,7 +2270,8 @@ app.put("/api/users/tour-seen", async (req, res) => {
 });
 
 // Change my password. Needs the current one, so a stolen session can't lock the owner out;
-// failed attempts count towards the same limit as logins.
+// failed attempts count towards the same limit as logins. An account made with Google that has no
+// password yet (has_password false) sets its first one without.
 app.put("/api/users/password", authLimiter, async (req, res) => {
     const userId = req.user.userId;
     const { currentPassword, newPassword } = req.body ?? {};
@@ -2073,20 +2280,23 @@ app.put("/api/users/password", authLimiter, async (req, res) => {
         // bcrypt only uses the first 72 bytes
         return res.status(400).json({ error: "New password must be 8-72 characters", code: "WEAK_PASSWORD" });
     }
-    if (typeof currentPassword !== "string" || !currentPassword || currentPassword.length > 1000) {
-        return res.status(400).json({ error: "Current password is required", code: "WRONG_PASSWORD" });
-    }
 
     try {
-        const result = await pool.query("SELECT password_hash FROM users WHERE id = $1", [userId]);
-        const matches = result.rows.length > 0 && await bcrypt.compare(currentPassword, result.rows[0].password_hash);
-        if (!matches) {
-            return res.status(401).json({ error: "Current password is wrong", code: "WRONG_PASSWORD" });
+        const result = await pool.query("SELECT password_hash, has_password FROM users WHERE id = $1", [userId]);
+        const account = result.rows[0];
+        if (!account) return res.status(401).json({ error: "User not found" });
+        if (account.has_password) {
+            if (typeof currentPassword !== "string" || !currentPassword || currentPassword.length > 1000) {
+                return res.status(400).json({ error: "Current password is required", code: "WRONG_PASSWORD" });
+            }
+            if (!await bcrypt.compare(currentPassword, account.password_hash)) {
+                return res.status(401).json({ error: "Current password is wrong", code: "WRONG_PASSWORD" });
+            }
         }
         const passwordHash = await bcrypt.hash(newPassword, 10);
         // all other logins end; this device gets a fresh token and stays signed in
         const updated = await pool.query(
-            `UPDATE users SET password_hash = $1, token_version = token_version + 1 WHERE id = $2
+            `UPDATE users SET password_hash = $1, has_password = true, token_version = token_version + 1 WHERE id = $2
             RETURNING id, username, token_version`,
             [passwordHash, userId]
         );
@@ -2116,25 +2326,33 @@ app.post("/api/users/logout-all", async (req, res) => {
 });
 
 // Delete my account for good: { password }. Needs the password, so a stolen session can't do it;
-// failed attempts count towards the same limit as logins. Tasks, groups and my own sessions go
+// failed attempts count towards the same limit as logins. An account without a password (made
+// with Google) confirms with its username instead: { confirmUsername }. A running subscription
+// is cancelled at Stripe / Google Play right away (utils/billing.js), so nothing is charged again. Tasks, groups and my own sessions go
 // with it (their tables don't cascade); everything else that points at the account either
 // cascades or keeps a null in its place (admin log, shared session history).
 // The last admin can't leave, so there is always somebody to run the beta.
 app.delete("/api/users", authLimiter, async (req, res) => {
     const userId = req.user.userId;
     const password = req.body?.password;
-    if (typeof password !== "string" || !password || password.length > 1000) {
-        return res.status(400).json({ error: "Password is required", code: "WRONG_PASSWORD" });
-    }
+    const confirmUsername = req.body?.confirmUsername;
 
     const client = await pool.connect();
     try {
         await client.query("BEGIN");
-        const result = await client.query("SELECT password_hash, is_admin FROM users WHERE id = $1 FOR UPDATE", [userId]);
+        const result = await client.query("SELECT username, password_hash, has_password, is_admin FROM users WHERE id = $1 FOR UPDATE", [userId]);
         const user = result.rows[0];
-        if (!user || !await bcrypt.compare(password, user.password_hash)) {
+        const confirmed = !user ? false
+            : user.has_password
+                ? typeof password === "string" && password.length > 0 && password.length <= 1000 && await bcrypt.compare(password, user.password_hash)
+                : typeof confirmUsername === "string" && confirmUsername.trim().toLowerCase() === user.username.toLowerCase();
+        if (!confirmed) {
             await client.query("ROLLBACK");
-            return res.status(401).json({ error: "Password is wrong", code: "WRONG_PASSWORD" });
+            if (user?.has_password === false) return res.status(400).json({ error: "Type your username to confirm", code: "WRONG_USERNAME" });
+            // nothing sent is a bad request, a wrong one doesn't match
+            return typeof password !== "string" || !password
+                ? res.status(400).json({ error: "Password is required", code: "WRONG_PASSWORD" })
+                : res.status(401).json({ error: "Password is wrong", code: "WRONG_PASSWORD" });
         }
         if (user.is_admin) {
             const admins = await client.query("SELECT count(*)::int AS n FROM users WHERE is_admin");
@@ -2143,6 +2361,8 @@ app.delete("/api/users", authLimiter, async (req, res) => {
                 return res.status(409).json({ error: "The last admin can't delete their account", code: "LAST_ADMIN" });
             }
         }
+        // nothing is charged any more for an account that is gone
+        await billing.cancelAllSubscriptions(client, userId);
 
         await client.query(
             "DELETE FROM sessions WHERE user_id = $1 OR group_id IN (SELECT id FROM groups WHERE user_id = $1)",
@@ -2786,6 +3006,7 @@ app.post("/api/friends/requests", friendRequestLimiter, async (req, res) => {
         if (other.id === userId) {
             return res.status(400).json({ error: "You can't add yourself", code: "SELF" });
         }
+        if (await refuseOverLimit(pool, res, req.account, "friends")) return;
 
         const existing = await pool.query(
             `SELECT id, requester_id, status FROM friendships
@@ -2837,6 +3058,7 @@ app.post("/api/friends/requests/:id/accept", async (req, res) => {
     const requestId = idParam(req.params.id);
     if (!requestId) return res.status(404).json({ error: "Request not found", code: "REQUEST_NOT_FOUND" });
     try {
+        if (await refuseOverLimit(pool, res, req.account, "friends")) return;
         const result = await pool.query(
             `UPDATE friendships SET status = 'accepted', responded_at = now()
             WHERE id = $1 AND addressee_id = $2 AND status = 'pending'
@@ -3972,6 +4194,7 @@ app.post("/api/shared-sessions", async (req, res) => {
     const userId = req.user.userId;
     const name = sessionName(req.body?.name);
     if (!name) return fail(res, 400, "NAME_REQUIRED", "Name is required");
+    if (await refuseOverLimit(pool, res, req.account, "sessions")) return;
 
     const client = await pool.connect();
     try {
@@ -4023,6 +4246,7 @@ app.post("/api/shared-sessions/:id/join", async (req, res) => {
     const sessionId = idParam(req.params.id);
     if (!sessionId) return fail(res, 404, "INVITE_NOT_FOUND", "Invite not found");
     try {
+        if (await refuseOverLimit(pool, res, req.account, "sessions")) return;
         const result = await pool.query(
             `UPDATE shared_session_members SET status = 'joined', joined_at = now()
             WHERE session_id = $1 AND user_id = $2 AND status = 'invited'
@@ -5186,6 +5410,10 @@ app.get("/api/stats", async (req, res) => {
     if (from === undefined) return invalidInput(res, "from");
     if (to === undefined) return invalidInput(res, "to");
     if (from && to && (from > to || Date.parse(to) - Date.parse(from) > STATS_MAX_DAYS * DAY_MS)) return invalidInput(res, "to");
+    // the free plan: only the last FREE_STATS_DAYS days (a day of slack for the time zones)
+    if (limited(req.account) && (!from || Date.parse(from) < Date.now() - (FREE_STATS_DAYS + 1) * DAY_MS)) {
+        return res.status(403).json({ error: "Longer periods need Pro", code: "LIMIT_REACHED", limit: "stats", max: FREE_STATS_DAYS });
+    }
 
     try {
         const result = await pool.query(
@@ -5481,23 +5709,28 @@ function pushBetaRequest(fromId, reason) {
 }
 
 const PUSH_ENDPOINT_MAX = 1000;
-const validEndpoint = (value) => typeof value === "string" && value.length <= PUSH_ENDPOINT_MAX && /^https:\/\/[^\s]+$/.test(value);
+// a browser's push service address, or 'fcm:<token>' for a device of the Android app (utils/fcm.js)
+const validEndpoint = (value) => typeof value === "string" && value.length <= PUSH_ENDPOINT_MAX
+    && (/^https:\/\/[^\s]+$/.test(value) || FCM_ENDPOINT.test(value));
 const validPushKey = (value, max) => typeof value === "string" && value.length >= 1 && value.length <= max && /^[A-Za-z0-9_=-]+$/.test(value);
 const pushKindsJson = (row) => Object.fromEntries(PUSH_KINDS.map(kind => [kind, row[kind]]));
 
-// The server's public key, which the browser needs to sign up; null: this server sends no pushes
+// The server's public key, which the browser needs to sign up (null: this server sends no Web
+// Push), and whether it sends to the Android app (fcm)
 app.get("/api/push/key", (req, res) => {
-    res.json({ publicKey: PUSH_PUBLIC_KEY || null });
+    res.json({ publicKey: PUSH_PUBLIC_KEY || null, fcm: PUSH_FCM_ENABLED });
 });
 
 // This device wants pushes (again): { endpoint, keys: { p256dh, auth }, kinds?: { plan, digest, messages, social } }.
+// A device of the Android app sends { endpoint: 'fcm:<token>', kinds? } without keys.
 // Also called on every start of the app, so a renewed address or another account on the device
 // is picked up. Kinds not sent stay as they were (all on for a new device). Answers { kinds }.
 app.put("/api/push/subscription", async (req, res) => {
     const userId = req.user.userId;
     const { endpoint, keys, kinds } = req.body ?? {};
     if (!validEndpoint(endpoint)) return invalidInput(res, "endpoint");
-    if (!validPushKey(keys?.p256dh, 200) || !validPushKey(keys?.auth, 100)) return invalidInput(res, "keys");
+    const app = isFcmEndpoint(endpoint);
+    if (app ? keys !== undefined : !validPushKey(keys?.p256dh, 200) || !validPushKey(keys?.auth, 100)) return invalidInput(res, "keys");
     if (kinds !== undefined && (typeof kinds !== "object" || kinds === null || Object.entries(kinds).some(([kind, on]) => !PUSH_KINDS.includes(kind) || typeof on !== "boolean"))) {
         return invalidInput(res, "kinds");
     }
@@ -5511,7 +5744,7 @@ app.put("/api/push/subscription", async (req, res) => {
                 messages = COALESCE($7, push_subscriptions.messages), social = COALESCE($8, push_subscriptions.social),
                 updated_at = now()
             RETURNING ${PUSH_KINDS.join(", ")}`,
-            [userId, endpoint, keys.p256dh, keys.auth, ...wanted]
+            [userId, endpoint, app ? null : keys.p256dh, app ? null : keys.auth, ...wanted]
         );
         // a few devices per account: the ones not seen for the longest go
         await pool.query(
@@ -5569,6 +5802,168 @@ app.post("/api/push/test", pushTestLimiter, async (req, res) => {
         });
         if (!sent) return res.status(502).json({ error: "The push service refused it", code: "PUSH_FAILED" });
         res.json({ sent: true });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- Quidey Pro (utils/billing.js) ----------
+// Pro supports the development: 2,99 € a month or 25 € a year, through Stripe (web) or Google
+// Play (Android app). These routes need only a signed-in account (not app access: somebody
+// without access may buy Pro to get in). The webhooks and the cancel button are public.
+const FRONTEND_URL = (process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/+$/, "");
+// shown in the app; the real prices live at Stripe / in the Play Console (keep them the same)
+const PRO_PRICES = { currency: "EUR", monthly: 2.99, yearly: 25 };
+
+const billingLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 10,
+    keyGenerator: (req) => `billing:${req.user.userId}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many requests, please try again later", code: "RATE_LIMITED" },
+});
+
+// Access, Pro and limits change with a payment: the account is read fresh, its sockets too
+const proChanged = (userId) => {
+    if (!userId) return;
+    forgetAccount(userId);
+    realtime.toUser(userId, "pro:changed", {});
+};
+
+// My Pro: { active, gift, until, subscription, canManageStripe, stripe, play, prices, playAccountId }
+app.get("/api/billing", authenticateToken, async (req, res) => {
+    try {
+        res.json({ ...(await billing.proStatus(pool, req.user.userId)), prices: PRO_PRICES, playAccountId: billing.playAccountId(req.user.userId) });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Stripe Checkout for { plan: 'monthly' | 'yearly' }: { url } to send the browser to
+app.post("/api/billing/checkout", authenticateToken, billingLimiter, async (req, res) => {
+    if (!billing.STRIPE_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
+    const plan = req.body?.plan;
+    if (!billing.PLANS.includes(plan)) return invalidInput(res, "plan");
+    try {
+        const status = await billing.proStatus(pool, req.user.userId);
+        // a running subscription is changed in the portal, not bought twice
+        if (status.until && new Date(status.until) > new Date()) return res.status(409).json({ error: "You already have Pro", code: "ALREADY_SUBSCRIBED" });
+        const language = LANGUAGES.includes(req.body?.language) ? req.body.language : "de";
+        res.json({ url: await billing.stripeCheckout(pool, { userId: req.user.userId, plan, language, frontendUrl: FRONTEND_URL }) });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Stripe's customer portal (change plan, payment method, cancel, invoices): { url }
+app.post("/api/billing/portal", authenticateToken, billingLimiter, async (req, res) => {
+    if (!billing.STRIPE_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
+    try {
+        const url = await billing.stripePortal(pool, { userId: req.user.userId, frontendUrl: FRONTEND_URL });
+        if (!url) return res.status(404).json({ error: "No subscription at Stripe", code: "NO_SUBSCRIPTION" });
+        res.json({ url });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Stripe's webhook (raw body, signed): every change of a subscription
+app.post("/api/billing/stripe-webhook", express.raw({ type: "application/json", limit: "1mb" }), async (req, res) => {
+    if (!billing.STRIPE_ENABLED) return res.status(503).end();
+    let userId;
+    try {
+        userId = await billing.stripeWebhook(pool, req.body, req.headers["stripe-signature"]);
+    } catch (err) {
+        // a wrong signature, or Stripe's data didn't fit: Stripe tries again later
+        if (err.type === "StripeSignatureVerificationError") return res.status(400).json({ error: "Invalid signature" });
+        console.error("Stripe webhook failed:", err.message);
+        return res.status(500).end();
+    }
+    proChanged(userId);
+    res.json({ received: true });
+});
+
+// The Android app bought (or restores) Pro in Google Play: { purchaseToken }
+app.post("/api/billing/play", authenticateToken, billingLimiter, async (req, res) => {
+    if (!billing.PLAY_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
+    const token = req.body?.purchaseToken;
+    if (typeof token !== "string" || token.length < 10 || token.length > 1000 || !/^[A-Za-z0-9._:-]+$/.test(token)) return invalidInput(res, "purchaseToken");
+    try {
+        const owner = await billing.savePlayPurchase(pool, token, req.user.userId);
+        if (owner && owner !== req.user.userId) return res.status(409).json({ error: "This purchase belongs to another account", code: "OTHER_ACCOUNT" });
+        proChanged(req.user.userId);
+        res.json(await billing.proStatus(pool, req.user.userId));
+    } catch (err) {
+        if (err.status === 400 || err.status === 403 || err.status === 404 || err.status === 410) {
+            return res.status(400).json({ error: "Google Play doesn't know this purchase", code: "INVALID_PURCHASE" });
+        }
+        serverError(res, err);
+    }
+});
+
+// Google Play's real-time developer notifications (Pub/Sub push to
+// /api/billing/play-notifications?token=PLAY_RTDN_TOKEN)
+app.post("/api/billing/play-notifications", async (req, res) => {
+    const secret = process.env.PLAY_RTDN_TOKEN || "";
+    const given = typeof req.query.token === "string" ? req.query.token : "";
+    if (!billing.PLAY_ENABLED || !secret || given.length !== secret.length
+        || !crypto.timingSafeEqual(Buffer.from(given), Buffer.from(secret))) {
+        return res.status(403).end();
+    }
+    try {
+        proChanged(await billing.playNotification(pool, req.body));
+        res.status(204).end();
+    } catch (err) {
+        console.error("Play notification failed:", err.message);
+        // 5xx: Pub/Sub delivers it again later
+        res.status(500).end();
+    }
+});
+
+// The cancel button (§ 312k BGB "Verträge hier kündigen"): public, no sign-in needed.
+// { name, email, username?, reason: 'ordinary' | 'extraordinary', explanation?, language? }.
+// A running Stripe subscription of the account with that address (and username, if given) ends
+// at the end of its period; a confirmation goes to the address right away either way, and a copy
+// to the operator. The answer never says whether an account was found.
+const cancelLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_CONTACT", 5),
+    skip: (req) => req.method === "OPTIONS",
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many requests, please try again later", code: "RATE_LIMITED" },
+});
+
+app.post("/api/billing/cancel", cancelLimiter, async (req, res) => {
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+    const username = typeof req.body?.username === "string" ? req.body.username.trim().replace(/^@/, "") : "";
+    const reason = req.body?.reason === "extraordinary" ? "extraordinary" : "ordinary";
+    const explanation = typeof req.body?.explanation === "string" ? req.body.explanation.trim().slice(0, 2000) : "";
+    const language = req.body?.language === "en" ? "en" : "de";
+    if (!name || name.length > 100) return invalidInput(res, "name");
+    if (!EMAIL_PATTERN.test(email) || email.length > 254) return invalidInput(res, "email");
+    if (username && !USERNAME_PATTERN.test(username)) return invalidInput(res, "username");
+    if (reason === "extraordinary" && !explanation) return invalidInput(res, "explanation");
+    const receivedAt = new Date();
+    try {
+        const account = (await pool.query(
+            "SELECT id FROM users WHERE lower(email) = lower($1) AND ($2 = '' OR lower(username) = lower($2))",
+            [email, username]
+        )).rows[0];
+        let found = 0;
+        if (account) {
+            found = await billing.stripeCancelAtPeriodEnd(pool, account.id).catch((err) => {
+                console.error("Cancelling at Stripe failed:", err.message);
+                return 0;
+            });
+            if (found) proChanged(account.id);
+        }
+        await sendCancellationMail({ name, email, username, reason, explanation, receivedAt, found }, language).catch((err) => {
+            console.error("Cancellation mail failed:", err);
+        });
+        res.json({ received: true, receivedAt: receivedAt.toISOString() });
     } catch (err) {
         serverError(res, err);
     }

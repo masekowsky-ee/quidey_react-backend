@@ -1,9 +1,11 @@
-// Manage beta access from the command line (uses the same .env as the server):
+// Manage beta access and Pro from the command line (uses the same .env as the server):
 //
-//   npm run pro -- list                 users with pro
+//   npm run pro -- list                 users with tester, Pro or admin
 //   npm run pro -- requests [all]       open beta requests (all: also decided ones)
-//   npm run pro -- grant <username>     give pro (also approves their request, if any)
-//   npm run pro -- revoke <username>    take pro away
+//   npm run pro -- grant <username>     give beta access = make tester (also approves their request)
+//   npm run pro -- revoke <username>    take beta access (tester) away
+//   npm run pro -- gift <username>      give Pro as a gift (no payment; no test features)
+//   npm run pro -- ungift <username>    take the gifted Pro away (a paid subscription stays)
 //   npm run pro -- decline <username>   decline their request (they can't ask again)
 //   npm run pro -- admin <username>     make admin (sees the admin panel in the app)
 //   npm run pro -- unadmin <username>   take admin away
@@ -16,15 +18,18 @@ const pool = require("../db");
 
 async function findUser(username) {
     if (!username) throw new Error("Which user? e.g. npm run pro -- grant testUser1");
-    const result = await pool.query("SELECT id, username, is_pro FROM users WHERE lower(username) = lower($1)", [username]);
+    const result = await pool.query("SELECT id, username, is_pro, is_tester FROM users WHERE lower(username) = lower($1)", [username]);
     if (result.rows.length === 0) throw new Error(`No user named "${username}"`);
     return result.rows[0];
 }
 
 const commands = {
     async list() {
-        const result = await pool.query("SELECT username, display_name, is_pro, is_admin, is_tester FROM users WHERE is_pro OR is_admin OR is_tester ORDER BY lower(username)");
-        if (result.rows.length === 0) return console.log("Nobody has pro or admin yet.");
+        const result = await pool.query(
+            `SELECT username, display_name, is_tester, is_pro AS pro_gift, to_char(pro_until, 'YYYY-MM-DD') AS pro_paid_until, is_admin
+            FROM users WHERE is_pro OR pro_until > now() OR is_admin OR is_tester ORDER BY lower(username)`
+        );
+        if (result.rows.length === 0) return console.log("Nobody has tester, Pro or admin yet.");
         console.table(result.rows);
     },
 
@@ -43,18 +48,30 @@ const commands = {
 
     async grant(username) {
         const user = await findUser(username);
-        await pool.query("UPDATE users SET is_pro = true WHERE id = $1", [user.id]);
+        await pool.query("UPDATE users SET is_tester = true WHERE id = $1", [user.id]);
         await pool.query(
             "UPDATE beta_access_requests SET status = 'approved', decided_at = now() WHERE user_id = $1 AND status <> 'approved'",
             [user.id]
         );
-        console.log(user.is_pro ? `${user.username} already had pro.` : `${user.username} has pro now.`);
+        console.log(user.is_tester ? `${user.username} already had beta access.` : `${user.username} has beta access now (tester).`);
     },
 
     async revoke(username) {
         const user = await findUser(username);
+        await pool.query("UPDATE users SET is_tester = false WHERE id = $1", [user.id]);
+        console.log(user.is_tester ? `${user.username} no longer has beta access.` : `${user.username} didn't have beta access.`);
+    },
+
+    async gift(username) {
+        const user = await findUser(username);
+        await pool.query("UPDATE users SET is_pro = true WHERE id = $1", [user.id]);
+        console.log(user.is_pro ? `${user.username} already had Pro as a gift.` : `${user.username} has Pro as a gift now.`);
+    },
+
+    async ungift(username) {
+        const user = await findUser(username);
         await pool.query("UPDATE users SET is_pro = false WHERE id = $1", [user.id]);
-        console.log(user.is_pro ? `${user.username} no longer has pro.` : `${user.username} didn't have pro.`);
+        console.log(user.is_pro ? `${user.username} no longer has the gifted Pro.` : `${user.username} had no gifted Pro.`);
     },
 
     async decline(username) {
@@ -96,7 +113,7 @@ const commands = {
 async function main() {
     const [command, arg] = process.argv.slice(2);
     if (!commands[command]) {
-        console.log("Usage: npm run pro -- list | requests [all] | grant <username> | revoke <username> | decline <username> | admin <username> | unadmin <username> | tester <username> | untester <username>");
+        console.log("Usage: npm run pro -- list | requests [all] | grant <username> | revoke <username> | gift <username> | ungift <username> | decline <username> | admin <username> | unadmin <username> | tester <username> | untester <username>");
         process.exitCode = 1;
         return;
     }
