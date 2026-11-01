@@ -86,6 +86,8 @@ psql_run -c "SET client_min_messages = warning; CREATE TABLE IF NOT EXISTS publi
 
 declare -A applied_sum=()
 while IFS='|' read -r name sum; do
+    # psql on Windows (dev machines) ends its lines with CR: not part of the checksum
+    sum="${sum%$'\r'}"
     [ -n "$name" ] && applied_sum["$name"]="$sum"
 done < <(psql_query "SELECT filename, checksum FROM public.schema_migrations")
 
