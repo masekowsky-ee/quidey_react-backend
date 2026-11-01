@@ -16,7 +16,7 @@ const { startFocusSchedule } = require("./utils/focus");
 const { PUSH_PUBLIC_KEY, PUSH_FCM_ENABLED, PUSH_KINDS, PUSH_MAX_DEVICES, PUSH_TEXTS, pushLater, deliver, startPushSchedule } = require("./utils/push");
 const http = require("node:http");
 const realtime = require("./realtime");
-const { ACCESS_MODE, hasPro, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
+const { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
 const { FREE_LIMITS, FREE_STATS_DAYS, limited, usage, refuseOverLimit } = require("./utils/limits");
 const { FCM_ENDPOINT, isFcmEndpoint } = require("./utils/fcm");
 const progress = require("./utils/progress");
@@ -795,6 +795,8 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
             allDayReminderTime: row.allday_reminder_time,
             tourSeen: row.tour_seen,
             accessMode: ACCESS_MODE,
+            // whether Quidey Pro can be bought (PRO_BILLING); the apps show it only then
+            proSales: PRO_BILLING,
             // Pro: paid (pro_until ahead) or a gift (is_pro); limits/usage only on the free plan
             pro: { active: hasPro(row), gift: row.is_pro, until: row.pro_until },
             limits: limited(row) ? { ...FREE_LIMITS, statsDays: FREE_STATS_DAYS } : null,
@@ -5832,7 +5834,7 @@ const proChanged = (userId) => {
 };
 
 // My Pro: { active, gift, until, subscription, canManageStripe, stripe, play, prices, playAccountId }
-app.get("/api/billing", authenticateToken, async (req, res) => {
+app.get("/api/billing", authenticateToken, requireProBilling, async (req, res) => {
     try {
         res.json({ ...(await billing.proStatus(pool, req.user.userId)), prices: PRO_PRICES, playAccountId: billing.playAccountId(req.user.userId) });
     } catch (err) {
@@ -5841,7 +5843,7 @@ app.get("/api/billing", authenticateToken, async (req, res) => {
 });
 
 // Stripe Checkout for { plan: 'monthly' | 'yearly' }: { url } to send the browser to
-app.post("/api/billing/checkout", authenticateToken, billingLimiter, async (req, res) => {
+app.post("/api/billing/checkout", authenticateToken, requireProBilling, billingLimiter, async (req, res) => {
     if (!billing.STRIPE_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
     const plan = req.body?.plan;
     if (!billing.PLANS.includes(plan)) return invalidInput(res, "plan");
@@ -5857,7 +5859,7 @@ app.post("/api/billing/checkout", authenticateToken, billingLimiter, async (req,
 });
 
 // Stripe's customer portal (change plan, payment method, cancel, invoices): { url }
-app.post("/api/billing/portal", authenticateToken, billingLimiter, async (req, res) => {
+app.post("/api/billing/portal", authenticateToken, requireProBilling, billingLimiter, async (req, res) => {
     if (!billing.STRIPE_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
     try {
         const url = await billing.stripePortal(pool, { userId: req.user.userId, frontendUrl: FRONTEND_URL });
@@ -5885,7 +5887,7 @@ app.post("/api/billing/stripe-webhook", express.raw({ type: "application/json", 
 });
 
 // The Android app bought (or restores) Pro in Google Play: { purchaseToken }
-app.post("/api/billing/play", authenticateToken, billingLimiter, async (req, res) => {
+app.post("/api/billing/play", authenticateToken, requireProBilling, billingLimiter, async (req, res) => {
     if (!billing.PLAY_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
     const token = req.body?.purchaseToken;
     if (typeof token !== "string" || token.length < 10 || token.length > 1000 || !/^[A-Za-z0-9._:-]+$/.test(token)) return invalidInput(res, "purchaseToken");

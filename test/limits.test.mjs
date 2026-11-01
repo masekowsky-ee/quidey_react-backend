@@ -1,10 +1,11 @@
-// The free plan (utils/limits.js) in ACCESS_MODE=open, without a database: the counts come from
+// The free plan (utils/limits.js) in ACCESS_MODE=open with Pro on sale, without a database: the counts come from
 // a stand-in. (api.test.mjs runs the server in the beta mode, where nobody has limits.)
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 
 process.env.ACCESS_MODE = "open";
+process.env.PRO_BILLING = "on";
 const require = createRequire(import.meta.url);
 const { FREE_LIMITS, limited, limitReached, refuseOverLimit, usage } = require("../utils/limits.js");
 const { hasAppAccess } = require("../utils/access.js");

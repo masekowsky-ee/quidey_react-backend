@@ -107,8 +107,8 @@ before(async () => {
             RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", FOCUS_CHECK_MS: "200", NOTEBOOK_STORAGE_MAX: "4000", PRESENCE_GRACE_MS: "200",
             // pushes are only logged ("[DEV] Push to user …"), like mails without SMTP_HOST
             VAPID_PUBLIC_KEY: "", VAPID_PRIVATE_KEY: "",
-            // the Android app's pushes are only logged too; no payments set up
-            FIREBASE_SERVICE_ACCOUNT_FILE: "", STRIPE_SECRET_KEY: "", PLAY_SERVICE_ACCOUNT_FILE: "", ACCESS_MODE: "beta",
+            // the Android app's pushes are only logged too; Pro on sale, but no payments set up
+            FIREBASE_SERVICE_ACCOUNT_FILE: "", STRIPE_SECRET_KEY: "", PLAY_SERVICE_ACCOUNT_FILE: "", ACCESS_MODE: "beta", PRO_BILLING: "on",
             GOOGLE_CLIENT_IDS: GOOGLE_CLIENT,
             GOOGLE_TEST_CERTS: JSON.stringify({ [GOOGLE_KID]: GOOGLE_KEY.publicKey.export({ type: "spki", format: "pem" }) }),
         },

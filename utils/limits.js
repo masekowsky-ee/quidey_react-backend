@@ -1,7 +1,7 @@
-// The free plan (only in ACCESS_MODE=open, for accounts without Pro, tester or admin; see
-// utils/access.js): how much of each thing an account can have at a time. Things that are there
+// The free plan (only in ACCESS_MODE=open with PRO_BILLING=on, for accounts without Pro, tester or
+// admin; see utils/access.js): how much of each thing an account can have at a time. Things that are there
 // stay (also after Pro ended); only new ones are refused, with 403 LIMIT_REACHED { limit, max }.
-const { ACCESS_MODE, hasNoLimits } = require("./access");
+const { ACCESS_MODE, PRO_BILLING, hasNoLimits } = require("./access");
 
 const FREE_LIMITS = {
     tasks: 10, // open tasks (not ticked off)
@@ -24,8 +24,8 @@ const COUNTS = {
         WHERE (status = 'accepted' AND (requester_id = $1 OR addressee_id = $1)) OR (status = 'pending' AND requester_id = $1)`,
 };
 
-// Whether this account has the free plan's limits now
-const limited = (account) => ACCESS_MODE === "open" && !hasNoLimits(account);
+// Whether this account has the free plan's limits now (never while Pro can't be bought)
+const limited = (account) => ACCESS_MODE === "open" && PRO_BILLING && !hasNoLimits(account);
 
 // How much of each the account has: { tasks, events, groups, sessions, friends }
 async function usage(db, userId) {
