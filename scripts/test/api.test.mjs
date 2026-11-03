@@ -2286,6 +2286,165 @@ describe("Fokusraum: alarm, routines, notebook", () => {
     });
 });
 
+describe("notes area and collections (testers)", () => {
+    let tess, other, plain;
+    const makeTester = (user) => sql("UPDATE users SET is_tester = true WHERE id = $1", [user.id]);
+    const newTask = async (user, body) => {
+        const data = (await call("POST", "/api/tasks", body, user.token)).data;
+        return data.id ?? data.task?.id;
+    };
+
+    before(async () => {
+        tess = await member("notestess");
+        other = await member("notesother");
+        plain = await member("notesplain");
+        await makeTester(tess);
+        await makeTester(other);
+        await sql("UPDATE users SET is_tester = false WHERE id = $1", [plain.id]);
+    });
+
+    test("folders, tags, colour, archive; only testers set them", async () => {
+        let r = await call("POST", "/api/tester/note-folders", { name: "Mathe", emoji: "📐" }, tess.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        const folder = r.data;
+        assert.equal((await call("POST", "/api/tester/note-folders", { name: "mathe" }, tess.token)).data.code, "FOLDER_EXISTS");
+        assert.equal((await call("POST", "/api/tester/note-folders", { name: " " }, tess.token)).data.field, "name");
+        assert.equal((await call("GET", "/api/tester/note-folders", null, plain.token)).data.code, "TESTER_REQUIRED");
+
+        r = await call("POST", "/api/notebook", { title: "Analysis", body: "x", folderId: folder.id, tags: ["#klausur", "Klausur", "lernzettel"], color: "blue" }, tess.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        const note = r.data;
+        assert.equal(note.folderId, folder.id);
+        assert.deepEqual(note.tags, ["klausur", "lernzettel"], "# dropped, the same word once");
+        assert.equal(note.color, "blue");
+        assert.equal(note.archived, false);
+        assert.equal((await call("POST", "/api/notebook", { body: "x", tags: ["zwei worte"] }, tess.token)).data.field, "tags");
+        assert.equal((await call("POST", "/api/notebook", { body: "x", color: "beige" }, tess.token)).data.field, "color");
+        // a NUL byte is refused up front (Postgres can't store it: a 500 otherwise)
+        assert.equal((await call("POST", "/api/notebook", { title: "a\u0000b", body: "x" }, tess.token)).data.field, "title");
+        assert.equal((await call("POST", "/api/notebook", { body: "a\u0000b" }, tess.token)).data.field, "body");
+        assert.equal((await call("POST", "/api/notebook", { body: "x", tags: ["a\u0000b"] }, tess.token)).data.field, "tags");
+        assert.equal((await call("POST", "/api/notebook", { body: "x", attachments: [{ kind: "link", url: "https://a.de/\u0000" }] }, tess.token)).data.field, "attachments");
+        assert.equal((await call("POST", "/api/tester/note-folders", { name: "a\u0000b" }, tess.token)).data.field, "name");
+        assert.equal((await call("POST", "/api/notebook", { body: "x", folderId: folder.id }, other.token)).status, 404, "not somebody else's folder");
+        assert.equal((await call("POST", "/api/notebook", { body: "x", tags: ["a"] }, plain.token)).data.code, "TESTER_REQUIRED");
+        assert.equal((await call("POST", "/api/notebook", { body: "plain note" }, plain.token)).status, 201, "the notebook itself stays for everybody");
+
+        const before = note.updatedAt;
+        r = await call("PUT", `/api/notebook/${note.id}`, { archived: true }, tess.token);
+        assert.equal(r.data.archived, true);
+        assert.equal(r.data.updatedAt, before, "archiving isn't an edit");
+        assert.equal((await call("GET", "/api/tester/note-folders", null, tess.token)).data[0].notes, 1);
+
+        assert.equal((await call("DELETE", `/api/tester/note-folders/${folder.id}`, null, other.token)).status, 404);
+        assert.equal((await call("DELETE", `/api/tester/note-folders/${folder.id}`, null, tess.token)).status, 200);
+        assert.equal((await call("GET", `/api/notebook/${note.id}`, null, tess.token)).data.folderId, null, "its notes stay, loose");
+    });
+
+    test("trash: out of the list, back again, emptied, and gone after 30 days", async () => {
+        const note = (await call("POST", "/api/notebook", { title: "Weg damit", body: "x" }, tess.token)).data;
+        let r = await call("PUT", `/api/notebook/${note.id}`, { trashed: true }, tess.token);
+        assert.ok(r.data.trashedAt);
+        assert.ok(!(await call("GET", "/api/notebook", null, tess.token)).data.some(n => n.id === note.id));
+        assert.ok((await call("GET", "/api/notebook?trash=1", null, tess.token)).data.some(n => n.id === note.id));
+        r = await call("PUT", `/api/notebook/${note.id}`, { trashed: false }, tess.token);
+        assert.equal(r.data.trashedAt, null);
+
+        const old = (await call("POST", "/api/notebook", { body: "alt" }, tess.token)).data;
+        await sql("UPDATE notebook_notes SET trashed_at = now() - interval '31 days' WHERE id = $1", [old.id]);
+        const fresh = (await call("POST", "/api/notebook", { body: "neu" }, tess.token)).data;
+        await call("PUT", `/api/notebook/${fresh.id}`, { trashed: true }, tess.token);
+        const trash = (await call("GET", "/api/notebook?trash=1", null, tess.token)).data;
+        assert.ok(!trash.some(n => n.id === old.id), "over 30 days: deleted");
+        assert.ok(trash.some(n => n.id === fresh.id));
+        r = await call("DELETE", "/api/tester/notebook/trash", null, tess.token);
+        assert.equal(r.data.deleted, 1);
+        assert.equal((await call("GET", "/api/notebook?trash=1", null, tess.token)).data.length, 0);
+    });
+
+    test("collections hold tasks, events and notes, from either side", async () => {
+        const exam = await newTask(tess, { name: "Klausur Mathe", kind: "event", due: daysFromToday(10), due_time: "09:00" });
+        const learn = await newTask(tess, { name: "Kapitel 3 lernen" });
+        const sheet = (await call("POST", "/api/notebook", { title: "Formelsammlung", body: "x" }, tess.token)).data;
+        const foreign = await newTask(other, { name: "Nicht meins" });
+        assert.ok(exam && learn && foreign);
+
+        let r = await call("POST", "/api/tester/collections", { name: "Klausur Mathe", emoji: "📐", color: "violet", items: [{ kind: "task", id: exam }] }, tess.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        const col = r.data;
+        assert.deepEqual(col.items.map(i => [i.kind, i.id]), [["task", exam]]);
+
+        r = await call("POST", `/api/tester/collections/${col.id}/items`, { kind: "task", id: learn }, tess.token);
+        assert.equal(r.status, 201);
+        r = await call("POST", `/api/tester/collections/${col.id}/items`, { kind: "note", id: sheet.id }, tess.token);
+        assert.equal(r.data.items.length, 3);
+        assert.equal((await call("POST", `/api/tester/collections/${col.id}/items`, { kind: "note", id: sheet.id }, tess.token)).status, 200, "in already");
+        assert.equal((await call("POST", `/api/tester/collections/${col.id}/items`, { kind: "task", id: foreign }, tess.token)).status, 404, "not somebody else's task");
+        assert.equal((await call("POST", `/api/tester/collections/${col.id}/items`, { kind: "folder", id: 1 }, tess.token)).data.field, "item");
+        assert.equal((await call("POST", `/api/tester/collections/${col.id}/items`, { kind: "task", id: learn }, other.token)).status, 404, "not somebody else's collection");
+        assert.equal((await call("POST", "/api/tester/collections", { name: "x", items: [{ kind: "task", id: foreign }] }, tess.token)).status, 404);
+        assert.equal((await call("GET", "/api/tester/collections", null, plain.token)).data.code, "TESTER_REQUIRED");
+
+        // one thing in two collections
+        const second = (await call("POST", "/api/tester/collections", { name: "Diese Woche", items: [{ kind: "task", id: learn }] }, tess.token)).data;
+        const list = (await call("GET", "/api/tester/collections", null, tess.token)).data;
+        assert.equal(list.filter(c => c.items.some(i => i.kind === "task" && i.id === learn)).length, 2);
+
+        // a trashed note is out of sight, a deleted task goes for good
+        await call("PUT", `/api/notebook/${sheet.id}`, { trashed: true }, tess.token);
+        assert.equal((await call("GET", "/api/tester/collections", null, tess.token)).data.find(c => c.id === col.id).items.length, 2);
+        await call("PUT", `/api/notebook/${sheet.id}`, { trashed: false }, tess.token);
+        await call("DELETE", `/api/tasks/${learn}`, null, tess.token);
+        assert.equal((await call("GET", "/api/tester/collections", null, tess.token)).data.find(c => c.id === second.id).items.length, 0);
+
+        r = await call("PUT", `/api/tester/collections/${col.id}`, { description: "Am 14. im Hörsaal 2", color: null }, tess.token);
+        assert.equal(r.data.description, "Am 14. im Hörsaal 2");
+        assert.equal(r.data.color, null);
+        assert.equal(r.data.name, "Klausur Mathe");
+        r = await call("DELETE", `/api/tester/collections/${col.id}/items/note/${sheet.id}`, null, tess.token);
+        assert.equal(r.data.items.length, 1);
+        assert.equal((await call("GET", `/api/notebook/${sheet.id}`, null, tess.token)).status, 200, "the note itself stays");
+        assert.equal((await call("DELETE", `/api/tester/collections/${col.id}`, null, other.token)).status, 404);
+        assert.equal((await call("DELETE", `/api/tester/collections/${col.id}`, null, tess.token)).status, 200);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE id = $1", [exam]))[0].n, 1, "its tasks stay");
+    });
+
+    test("a tester's groups become collections once; stats count focus per collection", async () => {
+        const gina = await member("notesgina");
+        await makeTester(gina);
+        const sport = (await call("POST", "/api/groups", { name: "Sport", description: "Laufen und so", color: "green" }, gina.token)).data;
+        const uni = (await call("POST", "/api/groups", { name: "Uni", description: "" }, gina.token)).data;
+        const run = await newTask(gina, { name: "Laufen", description: "" });
+        const read = await newTask(gina, { name: "Lesen", description: "" });
+        await call("POST", `/api/tasks/${run}/groups/${sport.id}`, null, gina.token);
+        await call("POST", `/api/tasks/${read}/groups/${uni.id}`, null, gina.token);
+        await call("POST", `/api/tasks/${run}/groups/${uni.id}`, null, gina.token);
+        // a collection named like a group already: that group isn't taken over a second time
+        await call("POST", "/api/tester/collections", { name: "uni" }, gina.token);
+
+        let list = (await call("GET", "/api/tester/collections", null, gina.token)).data;
+        assert.equal(list.length, 2);
+        const taken = list.find(c => c.name === "Sport");
+        assert.equal(taken.color, "green");
+        assert.equal(taken.description, "Laufen und so");
+        assert.deepEqual(taken.items.map(item => [item.kind, item.id]), [["task", run]]);
+        assert.equal(list.find(c => c.name === "uni").items.length, 0);
+        assert.equal((await call("GET", "/api/groups", null, gina.token)).data.length, 2, "the groups themselves stay");
+
+        // only once: what is deleted stays deleted
+        await call("DELETE", `/api/tester/collections/${taken.id}`, null, gina.token);
+        list = (await call("GET", "/api/tester/collections", null, gina.token)).data;
+        assert.equal(list.length, 1);
+
+        const learn = (await call("POST", "/api/tester/collections", { name: "Lernen", items: [{ kind: "task", id: read }] }, gina.token)).data;
+        await call("POST", "/api/sessions", { totalTime: 1500, workedTasks: [{ id: read, name: "Lesen", time: 1200 }, { id: run, name: "Laufen", time: 300 }] }, gina.token);
+        let stats = (await call("GET", "/api/stats", null, gina.token)).data;
+        assert.deepEqual(stats.collections.map(c => [c.id, c.ms]), [[learn.id, 1200000]]);
+        stats = (await call("GET", "/api/stats", null, plain.token)).data;
+        assert.equal(stats.collections, undefined, "not for everybody else");
+    });
+});
+
 describe("upload safety and profile pictures", () => {
     let pia, pal, stranger, admin, outsider;
     // 1 × 1 pixel pictures

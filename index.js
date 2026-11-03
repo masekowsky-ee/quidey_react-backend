@@ -290,10 +290,13 @@ const idParam = (value) => {
     return Number.isInteger(id) && id > 0 && id <= 2147483647 ? id : null;
 };
 
-// Text: trimmed, null when empty; undefined when it has the wrong type or is longer than max
+// A NUL character: Postgres can't store it in text or jsonb (a database error otherwise)
+const hasNul = (value) => value.includes("\u0000");
+
+// Text: trimmed, null when empty; undefined when it has the wrong type, a NUL or is longer than max
 function cleanText(value, max) {
     if (value === undefined || value === null) return null;
-    if (typeof value !== "string") return undefined;
+    if (typeof value !== "string" || hasNul(value)) return undefined;
     const trimmed = value.trim();
     if (trimmed.length > max) return undefined;
     return trimmed === "" ? null : trimmed;
@@ -5396,6 +5399,8 @@ app.delete("/api/event-types/:id", async (req, res) => {
 //   events:    { ms, count, days: [{ day, ms }], types: [{ id, name, color, ms, count }] }
 //              past events (time = their duration), per type; id null = without a type
 //   groups:    [{ name, color, ms }]  focus per group, the six biggest
+//   collections (testers, in place of groups): [{ id, name, emoji, color, ms }] focus on the
+//              tasks of each collection (as booked on them in the sessions), the six biggest
 //   tasksDone: tasks ticked off in the period (events don't count)
 //   firstDay:  the first day with anything at all, to draw "everything" from there
 const STATS_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -5460,6 +5465,24 @@ app.get("/api/stats", async (req, res) => {
             [userId, from, to]
         );
         const row = result.rows[0];
+        const collections = hasTesterAccess(req.account) ? (await pool.query(
+            `WITH me AS (SELECT COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = $1),
+            focus_in AS (
+                SELECT sessions.id FROM sessions, me
+                WHERE sessions.user_id = $1 AND sessions.date IS NOT NULL
+                    AND ($2::date IS NULL OR ((sessions.date AT TIME ZONE current_setting('TimeZone')) AT TIME ZONE me.tz)::date >= $2::date)
+                    AND ($3::date IS NULL OR ((sessions.date AT TIME ZONE current_setting('TimeZone')) AT TIME ZONE me.tz)::date <= $3::date)
+            )
+            SELECT collections.id, collections.name, collections.emoji, collections.color, sum(session_tasks.time_ms)::bigint AS ms
+            FROM session_tasks
+            JOIN focus_in ON focus_in.id = session_tasks.session_id
+            JOIN collection_items ON collection_items.task_id = session_tasks.task_id
+            JOIN collections ON collections.id = collection_items.collection_id AND collections.user_id = $1
+            GROUP BY collections.id
+            HAVING sum(session_tasks.time_ms) > 0
+            ORDER BY ms DESC LIMIT 6`,
+            [userId, from, to]
+        )).rows : null;
         const days = (list) => list.map(d => ({ day: d.day, ms: Number(d.ms), count: Number(d.n) }));
         const focusDays = days(row.focus_days);
         const eventDays = days(row.event_days);
@@ -5477,6 +5500,7 @@ app.get("/api/stats", async (req, res) => {
                 types: row.event_types.map(type => ({ id: type.id, name: type.name, color: type.color, ms: Number(type.ms), count: Number(type.count) })),
             },
             groups: row.groups.map(group => ({ name: group.name, color: group.color, ms: Number(group.ms) })),
+            ...(collections ? { collections: collections.map(c => ({ id: c.id, name: c.name, emoji: c.emoji, color: c.color, ms: Number(c.ms) })) } : {}),
             tasksDone: row.tasks_done,
         });
     } catch (err) {
@@ -6207,7 +6231,7 @@ function cleanAttachments(list) {
     const clean = [];
     for (const item of list) {
         if (item?.kind === "link") {
-            if (typeof item.url !== "string" || item.url.length > 2000 || !LINK_URL.test(item.url)) return undefined;
+            if (typeof item.url !== "string" || item.url.length > 2000 || !LINK_URL.test(item.url) || hasNul(item.url)) return undefined;
             const title = cleanText(item.title, 120);
             if (title === undefined) return undefined;
             clean.push({ kind: "link", url: item.url, ...(title ? { title } : {}) });
@@ -6232,7 +6256,7 @@ function cleanNote(body, partial) {
         out.title = title ?? "";
     }
     if (!partial || body.body !== undefined) {
-        if (body.body !== undefined && body.body !== null && (typeof body.body !== "string" || body.body.length > NOTEBOOK_BODY_MAX)) return { field: "body" };
+        if (body.body !== undefined && body.body !== null && (typeof body.body !== "string" || body.body.length > NOTEBOOK_BODY_MAX || hasNul(body.body))) return { field: "body" };
         out.body = body.body ?? "";
     }
     if (body.pinned !== undefined) {
@@ -6248,9 +6272,65 @@ function cleanNote(body, partial) {
         if (!attachments) return { field: "attachments" };
         out.attachments = JSON.stringify(attachments);
     }
+    // the notes area's fields (testers first: see NOTE_TESTER_COLUMNS)
+    if (body.folderId !== undefined) {
+        if (body.folderId !== null && !idParam(body.folderId)) return { field: "folderId" };
+        out.folder_id = body.folderId === null ? null : idParam(body.folderId);
+    }
+    if (body.tags !== undefined) {
+        const tags = cleanTags(body.tags);
+        if (!tags) return { field: "tags" };
+        out.tags = tags;
+    }
+    if (body.color !== undefined) {
+        if (body.color !== null && !TASK_COLORS.includes(body.color)) return { field: "color" };
+        out.color = body.color;
+    }
+    if (body.archived !== undefined) {
+        if (typeof body.archived !== "boolean") return { field: "archived" };
+        out.archived = body.archived;
+    }
+    if (body.trashed !== undefined) {
+        if (typeof body.trashed !== "boolean") return { field: "trashed" };
+        out.trashed_at = body.trashed ? new Date().toISOString() : null;
+    }
     if (!partial && !out.title && !out.body.trim() && !(body.attachments?.length)) return { field: "body" };
     return { values: out };
 }
+
+// Tags: single words of my own ("#" in front dropped), the same word in any case only once
+const NOTE_TAGS_MAX = 10;
+const NOTE_TAG_MAX = 30;
+function cleanTags(list) {
+    if (!Array.isArray(list) || list.length > NOTE_TAGS_MAX) return undefined;
+    const tags = [];
+    for (const item of list) {
+        if (typeof item !== "string") return undefined;
+        const tag = item.trim().replace(/^#+/, "");
+        if (!tag || tag.length > NOTE_TAG_MAX || /[\s,]/.test(tag) || hasNul(tag)) return undefined;
+        if (!tags.some(seen => seen.toLowerCase() === tag.toLowerCase())) tags.push(tag);
+    }
+    return tags;
+}
+
+// The notes area is in test: only testers may set these (everybody else's notes keep them empty)
+const NOTE_TESTER_COLUMNS = ["folder_id", "tags", "color", "archived", "trashed_at"];
+const usesTesterNoteFields = (values) => NOTE_TESTER_COLUMNS.some(column => column in values);
+const testersOnly = (res) => res.status(403).json({ error: "Only for testers", code: "TESTER_REQUIRED" });
+// a change of these says the note was edited (updated_at); moving it around doesn't
+const NOTE_CONTENT_COLUMNS = ["title", "body", "attachments", "task_id", "tags", "color"];
+
+// a folder a note goes into must be mine
+async function folderMine(folderId, userId) {
+    if (!folderId) return true;
+    const check = await pool.query("SELECT 1 FROM note_folders WHERE id = $1 AND user_id = $2", [folderId, userId]);
+    return check.rows.length > 0;
+}
+
+// Notes stay in the trash this long, then they go for good (checked whenever the list is loaded)
+const NOTE_TRASH_DAYS = 30;
+const purgeOldTrash = (userId) => pool.query(
+    `DELETE FROM notebook_notes WHERE user_id = $1 AND trashed_at < now() - interval '${NOTE_TRASH_DAYS} days'`, [userId]);
 
 // full: with the pictures' data; otherwise only that they are there
 const noteJson = (row, full) => ({
@@ -6260,6 +6340,11 @@ const noteJson = (row, full) => ({
     taskId: row.task_id,
     pinned: row.pinned,
     attachments: full ? row.attachments : row.attachments.map(item => item.kind === "image" ? { kind: "image", name: item.name ?? null } : item),
+    folderId: row.folder_id,
+    tags: row.tags ?? [],
+    color: row.color,
+    archived: row.archived,
+    trashedAt: row.trashed_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
 });
@@ -6271,10 +6356,14 @@ async function taskVisible(taskId, userId) {
     return check.rows.length > 0;
 }
 
+// the notes, without the ones in the trash (?trash=1: only those)
 app.get("/api/notebook", async (req, res) => {
+    const trash = req.query.trash === "1";
     try {
+        await purgeOldTrash(req.user.userId);
         const result = await pool.query(
-            "SELECT * FROM notebook_notes WHERE user_id = $1 ORDER BY pinned DESC, updated_at DESC",
+            `SELECT * FROM notebook_notes WHERE user_id = $1 AND trashed_at IS ${trash ? "NOT NULL" : "NULL"}
+            ORDER BY pinned DESC, updated_at DESC`,
             [req.user.userId]
         );
         res.json(result.rows.map(row => noteJson(row, false)));
@@ -6298,15 +6387,18 @@ app.get("/api/notebook/:id", async (req, res) => {
 app.post("/api/notebook", async (req, res) => {
     const { field, values } = cleanNote(req.body ?? {}, false);
     if (field) return invalidInput(res, field);
+    if (usesTesterNoteFields(values) && !hasTesterAccess(req.account)) return testersOnly(res);
     try {
         if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");
+        if (!await folderMine(values.folder_id, req.user.userId)) return notFound(res, "Folder");
         const count = await pool.query("SELECT count(*)::int AS n FROM notebook_notes WHERE user_id = $1", [req.user.userId]);
         if (count.rows[0].n >= NOTEBOOK_MAX) return res.status(409).json({ error: "Too many notes", code: "NOTEBOOK_LIMIT" });
         if (values.attachments && !await notebookHasRoom(req.user.userId, null, values.attachments)) return storageFull(res);
         const saved = await pool.query(
-            `INSERT INTO notebook_notes (user_id, task_id, title, body, pinned, attachments)
-            VALUES ($1, $2, $3, $4, COALESCE($5, false), COALESCE($6::jsonb, '[]'::jsonb)) RETURNING *`,
-            [req.user.userId, values.task_id ?? null, values.title, values.body, values.pinned ?? null, values.attachments ?? null]
+            `INSERT INTO notebook_notes (user_id, task_id, title, body, pinned, attachments, folder_id, tags, color)
+            VALUES ($1, $2, $3, $4, COALESCE($5, false), COALESCE($6::jsonb, '[]'::jsonb), $7, COALESCE($8, '{}'::text[]), $9) RETURNING *`,
+            [req.user.userId, values.task_id ?? null, values.title, values.body, values.pinned ?? null, values.attachments ?? null,
+                values.folder_id ?? null, values.tags ?? null, values.color ?? null]
         );
         res.status(201).json(noteJson(saved.rows[0], true));
     } catch (err) {
@@ -6319,13 +6411,16 @@ app.put("/api/notebook/:id", async (req, res) => {
     if (!id) return notFound(res, "Note");
     const { field, values } = cleanNote(req.body ?? {}, true);
     if (field) return invalidInput(res, field);
+    if (usesTesterNoteFields(values) && !hasTesterAccess(req.account)) return testersOnly(res);
     const columns = Object.keys(values);
     try {
         if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");
+        if (!await folderMine(values.folder_id, req.user.userId)) return notFound(res, "Folder");
         if (values.attachments && !await notebookHasRoom(req.user.userId, id, values.attachments)) return storageFull(res);
         const sets = columns.map((column, i) => `${column} = $${i + 3}${column === "attachments" ? "::jsonb" : ""}`);
+        if (sets.length === 0 || columns.some(column => NOTE_CONTENT_COLUMNS.includes(column))) sets.push("updated_at = now()");
         const result = await pool.query(
-            `UPDATE notebook_notes SET ${[...sets, "updated_at = now()"].join(", ")} WHERE id = $1 AND user_id = $2 RETURNING *`,
+            `UPDATE notebook_notes SET ${sets.join(", ")} WHERE id = $1 AND user_id = $2 RETURNING *`,
             [id, req.user.userId, ...columns.map(column => values[column])]
         );
         if (result.rows.length === 0) return notFound(res, "Note");
@@ -6342,6 +6437,342 @@ app.delete("/api/notebook/:id", async (req, res) => {
         const result = await pool.query("DELETE FROM notebook_notes WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
         if (result.rows.length === 0) return notFound(res, "Note");
         res.json({ deleted: id });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- the notes area: folders and the trash (testers first) ----------
+// The notes are the notebook's (above); testers can also sort them into folders, tag, colour,
+// archive and trash them. Folders: { id, name, emoji, notes } (notes = how many, not in the trash).
+const NOTE_FOLDERS_MAX = 50;
+const NOTE_FOLDER_NAME_MAX = 40;
+const EMOJI_MAX = 16;
+
+const folderJson = (row) => ({ id: row.id, name: row.name, emoji: row.emoji, notes: row.notes ?? 0, createdAt: row.created_at });
+const nameTaken = (err) => err.code === "23505";
+
+function cleanFolder(body, partial) {
+    const out = {};
+    if (!partial || body.name !== undefined) {
+        const name = cleanText(body.name, NOTE_FOLDER_NAME_MAX);
+        if (!name) return { field: "name" };
+        out.name = name;
+    }
+    if (body.emoji !== undefined) {
+        const emoji = cleanText(body.emoji, EMOJI_MAX);
+        if (emoji === undefined) return { field: "emoji" };
+        out.emoji = emoji;
+    }
+    return { values: out };
+}
+
+app.get("/api/tester/note-folders", async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT note_folders.*, (SELECT count(*)::int FROM notebook_notes
+                WHERE notebook_notes.folder_id = note_folders.id AND notebook_notes.trashed_at IS NULL) AS notes
+            FROM note_folders WHERE user_id = $1 ORDER BY lower(name)`,
+            [req.user.userId]
+        );
+        res.json(result.rows.map(folderJson));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.post("/api/tester/note-folders", async (req, res) => {
+    const { field, values } = cleanFolder(req.body ?? {}, false);
+    if (field) return invalidInput(res, field);
+    try {
+        const count = await pool.query("SELECT count(*)::int AS n FROM note_folders WHERE user_id = $1", [req.user.userId]);
+        if (count.rows[0].n >= NOTE_FOLDERS_MAX) return res.status(409).json({ error: "Too many folders", code: "FOLDER_LIMIT" });
+        const saved = await pool.query(
+            "INSERT INTO note_folders (user_id, name, emoji) VALUES ($1, $2, $3) RETURNING *",
+            [req.user.userId, values.name, values.emoji ?? null]
+        );
+        res.status(201).json(folderJson(saved.rows[0]));
+    } catch (err) {
+        if (nameTaken(err)) return res.status(409).json({ error: "Folder exists", code: "FOLDER_EXISTS" });
+        serverError(res, err);
+    }
+});
+
+app.put("/api/tester/note-folders/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Folder");
+    const { field, values } = cleanFolder(req.body ?? {}, true);
+    if (field) return invalidInput(res, field);
+    const columns = Object.keys(values);
+    if (columns.length === 0) return invalidInput(res, "name");
+    try {
+        const result = await pool.query(
+            `UPDATE note_folders SET ${columns.map((column, i) => `${column} = $${i + 3}`).join(", ")}
+            WHERE id = $1 AND user_id = $2 RETURNING *`,
+            [id, req.user.userId, ...columns.map(column => values[column])]
+        );
+        if (result.rows.length === 0) return notFound(res, "Folder");
+        res.json(folderJson(result.rows[0]));
+    } catch (err) {
+        if (nameTaken(err)) return res.status(409).json({ error: "Folder exists", code: "FOLDER_EXISTS" });
+        serverError(res, err);
+    }
+});
+
+// deleting a folder keeps its notes (loose then)
+app.delete("/api/tester/note-folders/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Folder");
+    try {
+        const result = await pool.query("DELETE FROM note_folders WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
+        if (result.rows.length === 0) return notFound(res, "Folder");
+        res.json({ deleted: id });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// empties the trash: { deleted: how many notes }
+app.delete("/api/tester/notebook/trash", async (req, res) => {
+    try {
+        const result = await pool.query("DELETE FROM notebook_notes WHERE user_id = $1 AND trashed_at IS NOT NULL", [req.user.userId]);
+        res.json({ deleted: result.rowCount });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- collections (testers first) ----------
+// Things that belong together, whatever they are: tasks, events and notes in one collection
+// (e.g. "Klausur Mathe": the exam, the tasks to learn for it, the formula sheet). One thing can
+// be in several collections; an entry goes when its task or note is deleted. Tasks are the ones I
+// can see (mine and the accepted shares), notes my own outside the trash.
+// { id, name, emoji, color, description, items: [{ kind: 'task' | 'note', id, addedAt }] }
+const COLLECTIONS_MAX = 100;
+const COLLECTION_ITEMS_MAX = 200;
+const COLLECTION_NAME_MAX = 60;
+const COLLECTION_DESCRIPTION_MAX = 500;
+const COLLECTION_KINDS = ["task", "note"];
+
+function cleanCollection(body, partial) {
+    const out = {};
+    if (!partial || body.name !== undefined) {
+        const name = cleanText(body.name, COLLECTION_NAME_MAX);
+        if (!name) return { field: "name" };
+        out.name = name;
+    }
+    if (body.emoji !== undefined) {
+        const emoji = cleanText(body.emoji, EMOJI_MAX);
+        if (emoji === undefined) return { field: "emoji" };
+        out.emoji = emoji;
+    }
+    if (body.color !== undefined) {
+        if (body.color !== null && !TASK_COLORS.includes(body.color)) return { field: "color" };
+        out.color = body.color;
+    }
+    if (body.description !== undefined) {
+        const description = cleanText(body.description, COLLECTION_DESCRIPTION_MAX);
+        if (description === undefined) return { field: "description" };
+        out.description = description ?? "";
+    }
+    return { values: out };
+}
+
+// { kind, id } of a thing to put in, or null
+const cleanItem = (item) => (item && COLLECTION_KINDS.includes(item.kind) && idParam(item.id) ? { kind: item.kind, id: idParam(item.id) } : null);
+
+// whether I may put this thing in a collection
+async function itemMine(item, userId) {
+    if (item.kind === "task") return taskVisible(item.id, userId);
+    const check = await pool.query("SELECT 1 FROM notebook_notes WHERE id = $1 AND user_id = $2 AND trashed_at IS NULL", [item.id, userId]);
+    return check.rows.length > 0;
+}
+
+// my collections (or the one with this id), each with what is in it
+async function loadCollections(userId, id = null) {
+    const rows = (await pool.query(
+        `SELECT * FROM collections WHERE user_id = $1 ${id ? "AND id = $2" : ""} ORDER BY updated_at DESC`,
+        id ? [userId, id] : [userId]
+    )).rows;
+    if (rows.length === 0) return [];
+    const items = (await pool.query(
+        `SELECT collection_id, task_id, note_id, added_at FROM collection_items
+        WHERE collection_id = ANY($1::int[])
+            AND (task_id IS NULL OR task_id IN (${accessibleTaskIds("$2")}))
+            AND (note_id IS NULL OR note_id IN (SELECT id FROM notebook_notes WHERE user_id = $2 AND trashed_at IS NULL))
+        ORDER BY added_at, id`,
+        [rows.map(row => row.id), userId]
+    )).rows;
+    return rows.map(row => ({
+        id: row.id,
+        name: row.name,
+        emoji: row.emoji,
+        color: row.color,
+        description: row.description,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        items: items.filter(item => item.collection_id === row.id)
+            .map(item => ({ kind: item.task_id ? "task" : "note", id: item.task_id ?? item.note_id, addedAt: item.added_at })),
+    }));
+}
+const oneCollection = async (userId, id) => (await loadCollections(userId, id))[0] ?? null;
+
+const addItem = (collectionId, item) => pool.query(
+    `INSERT INTO collection_items (collection_id, ${item.kind}_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+    [collectionId, item.id]
+);
+
+// For testers collections take the place of groups. Their first look at their collections takes
+// their groups over, once (users.groups_imported_at): one collection per group with its tasks,
+// name, colour and description (none for a group whose name a collection has already). The
+// groups themselves stay as they were, for when the test is over.
+async function importGroupsOnce(userId) {
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const claimed = await client.query(
+            "UPDATE users SET groups_imported_at = now() WHERE id = $1 AND groups_imported_at IS NULL RETURNING id", [userId]);
+        if (claimed.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return;
+        }
+        const groups = (await client.query(
+            `SELECT id, name, color, description FROM groups
+            WHERE user_id = $1 AND name <> 'all'
+                AND NOT EXISTS (SELECT 1 FROM collections WHERE collections.user_id = $1 AND lower(collections.name) = lower(groups.name))
+            ORDER BY id`,
+            [userId]
+        )).rows;
+        let count = (await client.query("SELECT count(*)::int AS n FROM collections WHERE user_id = $1", [userId])).rows[0].n;
+        for (const group of groups) {
+            if (count >= COLLECTIONS_MAX) break;
+            const name = cleanText(group.name.trim().slice(0, COLLECTION_NAME_MAX), COLLECTION_NAME_MAX);
+            if (!name) continue;
+            const description = cleanText((group.description ?? "").trim().slice(0, COLLECTION_DESCRIPTION_MAX), COLLECTION_DESCRIPTION_MAX) ?? "";
+            const saved = await client.query(
+                "INSERT INTO collections (user_id, name, color, description) VALUES ($1, $2, $3, $4) RETURNING id",
+                [userId, name, TASK_COLORS.includes(group.color) ? group.color : null, description]
+            );
+            await client.query(
+                `INSERT INTO collection_items (collection_id, task_id)
+                SELECT $1, task_id FROM task_groups
+                WHERE group_id = $2 AND task_id IN (${accessibleTaskIds("$3")})
+                ORDER BY task_id LIMIT ${COLLECTION_ITEMS_MAX}
+                ON CONFLICT DO NOTHING`,
+                [saved.rows[0].id, group.id, userId]
+            );
+            count += 1;
+        }
+        await client.query("COMMIT");
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+    } finally {
+        client.release();
+    }
+}
+
+app.get("/api/tester/collections", async (req, res) => {
+    try {
+        await importGroupsOnce(req.user.userId);
+        res.json(await loadCollections(req.user.userId));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// { name, emoji?, color?, description?, items?: [{ kind, id }] } (e.g. started from an event: with it in)
+app.post("/api/tester/collections", async (req, res) => {
+    const body = req.body ?? {};
+    const { field, values } = cleanCollection(body, false);
+    if (field) return invalidInput(res, field);
+    if (body.items !== undefined && (!Array.isArray(body.items) || body.items.length > COLLECTION_ITEMS_MAX)) return invalidInput(res, "items");
+    const items = (body.items ?? []).map(cleanItem);
+    if (items.some(item => !item)) return invalidInput(res, "items");
+    try {
+        for (const item of items) if (!await itemMine(item, req.user.userId)) return notFound(res, item.kind === "task" ? "Task" : "Note");
+        const count = await pool.query("SELECT count(*)::int AS n FROM collections WHERE user_id = $1", [req.user.userId]);
+        if (count.rows[0].n >= COLLECTIONS_MAX) return res.status(409).json({ error: "Too many collections", code: "COLLECTION_LIMIT" });
+        const saved = await pool.query(
+            "INSERT INTO collections (user_id, name, emoji, color, description) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            [req.user.userId, values.name, values.emoji ?? null, values.color ?? null, values.description ?? ""]
+        );
+        const id = saved.rows[0].id;
+        for (const item of items) await addItem(id, item);
+        res.status(201).json(await oneCollection(req.user.userId, id));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.put("/api/tester/collections/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Collection");
+    const { field, values } = cleanCollection(req.body ?? {}, true);
+    if (field) return invalidInput(res, field);
+    const columns = Object.keys(values);
+    try {
+        const result = await pool.query(
+            `UPDATE collections SET ${[...columns.map((column, i) => `${column} = $${i + 3}`), "updated_at = now()"].join(", ")}
+            WHERE id = $1 AND user_id = $2 RETURNING id`,
+            [id, req.user.userId, ...columns.map(column => values[column])]
+        );
+        if (result.rows.length === 0) return notFound(res, "Collection");
+        res.json(await oneCollection(req.user.userId, id));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// deleting a collection keeps its tasks and notes
+app.delete("/api/tester/collections/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Collection");
+    try {
+        const result = await pool.query("DELETE FROM collections WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
+        if (result.rows.length === 0) return notFound(res, "Collection");
+        res.json({ deleted: id });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// puts a task / event / note in: { kind, id } → the collection (201; 200 when it was in already)
+app.post("/api/tester/collections/:id/items", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Collection");
+    const item = cleanItem(req.body);
+    if (!item) return invalidInput(res, "item");
+    try {
+        const collection = await oneCollection(req.user.userId, id);
+        if (!collection) return notFound(res, "Collection");
+        if (!await itemMine(item, req.user.userId)) return notFound(res, item.kind === "task" ? "Task" : "Note");
+        if (collection.items.some(entry => entry.kind === item.kind && entry.id === item.id)) return res.json(collection);
+        if (collection.items.length >= COLLECTION_ITEMS_MAX) return res.status(409).json({ error: "Collection is full", code: "COLLECTION_FULL" });
+        await addItem(id, item);
+        await pool.query("UPDATE collections SET updated_at = now() WHERE id = $1", [id]);
+        res.status(201).json(await oneCollection(req.user.userId, id));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// takes a thing out (the thing itself stays) → the collection
+app.delete("/api/tester/collections/:id/items/:kind/:itemId", async (req, res) => {
+    const id = idParam(req.params.id);
+    const item = cleanItem({ kind: req.params.kind, id: req.params.itemId });
+    if (!id || !item) return notFound(res, "Collection");
+    try {
+        const removed = await pool.query(
+            `DELETE FROM collection_items USING collections
+            WHERE collection_items.collection_id = collections.id AND collections.id = $1 AND collections.user_id = $2
+                AND collection_items.${item.kind}_id = $3
+            RETURNING collection_items.id`,
+            [id, req.user.userId, item.id]
+        );
+        if (removed.rows.length === 0) return notFound(res, "Entry");
+        await pool.query("UPDATE collections SET updated_at = now() WHERE id = $1", [id]);
+        res.json(await oneCollection(req.user.userId, id));
     } catch (err) {
         serverError(res, err);
     }

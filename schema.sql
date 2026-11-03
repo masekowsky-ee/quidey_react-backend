@@ -2314,6 +2314,52 @@ ALTER TABLE public.users ADD COLUMN IF NOT EXISTS stripe_customer_id text;
 CREATE UNIQUE INDEX IF NOT EXISTS users_stripe_customer_key ON public.users USING btree (stripe_customer_id);
 
 --
+-- 036: the notes area and collections (see migrations/036_notes_collections.sql)
+--
+
+CREATE TABLE IF NOT EXISTS public.note_folders (
+    id serial PRIMARY KEY,
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 40),
+    emoji text,
+    created_at timestamp with time zone NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS note_folders_user_name ON public.note_folders (user_id, lower(name));
+
+ALTER TABLE public.notebook_notes ADD COLUMN IF NOT EXISTS folder_id integer REFERENCES public.note_folders(id) ON DELETE SET NULL;
+ALTER TABLE public.notebook_notes ADD COLUMN IF NOT EXISTS tags text[] NOT NULL DEFAULT '{}'::text[];
+ALTER TABLE public.notebook_notes ADD COLUMN IF NOT EXISTS color text;
+ALTER TABLE public.notebook_notes ADD COLUMN IF NOT EXISTS archived boolean NOT NULL DEFAULT false;
+ALTER TABLE public.notebook_notes ADD COLUMN IF NOT EXISTS trashed_at timestamp with time zone;
+CREATE INDEX IF NOT EXISTS notebook_notes_trashed ON public.notebook_notes (trashed_at) WHERE trashed_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.collections (
+    id serial PRIMARY KEY,
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 60),
+    emoji text,
+    color text,
+    description text NOT NULL DEFAULT '',
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS collections_user ON public.collections (user_id);
+
+CREATE TABLE IF NOT EXISTS public.collection_items (
+    id serial PRIMARY KEY,
+    collection_id integer NOT NULL REFERENCES public.collections(id) ON DELETE CASCADE,
+    task_id integer REFERENCES public.tasks(id) ON DELETE CASCADE,
+    note_id integer REFERENCES public.notebook_notes(id) ON DELETE CASCADE,
+    added_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT collection_items_one_thing CHECK ((task_id IS NULL) <> (note_id IS NULL)),
+    CONSTRAINT collection_items_task_once UNIQUE (collection_id, task_id),
+    CONSTRAINT collection_items_note_once UNIQUE (collection_id, note_id)
+);
+CREATE INDEX IF NOT EXISTS collection_items_task ON public.collection_items (task_id) WHERE task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS collection_items_note ON public.collection_items (note_id) WHERE note_id IS NOT NULL;
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS groups_imported_at timestamp with time zone;
+
+--
 -- PostgreSQL database dump complete
 --
 
