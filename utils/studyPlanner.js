@@ -193,24 +193,57 @@ function reserveReviews(states, dayMap, record) {
     }
 }
 
-// What a day can still hold, as upper bounds: `minutes` under the daily max, and `slots`, what
-// `slots` goals can use: the whole sessions its free gaps take, 10-minute buffer between them
-function estimateRoom(dayMap, sessionMinutes) {
-    const room = new Map();
-    for (const [date, day] of dayMap) {
-        const minutes = Math.max(0, day.capacity);
-        const sessions = day.gaps.reduce((n, g) => n + Math.floor((g.end - g.start + BUFFER) / (sessionMinutes + BUFFER)), 0);
-        room.set(date, { minutes, slots: Math.min(minutes, sessions * sessionMinutes) });
+// The most minutes whole chunks can fill in one gap, as a true upper bound: k chunks fit only if the
+// k smallest do (with the buffer between them), and then fill at most the k largest, and at most
+// the gap minus the k - 1 inner buffers. `small` / `large` are running sums of the chunk sizes
+// sorted up / down.
+function gapRoom(length, small, large) {
+    let best = 0;
+    for (let k = 1; k < small.length && small[k] + (k - 1) * BUFFER <= length; k++) {
+        best = Math.max(best, Math.min(large[k], length - (k - 1) * BUFFER));
     }
+    return best;
+}
+
+const runningSums = (sizes) => {
+    const sums = [0];
+    for (const m of sizes) sums.push(sums[sums.length - 1] + m);
+    return sums;
+};
+
+// What each day can still hold once the reviews are in: `minutes` under the daily max, and its
+// free `gaps` (future days are not touched again until they are filled, so this stays valid)
+function estimateRoom(dayMap) {
+    const room = new Map();
+    for (const [date, day] of dayMap) room.set(date, { minutes: Math.max(0, day.capacity), gaps: day.gaps });
     return room;
 }
 
-// The room some goals have on some days: a day gives its `slots` room when every one of these
-// goals that can use it plans in slots, else its minutes (a `days` goal can use them all)
-const roomFor = (group, days, room) => [...days].reduce((sum, d) => {
-    const onlySlots = group.every((s) => s.goal.planMode === 'slots' || !s.days.includes(d));
-    return sum + (onlySlots ? room.get(d).slots : room.get(d).minutes);
-}, 0);
+// The room some goals have on some days: a day gives its minutes, or, when every one of these goals
+// that can use it plans in slots, what fits in its free gaps. That has two estimates:
+// - without `sessionMinutes`, a true upper bound: what these goals' own chunks could fill. The
+//   feasibility cut uses it, so it never cuts a session that would have fitted.
+// - with `sessionMinutes`, the whole standard sessions the gaps take (10-minute buffer between
+//   them). The daily needs use it, so an earlier goal places today rather than count on room its
+//   chunks may not get later (a longer chunk, a gap a later goal took, Ruling 6e).
+function roomFor(group, days, room, sessionMinutes = null) {
+    let fill;
+    if (sessionMinutes) {
+        fill = (length) => Math.floor((length + BUFFER) / (sessionMinutes + BUFFER)) * sessionMinutes;
+    } else {
+        const sizes = group.flatMap((s) => s.queue.map((c) => c.minutes)).sort((a, b) => a - b);
+        const small = runningSums(sizes);
+        const large = runningSums([...sizes].reverse());
+        fill = (length) => gapRoom(length, small, large);
+    }
+    let sum = 0;
+    for (const d of days) {
+        const { minutes, gaps } = room.get(d);
+        const onlySlots = group.every((s) => s.goal.planMode === 'slots' || !s.days.includes(d));
+        sum += onlySlots ? Math.min(minutes, gaps.reduce((t, g) => t + fill(g.end - g.start), 0)) : minutes;
+    }
+    return sum;
+}
 
 // Step 2. Feasibility, deadline by deadline: the goals due by D must fit the room on their days.
 // Where they don't, the latest-due goals lose their last sessions, so earlier goals keep their
@@ -235,12 +268,12 @@ function cutToFit(states, room) {
 
 // Per deadline D, the minutes the goals due by D must place today because the days after today
 // can't hold all of their remaining minutes
-function needsOn(date, states, room) {
+function needsOn(date, states, room, sessionMinutes) {
     const live = states.filter((s) => s.queue.length && s.days.some((d) => d >= date));
     return [...new Set(live.map((s) => s.goal.due))].sort().map((due) => {
         const group = live.filter((s) => s.goal.due <= due);
         const remaining = group.reduce((sum, s) => sum + s.total - s.planned, 0);
-        const later = roomFor(group, new Set(group.flatMap((s) => s.days.filter((d) => d > date))), room);
+        const later = roomFor(group, new Set(group.flatMap((s) => s.days.filter((d) => d > date))), room, sessionMinutes);
         return { due, minutes: Math.max(0, remaining - later) };
     });
 }
@@ -248,8 +281,8 @@ function needsOn(date, states, room) {
 // Step 3. One day: goals by (due, today's pace, id), one chunk per goal per round, while a goal is
 // behind its curve (ruling 1) or its deadline needs minutes today. A goal waits while an earlier
 // deadline still needs minutes today; a chunk that doesn't fit ends the goal's day.
-function fillDay(date, states, day, room, record) {
-    const needs = needsOn(date, states, room);
+function fillDay(date, states, day, room, record, sessionMinutes) {
+    const needs = needsOn(date, states, room, sessionMinutes);
     const indexOf = (s) => s.days.indexOf(date);
     const pace = (s) => (s.total - s.planned) / (s.days.length - indexOf(s));
     const open = states.filter((s) => indexOf(s) >= 0 && s.queue.length)
@@ -304,9 +337,9 @@ function plan(input) {
     };
 
     reserveReviews(states, dayMap, record);
-    const room = estimateRoom(dayMap, input.sessionMinutes);
+    const room = estimateRoom(dayMap);
     cutToFit(states, room);
-    for (const date of allDays) fillDay(date, states, dayMap.get(date), room, record);
+    for (const date of allDays) fillDay(date, states, dayMap.get(date), room, record, input.sessionMinutes);
 
     const shortfall = {};
     for (const s of states) shortfall[s.goal.id] = s.need - s.placed;
