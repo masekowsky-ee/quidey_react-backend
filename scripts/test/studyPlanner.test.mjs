@@ -611,3 +611,72 @@ test('determinism with several goals: same output twice, input untouched, never 
     perDay['2026-11-12'] = (perDay['2026-11-12'] || 0) + 45;
     for (const minutes of Object.values(perDay)) assert.ok(minutes <= 150);
 });
+
+// ---------- fix round 1 (task 4 review) ----------
+
+// Mon 08:00-14:00 holds 6 sessions; Tue and Wed hold one each
+const monLongTueWedShort = (tueWedEnd) => [
+    { weekday: 1, start: '08:00', end: '14:00' },
+    { weekday: 2, start: '15:00', end: tueWedEnd },
+    { weekday: 3, start: '15:00', end: tueWedEnd },
+];
+
+test('slots: a later-due slots goal does not take the gap an earlier goal needs today', () => {
+    // each day's window holds two sessions; goal A needs 4 in its 2 days, B has 10 days for 1
+    const windows = everyDay('15:00', '16:40');
+    const A = goal({ id: 'A', planMode: 'slots', due: '2026-11-11', parts: [part('a', 180)] });
+    const B = goal({ id: 'B', planMode: 'slots', due: '2026-11-19', parts: [part('b', 45)] });
+    assert.deepEqual(plan(input({ nowMinutes: 7 * 60, windows, goals: [A] })).shortfall, { A: 0 });
+    const both = plan(input({ nowMinutes: 7 * 60, windows, goals: [A, B] }));
+    assert.deepEqual(both.shortfall, { A: 0, B: 0 });
+    assert.deepEqual(dates(both.sessions.filter((s) => s.goalId === 'A')), ['2026-11-09', '2026-11-09', '2026-11-10', '2026-11-10']);
+});
+
+test('slots: an unrelated days goal does not hide how little the slots days hold', () => {
+    const run = (goals) => plan(input({ nowMinutes: 7 * 60, dailyMaxMinutes: 360, windows: monLongTueWedShort('15:45'), goals }));
+    const A = goal({ id: 'A', planMode: 'slots', due: '2026-11-12', parts: [part('a', 270)] });
+    const B = goal({ id: 'B', planMode: 'days', due: '2026-11-19', parts: [part('b', 45)] });
+    assert.deepEqual(run([A]).shortfall, { A: 0 });
+    assert.deepEqual(run([A, B]).shortfall, { A: 0, B: 0 });
+});
+
+test('slots: a 90-minute window counts as one session, not 90 minutes, when planning ahead', () => {
+    const { sessions, shortfall } = plan(input({
+        nowMinutes: 7 * 60, dailyMaxMinutes: 360, windows: monLongTueWedShort('16:30'),
+        goals: [goal({ id: 'A', planMode: 'slots', due: '2026-11-12', parts: [part('a', 360)] })],
+    }));
+    assert.deepEqual(shortfall, { A: 0 });
+    assert.deepEqual(Object.values(perDayMinutes(sessions)), [270, 45, 45]);
+});
+
+test('review: on its day it comes after the goal\'s regular sessions (slots and days)', () => {
+    const run = (planMode) => plan(input({
+        nowMinutes: 7 * 60, windows: everyDay('15:00', '19:00'),
+        goals: [goal({ planMode, due: '2026-11-12', parts: [part('p', 360), review('r', 45)] })],
+    }));
+    for (const planMode of ['slots', 'days']) {
+        const { sessions, shortfall } = run(planMode);
+        assert.deepEqual(shortfall, { g1: 0 }, planMode);
+        const onDay = sessions.filter((s) => s.date === '2026-11-11');
+        assert.equal(onDay.at(-1).partId, 'r', planMode);
+        assert.ok(onDay.filter((s) => s.partId === 'p').length > 0, planMode);
+        if (planMode === 'slots') {
+            const reviewAt = toMin(onDay.at(-1).time);
+            assert.ok(onDay.slice(0, -1).every((s) => toMin(s.time) < reviewAt), planMode);
+        }
+    }
+});
+
+test('feasibility: goals due the same day lose sessions from the largest first, so a small goal keeps its one', () => {
+    // one session a day for 5 days, 13 sessions wanted: goals 2 and 3 keep 2 each, goal 1 its single one
+    const { sessions, shortfall } = plan(input({
+        dailyMaxMinutes: 45,
+        goals: [
+            goal({ id: 1, due: '2026-11-14', parts: [part(10, 45)] }),
+            goal({ id: 2, due: '2026-11-14', parts: [part(20, 270)] }),
+            goal({ id: 3, due: '2026-11-14', parts: [part(30, 270)] }),
+        ],
+    }));
+    assert.deepEqual(shortfall, { 1: 0, 2: 180, 3: 180 });
+    assert.equal(sessions.filter((s) => s.goalId === 1).length, 1);
+});
