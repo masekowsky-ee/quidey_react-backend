@@ -21,6 +21,7 @@
   },
   "homepage": "https://github.com/masekowsky-ee/quidey_react-backend#readme",
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
