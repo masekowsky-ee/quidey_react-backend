@@ -750,6 +750,46 @@ describe("events in a shared session", () => {
     });
 });
 
+describe("study goals: schema", () => {
+    test("study tables and columns exist", async () => {
+        const columns = async (table) => (await sql(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1", [table]
+        )).map(row => row.column_name);
+        const expected = {
+            subjects: ["id", "user_id", "name", "emoji", "color", "archived", "created_at"],
+            goals: ["id", "user_id", "subject_id", "kind", "name", "due", "due_time", "plan_mode", "status",
+                "behind_notified_minutes", "behind_notified_on", "freed_minutes", "created_at"],
+            goal_parts: ["id", "goal_id", "name", "position", "estimate_minutes", "estimate_source", "role", "done_at", "actual_minutes"],
+            study_windows: ["id", "user_id", "weekday", "start_time", "end_time"],
+        };
+        for (const [table, names] of Object.entries(expected)) {
+            const have = await columns(table);
+            for (const name of names) assert.ok(have.includes(name), `${table}.${name}`);
+        }
+        const tasks = await columns("tasks");
+        for (const name of ["goal_part_id", "plan_pinned"]) assert.ok(tasks.includes(name), `tasks.${name}`);
+        const users = await columns("users");
+        for (const name of ["study_session_minutes", "study_daily_max_minutes", "study_ai_auto"]) assert.ok(users.includes(name), `users.${name}`);
+        assert.ok((await columns("push_subscriptions")).includes("study"), "push_subscriptions.study");
+
+        const u = await member("studyschema");
+        const subject = (await sql("INSERT INTO subjects (user_id, name) VALUES ($1, 'Mathe') RETURNING id", [u.id]))[0];
+        await assert.rejects(
+            sql("INSERT INTO goals (user_id, subject_id, kind, name, due) VALUES ($1, $2, 'quiz', 'x', CURRENT_DATE)", [u.id, subject.id]),
+            /goals_kind_check/
+        );
+        await sql("INSERT INTO goals (user_id, subject_id, kind, name, due) VALUES ($1, $2, 'exam', 'x', CURRENT_DATE)", [u.id, subject.id]);
+        await assert.rejects(
+            sql("INSERT INTO study_windows (user_id, weekday, start_time, end_time) VALUES ($1, 1, '10:00', '09:00')", [u.id]),
+            /study_windows_time_check/
+        );
+        await assert.rejects(
+            sql("INSERT INTO study_windows (user_id, weekday, start_time, end_time) VALUES ($1, 8, '09:00', '10:00')", [u.id]),
+            /study_windows_weekday_check/
+        );
+    });
+});
+
 describe("inbox: messages and notices", () => {
     let ann, bob, cleo, dan;
     before(async () => {
