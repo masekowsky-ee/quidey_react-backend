@@ -7,8 +7,8 @@ import { createRequire } from "node:module";
 process.env.ACCESS_MODE = "open";
 delete process.env.PRO_BILLING;
 const require = createRequire(import.meta.url);
-const { PRO_BILLING, requireProBilling, hasAppAccess } = require("../utils/access.js");
-const { limited, limitReached } = require("../utils/limits.js");
+const { PRO_BILLING, requireProBilling, hasAppAccess } = require("../../utils/access.js");
+const { limited, limitReached } = require("../../utils/limits.js");
 
 const free = { id: 1, is_pro: false, pro_until: null, is_tester: false, is_admin: false };
 

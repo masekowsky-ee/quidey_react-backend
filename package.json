@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "pro": "node scripts/pro.js",
-    "test": "node --test --test-concurrency=1 \"test/**/*.test.mjs\""
+    "test": "node --test --test-concurrency=1 \"scripts/test/**/*.test.mjs\""
   },
   "repository": {
     "type": "git",

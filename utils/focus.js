@@ -7,11 +7,15 @@
 // nobody would hear that the 25 minutes are over. Checked every FOCUS_CHECK_MS (a few seconds:
 // it should come on time); one that is more than LATE_LIMIT late is dropped without a push.
 //
+// Reminders (testers): once at `at`, or on each of their weekdays at at_time in my time zone; a
+// snooze rings at snoozed_until instead. Each time goes out once (fired_for), at most LATE_LIMIT
+// late; not to devices that ring them themselves (the Android app, push_subscriptions.alarms).
+//
 // Routines: on each planned weekday (days, 1 = Monday) at at_time in my time zone, once a day
 // (reminded_on), within an hour after the time.
 
 const { pushToUsers } = require("./push");
-const { APP_ACCESS_SQL } = require("./access");
+const { APP_ACCESS_SQL, TESTER_ACCESS_SQL } = require("./access");
 const { DEFAULT_TIMEZONE } = require("./reminderMails");
 
 const LATE_LIMIT = "10 minutes";
@@ -27,6 +31,16 @@ const TEXTS = {
         };
         const [title, body] = texts[phase] ?? texts.timer;
         return { title, body, url: "/focus", tag: "focus", renotify: true };
+    },
+    reminder(reminder, language) {
+        const en = language === "en";
+        return {
+            title: en ? "Reminder" : "Erinnerung",
+            body: reminder.text,
+            url: "/inbox?tab=reminders",
+            tag: `reminder-${reminder.id}`,
+            renotify: true,
+        };
     },
     routine(routine, language) {
         const en = language === "en";
@@ -87,6 +101,46 @@ async function pushRoutines(pool) {
     return due.rows.length;
 }
 
+// the time a reminder rings next on today's date (a snooze first, then a once reminder's time,
+// then today's time when today is one of its weekdays); null when none today
+const PICK_REMINDERS = `
+    UPDATE reminders SET fired_for = ready.due_at,
+        snoozed_until = CASE WHEN reminders.snoozed_until = ready.due_at THEN NULL ELSE reminders.snoozed_until END
+    FROM (
+        SELECT reminders.id, due.at AS due_at
+        FROM reminders
+        JOIN users ON users.id = reminders.user_id
+        CROSS JOIN LATERAL (
+            SELECT COALESCE(users.timezone, '${DEFAULT_TIMEZONE}') AS timezone
+        ) AS zone
+        CROSS JOIN LATERAL (
+            SELECT (now() AT TIME ZONE zone.timezone) AS at
+        ) AS now_local
+        CROSS JOIN LATERAL (
+            SELECT CASE
+                WHEN reminders.snoozed_until IS NOT NULL THEN reminders.snoozed_until
+                WHEN reminders.at IS NOT NULL THEN reminders.at
+                WHEN extract(isodow FROM now_local.at)::smallint = ANY(reminders.days)
+                    THEN (now_local.at::date + reminders.at_time) AT TIME ZONE zone.timezone
+            END AS at
+        ) AS due
+        WHERE reminders.done_at IS NULL
+            AND due.at <= now() AND due.at > now() - interval '${LATE_LIMIT}'
+            AND (reminders.fired_for IS NULL OR reminders.fired_for < due.at)
+            AND ${APP_ACCESS_SQL} AND ${TESTER_ACCESS_SQL}
+        FOR UPDATE OF reminders SKIP LOCKED
+    ) AS ready
+    WHERE reminders.id = ready.id
+    RETURNING reminders.id, reminders.user_id, reminders.text`;
+
+async function pushReminders(pool) {
+    const due = await pool.query(PICK_REMINDERS);
+    for (const reminder of due.rows) {
+        await pushToUsers(pool, [reminder.user_id], "plan", (language) => TEXTS.reminder(reminder, language), { skipAlarms: true });
+    }
+    return due.rows.length;
+}
+
 // Alarms every `everyMs`, routines with them (cheap: both look at a handful of rows)
 function startFocusSchedule(pool, everyMs = 5000) {
     let running = false;
@@ -96,6 +150,7 @@ function startFocusSchedule(pool, everyMs = 5000) {
         try {
             await pushFocusAlarms(pool);
             await pushRoutines(pool);
+            await pushReminders(pool);
         } catch (err) {
             console.error("Focus check failed:", err);
         } finally {
@@ -108,4 +163,4 @@ function startFocusSchedule(pool, everyMs = 5000) {
     return () => clearInterval(timer);
 }
 
-module.exports = { FOCUS_TEXTS: TEXTS, startFocusSchedule, pushFocusAlarms, pushRoutines };
+module.exports = { FOCUS_TEXTS: TEXTS, startFocusSchedule, pushFocusAlarms, pushRoutines, pushReminders };

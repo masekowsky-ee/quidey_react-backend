@@ -7,8 +7,8 @@ import { createRequire } from "node:module";
 process.env.ACCESS_MODE = "open";
 process.env.PRO_BILLING = "on";
 const require = createRequire(import.meta.url);
-const { FREE_LIMITS, limited, limitReached, refuseOverLimit, usage } = require("../utils/limits.js");
-const { hasAppAccess } = require("../utils/access.js");
+const { FREE_LIMITS, limited, limitReached, refuseOverLimit, usage } = require("../../utils/limits.js");
+const { hasAppAccess } = require("../../utils/access.js");
 
 // answers every count with `n`
 const db = (n) => ({ query: async () => ({ rows: [{ n }] }) });

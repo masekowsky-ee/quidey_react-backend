@@ -15,7 +15,7 @@ import { io } from "socket.io-client";
 import { generateKeyPairSync } from "node:crypto";
 import jwt from "jsonwebtoken";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 dotenv.config({ path: join(ROOT, ".env"), quiet: true });
 
 const DB = `quidey_test_${process.pid}`;
@@ -104,7 +104,7 @@ before(async () => {
         cwd: ROOT,
         env: {
             ...process.env, DB_NAME: DB, PORT: String(port), SMTP_HOST: "", CONTACT_TO: "owner@example.com",
-            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", FOCUS_CHECK_MS: "200", NOTEBOOK_STORAGE_MAX: "4000", PRESENCE_GRACE_MS: "200",
+            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_FRIEND_REQUESTS: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", FOCUS_CHECK_MS: "200", NOTEBOOK_STORAGE_MAX: "4000", PRESENCE_GRACE_MS: "200",
             // pushes are only logged ("[DEV] Push to user …"), like mails without SMTP_HOST
             VAPID_PUBLIC_KEY: "", VAPID_PRIVATE_KEY: "",
             // the Android app's pushes are only logged too; Pro on sale, but no payments set up
@@ -738,8 +738,15 @@ describe("events in a shared session", () => {
         assert.ok(!mine.tasks.some(task => task.name === "Treffen"));
     });
 
-    test("family calendars don't take a kind", async () => {
-        assert.equal((await sql("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_name = 'family_tasks' AND column_name = 'kind'"))[0].n, 0);
+    test("family entries have a kind, reminders and who ticked them off", async () => {
+        const columns = async (table) => (await sql(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1", [table]
+        )).map(row => row.column_name);
+        const family = await columns("family_tasks");
+        for (const name of ["kind", "reminders", "push_sent_for", "done_by", "completed_at"]) assert.ok(family.includes(name), `family_tasks.${name}`);
+        const session = await columns("shared_session_tasks");
+        for (const name of ["done_by", "completed_at"]) assert.ok(session.includes(name), `shared_session_tasks.${name}`);
+        assert.ok((await columns("push_subscriptions")).includes("groups"), "push_subscriptions.groups");
     });
 });
 
@@ -1501,6 +1508,407 @@ describe("Quidey Family", () => {
     });
 });
 
+describe("events and reminders in a family", () => {
+    const F = "/api/families";
+    let ola, per, ute, familyId;
+    const tasksPath = () => `${F}/${familyId}/tasks`;
+    const find = (family, name) => family.tasks.find(task => task.name === name);
+    before(async () => {
+        ola = await member("fevola");
+        per = await member("fevper");
+        ute = await member("fevute");
+        await befriend(ola, per, "fevper");
+        await befriend(ola, ute, "fevute");
+        familyId = (await call("POST", F, { name: "Termine daheim", friendIds: [per.id, ute.id] }, ola.token)).data.id;
+        await call("POST", `${F}/${familyId}/join`, null, per.token);
+        // ute stays invited
+    });
+
+    test("an event needs a day; entries stay tasks by default", async () => {
+        assert.equal((await call("POST", tasksPath(), { name: "Ohne Tag", kind: "event" }, ola.token)).data.field, "due");
+        assert.equal((await call("POST", tasksPath(), { name: "Falsch", kind: "meeting" }, ola.token)).data.field, "kind");
+        assert.equal(find((await call("POST", tasksPath(), { name: "Einkauf" }, ola.token)).data, "Einkauf").kind, "task");
+    });
+
+    test("an event is done once it is over, never by hand; moving it opens it again", async () => {
+        const past = find((await call("POST", tasksPath(), { name: "Konzert", kind: "event", due: daysFromToday(-1), due_time: "19:00", duration_minutes: 90 }, ola.token)).data, "Konzert");
+        assert.equal(past.kind, "event");
+        assert.equal(past.done, true);
+        assert.ok(past.completedAt, "ended");
+        const coming = find((await call("POST", tasksPath(), { name: "Geburtstag", kind: "event", due: daysFromToday(2) }, ola.token)).data, "Geburtstag");
+        assert.equal(coming.done, false);
+        assert.equal((await call("PATCH", `${tasksPath()}/${coming.id}`, { done: true }, per.token)).data.code, "EVENT_NOT_DONE_BY_HAND");
+        const moved = find((await call("PATCH", `${tasksPath()}/${past.id}`, { due: daysFromToday(3) }, per.token)).data, "Konzert");
+        assert.equal(moved.done, false);
+        assert.equal(moved.completedAt, null);
+        assert.equal((await call("PATCH", `${tasksPath()}/${coming.id}`, { due: null }, per.token)).data.field, "due");
+        const back = find((await call("PATCH", `${tasksPath()}/${past.id}`, { due: daysFromToday(-2) }, per.token)).data, "Konzert");
+        assert.equal(back.done, true, "moved into the past: over at once");
+        assert.ok(back.completedAt);
+    });
+
+    test("the server ticks off family events that end while nobody looks", async () => {
+        const event = find((await call("POST", tasksPath(), { name: "Elternabend", kind: "event", due: daysFromToday(1) }, ola.token)).data, "Elternabend");
+        await sql("UPDATE family_tasks SET due = current_date - 1, done = false WHERE id = $1", [event.id]);
+        let row;
+        for (let i = 0; i < 20; i++) {
+            [row] = await sql("SELECT done, completed_at FROM family_tasks WHERE id = $1", [event.id]);
+            if (row.done) break;
+            await sleep(100);
+        }
+        assert.equal(row.done, true);
+        assert.ok(row.completed_at);
+    });
+
+    test("reminders are kept only with a day", async () => {
+        const entry = find((await call("POST", tasksPath(), { name: "Zahnarzt", due: daysFromToday(4), due_time: "09:00", reminders: [60, 0] }, ola.token)).data, "Zahnarzt");
+        assert.deepEqual(entry.reminders, [0, 60]);
+        assert.equal((await call("POST", tasksPath(), { name: "Zuviel", due: daysFromToday(4), reminders: [1, 2, 3, 4, 5, 6] }, ola.token)).data.field, "reminders");
+        const cleared = find((await call("PATCH", `${tasksPath()}/${entry.id}`, { due: null }, per.token)).data, "Zahnarzt");
+        assert.deepEqual(cleared.reminders, []);
+        const noDay = find((await call("POST", tasksPath(), { name: "Ohne Tag erinnert", reminders: [0] }, ola.token)).data, "Ohne Tag erinnert");
+        assert.deepEqual(noDay.reminders, []);
+    });
+
+    test("ticking off records who and when, in families and sessions", async () => {
+        const entry = find((await call("POST", tasksPath(), { name: "Müll", due: daysFromToday(0) }, ola.token)).data, "Müll");
+        await call("PATCH", `${tasksPath()}/${entry.id}`, { done: true }, per.token);
+        let [row] = await sql("SELECT done_by, completed_at FROM family_tasks WHERE id = $1", [entry.id]);
+        assert.equal(row.done_by, per.id);
+        assert.ok(row.completed_at);
+        await call("PATCH", `${tasksPath()}/${entry.id}`, { done: false }, ola.token);
+        [row] = await sql("SELECT done_by, completed_at FROM family_tasks WHERE id = $1", [entry.id]);
+        assert.equal(row.done_by, null);
+        assert.equal(row.completed_at, null);
+
+        const sessionId = (await call("POST", "/api/shared-sessions", { name: "Abhaken", friendIds: [per.id] }, ola.token)).data.id;
+        await call("POST", `/api/shared-sessions/${sessionId}/join`, null, per.token);
+        const task = (await call("POST", `/api/shared-sessions/${sessionId}/tasks`, { name: "Folien" }, ola.token)).data.tasks.find(t => t.name === "Folien");
+        await call("PATCH", `/api/shared-sessions/${sessionId}/tasks/${task.id}`, { done: true }, per.token);
+        [row] = await sql("SELECT done_by, completed_at FROM shared_session_tasks WHERE id = $1", [task.id]);
+        assert.equal(row.done_by, per.id);
+        assert.ok(row.completed_at);
+        await call("PATCH", `/api/shared-sessions/${sessionId}/tasks/${task.id}`, { done: false }, per.token);
+        [row] = await sql("SELECT done_by, completed_at FROM shared_session_tasks WHERE id = $1", [task.id]);
+        assert.equal(row.done_by, null);
+        assert.equal(row.completed_at, null);
+    });
+
+    const ownTask = async (user, fields) => (await call("POST", "/api/tasks", { prio: 50, due: null, description: "", ...fields }, user.token)).data;
+    const myTaskIds = async (user) => (await call("GET", "/api/tasks", null, user.token)).data.map(task => task.id);
+
+    test("one of my own tasks moves into the family with its details and reminders", async () => {
+        const own = await ownTask(per, {
+            name: "Steuer", description: "Belege sammeln", due: daysFromToday(5), due_time: "18:00", prio: 80, duration_minutes: 45,
+            location: "Küche", link: "https://example.com/steuer", details: "Ordner blau", color: "orange", reminders: [60, 0],
+        });
+        const moved = await call("POST", tasksPath(), { taskId: own.id }, per.token);
+        assert.equal(moved.status, 201, JSON.stringify(moved.data));
+        const entry = find(moved.data, "Steuer");
+        assert.equal(entry.description, "Belege sammeln");
+        assert.equal(entry.due_time, "18:00");
+        assert.equal(entry.prio, 80);
+        assert.equal(entry.duration_minutes, 45);
+        assert.equal(entry.location, "Küche");
+        assert.equal(entry.link, "https://example.com/steuer");
+        assert.equal(entry.details, "Ordner blau");
+        assert.equal(entry.color, "orange");
+        assert.equal(entry.kind, "task");
+        assert.deepEqual(entry.reminders, [0, 60]);
+        assert.equal(entry.addedBy.id, per.id);
+        assert.ok(!(await myTaskIds(per)).includes(own.id), "gone from my list");
+    });
+
+    test("an own event moves as an event, with its type's colour", async () => {
+        const type = (await call("POST", "/api/event-types", { name: "Sport", color: "teal" }, per.token)).data;
+        const own = await ownTask(per, { name: "Schwimmen", due: daysFromToday(6), kind: "event", event_type_id: type.id });
+        const entry = find((await call("POST", tasksPath(), { taskId: own.id }, per.token)).data, "Schwimmen");
+        assert.equal(entry.kind, "event");
+        assert.equal(entry.color, "teal");
+    });
+
+    test("moving is refused for repeating, shared, done and other people's tasks", async () => {
+        const repeating = await ownTask(per, { name: "Wöchentlich", due: daysFromToday(1), repeat: "weekly" });
+        assert.equal((await call("POST", tasksPath(), { taskId: repeating.id }, per.token)).data.code, "TASK_REPEATS");
+        const shared = await ownTask(per, { name: "Geteilt" });
+        await call("POST", `/api/tasks/${shared.id}/shares`, { userIds: [ola.id] }, per.token);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM task_shares WHERE task_id = $1", [shared.id]))[0].n, 1, "shared");
+        assert.equal((await call("POST", tasksPath(), { taskId: shared.id }, per.token)).data.code, "TASK_SHARED");
+        const done = await ownTask(per, { name: "Erledigt" });
+        await call("PUT", `/api/tasks/${done.id}`, { name: "Erledigt", description: "", prio: 50, due: null, done: true }, per.token);
+        assert.equal((await call("POST", tasksPath(), { taskId: done.id }, per.token)).data.code, "TASK_DONE");
+        const foreign = await ownTask(ola, { name: "Olas" });
+        const refused = await call("POST", tasksPath(), { taskId: foreign.id }, per.token);
+        assert.equal(refused.status, 404);
+        assert.equal(refused.data.code, "TASK_NOT_FOUND");
+        for (const [user, task] of [[per, repeating], [per, shared], [per, done], [ola, foreign]]) {
+            assert.ok((await myTaskIds(user)).includes(task.id), `${task.name} stays`);
+        }
+    });
+
+    test("moving twice moves once", async () => {
+        const own = await ownTask(per, { name: "Doppelklick" });
+        const answers = await Promise.all([1, 2].map(() => call("POST", tasksPath(), { taskId: own.id }, per.token)));
+        assert.deepEqual(answers.map(a => a.status).sort(), [201, 404]);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM family_tasks WHERE family_id = $1 AND name = 'Doppelklick'", [familyId]))[0].n, 1);
+    });
+
+    test("a family entry's reminder reaches every joined member once", async () => {
+        const pushes = (user, text) => log.split("\n").filter(line => line.includes(`[DEV] Push to user ${user.id} (plan): `) && line.includes(text)).length;
+        for (const [n, who] of [ola, per, ute].entries()) {
+            await call("PUT", "/api/push/subscription", { endpoint: `https://push.example.com/send/family-rem-${n}`, keys: { p256dh: `BKeyR${n}`, auth: `authR${n}` } }, who.token);
+        }
+        // the owner's time zone counts; the start a minute from now, reminded a minute before it
+        await call("PUT", "/api/users/locale", { timezone: "UTC", language: "de" }, ola.token);
+        const start = new Date(Date.now() + 60000);
+        await call("POST", tasksPath(), { name: "Elterngespräch", due: start.toISOString().slice(0, 10), due_time: start.toISOString().slice(11, 16), reminders: [1] }, per.token);
+        for (let i = 0; i < 30 && (pushes(ola, "Elterngespräch") < 1 || pushes(per, "Elterngespräch") < 1); i++) await sleep(100);
+        assert.equal(pushes(ola, "Elterngespräch"), 1, "the owner");
+        assert.equal(pushes(per, "Elterngespräch"), 1, "a member");
+        await sleep(800);
+        assert.equal(pushes(ola, "Elterngespräch"), 1, "once");
+        assert.equal(pushes(per, "Elterngespräch"), 1, "once");
+        assert.equal(pushes(ute, "Elterngespräch"), 0, "only invited");
+        assert.ok(log.includes("„Termine daheim“ ·"), "the family's name in front");
+
+        // an edit that keeps the time (the editor always sends day and time) doesn't remind again
+        const entry = (await call("GET", `${F}/${familyId}`, null, per.token)).data.tasks.find(t => t.name === "Elterngespräch");
+        await call("PATCH", `${tasksPath()}/${entry.id}`, { due: start.toISOString().slice(0, 10), due_time: entry.due_time, location: "Schule" }, per.token);
+        await sleep(800);
+        assert.equal(pushes(ola, "Elterngespräch"), 1, "not again after an edit");
+        assert.equal(pushes(per, "Elterngespräch"), 1, "not again after an edit");
+    });
+
+    test("session and family work counts in my statistics", async () => {
+        const kim = await member("fstkim");
+        const lou = await member("fstlou");
+        await befriend(kim, lou, "fstlou");
+        const fam = (await call("POST", F, { name: "Statistikfamilie", friendIds: [lou.id] }, kim.token)).data.id;
+        await call("POST", `${F}/${fam}/join`, null, lou.token);
+        const ses = (await call("POST", "/api/shared-sessions", { name: "Statistiksitzung", friendIds: [lou.id] }, kim.token)).data.id;
+        await call("POST", `/api/shared-sessions/${ses}/join`, null, lou.token);
+        const famEntry = async (by, body) => (await call("POST", `${F}/${fam}/tasks`, body, by.token)).data.tasks.find(t => t.name === body.name);
+        const sesEntry = async (by, body) => (await call("POST", `/api/shared-sessions/${ses}/tasks`, body, by.token)).data.tasks.find(t => t.name === body.name);
+        const before = (await call("GET", `/api/stats?from=${daysFromToday(-6)}&to=${daysFromToday(0)}`, null, kim.token)).data;
+
+        // ticked by me in the family and in the session; given to me and ticked by lou
+        const a = await famEntry(lou, { name: "Spülen" });
+        await call("PATCH", `${F}/${fam}/tasks/${a.id}`, { done: true }, kim.token);
+        const b = await sesEntry(lou, { name: "Zusammenfassung" });
+        await call("PATCH", `/api/shared-sessions/${ses}/tasks/${b.id}`, { done: true }, kim.token);
+        const c = await famEntry(lou, { name: "Staubsaugen", assignee_id: kim.id });
+        await call("PATCH", `${F}/${fam}/tasks/${c.id}`, { done: true }, lou.token);
+        // lou's own, ticked by lou: not mine
+        const d = await famEntry(lou, { name: "Lous Sache" });
+        await call("PATCH", `${F}/${fam}/tasks/${d.id}`, { done: true }, lou.token);
+        // a 90-min family event I added yesterday; one lou added, not given to me
+        await famEntry(kim, { name: "Kino", kind: "event", due: daysFromToday(-1), due_time: "18:00", duration_minutes: 90 });
+        await famEntry(lou, { name: "Lous Termin", kind: "event", due: daysFromToday(-1), due_time: "10:00", duration_minutes: 60 });
+        // one of my own tasks shared into the session and ticked there counts once
+        const own = (await call("POST", "/api/tasks", { name: "Eigenes", prio: 50, due: null, description: "" }, kim.token)).data;
+        const copy = await sesEntry(kim, { taskId: own.id, name: "Eigenes" });
+        await call("PATCH", `/api/shared-sessions/${ses}/tasks/${copy.id}`, { done: true }, kim.token);
+        await sql("INSERT INTO shared_time_days (user_id, day, time_ms) VALUES ($1, current_date, 600000)", [kim.id]);
+
+        const week = (await call("GET", `/api/stats?from=${daysFromToday(-6)}&to=${daysFromToday(0)}`, null, kim.token)).data;
+        assert.equal(week.tasksDone - before.tasksDone, 4, "three shared ones + my own once");
+        assert.equal(week.events.ms - before.events.ms, 90 * 60_000);
+        assert.equal(week.events.count - before.events.count, 1);
+        assert.equal(week.together.teamMs, 600000);
+        const places = Object.fromEntries(week.together.places.map(p => [`${p.kind}:${p.id}`, [p.name, p.done, p.events]]));
+        assert.deepEqual(places[`family:${fam}`], ["Statistikfamilie", 2, 1]);
+        assert.deepEqual(places[`session:${ses}`], ["Statistiksitzung", 1, 0]);
+        assert.deepEqual(week.together.done.map(t => t.name).sort(), ["Spülen", "Staubsaugen", "Zusammenfassung"]);
+        assert.equal(week.together.done.find(t => t.name === "Spülen").where.name, "Statistikfamilie");
+        assert.equal(week.together.done.find(t => t.name === "Zusammenfassung").where.kind, "session");
+
+        const lous = (await call("GET", `/api/stats?from=${daysFromToday(-6)}&to=${daysFromToday(0)}`, null, lou.token)).data;
+        assert.equal(lous.tasksDone, 2, "what lou ticked off, also when it was given to kim");
+        assert.equal(lous.events.count, 1);
+    });
+});
+
+describe("notices about my families and sessions", () => {
+    const F = "/api/families";
+    let ann, ben, cleo, familyId, otherFamilyId, sessionId;
+    let annLive, benLive, cleoLive;
+    const sockets = [];
+    const connect = (token) => new Promise((resolve, reject) => {
+        const socket = io(API, { auth: { token }, transports: ["websocket"], reconnection: false, forceNew: true });
+        sockets.push(socket);
+        socket.once("connect", () => resolve(socket));
+        socket.once("connect_error", (err) => reject(err));
+    });
+    const next = (socket, event, ms = 2000) => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`no ${event} within ${ms} ms`)), ms);
+        socket.once(event, (payload) => { clearTimeout(timer); resolve(payload); });
+    });
+    const silent = (socket, event, ms = 500) => new Promise((resolve, reject) => {
+        const handler = () => reject(new Error(`unexpected ${event}`));
+        socket.once(event, handler);
+        setTimeout(() => { socket.off(event, handler); resolve(); }, ms);
+    });
+    const pushesFor = (user, kind, text) => log.split("\n").filter(line => line.includes(`[DEV] Push to user ${user.id} (${kind}): `) && line.includes(text)).length;
+    async function waitForPushes(user, kind, text, count = 1) {
+        for (let i = 0; i < 30 && pushesFor(user, kind, text) < count; i++) await sleep(100);
+        return pushesFor(user, kind, text);
+    }
+    const notices = async (user, kind) => sql("SELECT title, body, data, read_at FROM notifications WHERE user_id = $1 AND kind = $2 ORDER BY id", [user.id, kind]);
+    // notices go out after the answer: the rows of user / kind that `pick` keeps, once there are `count` of them
+    async function noticesOnce(user, kind, pick, count) {
+        let rows = [];
+        for (let i = 0; i < 30; i++) {
+            rows = (await notices(user, kind)).filter(pick);
+            if (rows.length >= count && (count > 0 || i >= 5)) break;
+            await sleep(100);
+        }
+        return rows;
+    }
+    // the same, until the newest one counts `n` entries
+    async function countOnce(user, pick, n) {
+        let rows = [];
+        for (let i = 0; i < 30; i++) {
+            rows = (await notices(user, "entries_added")).filter(pick);
+            if (rows.at(-1)?.data.count === n) break;
+            await sleep(100);
+        }
+        return rows;
+    }
+    const addEntry = (user, body, id = familyId) => call("POST", `${F}/${id}/tasks`, body, user.token);
+
+    before(async () => {
+        ann = await member("gnann");
+        ben = await member("gnben");
+        cleo = await member("gncleo");
+        await befriend(ann, ben, "gnben");
+        await befriend(ann, cleo, "gncleo");
+        for (const [n, who] of [ann, ben, cleo].entries()) {
+            await call("PUT", "/api/users/locale", { timezone: "UTC", language: "de" }, who.token);
+            await call("PUT", "/api/push/subscription", { endpoint: `https://push.example.com/send/groups-${n}`, keys: { p256dh: `BKeyG${n}`, auth: `authG${n}` } }, who.token);
+        }
+        familyId = (await call("POST", F, { name: "WG Süd", friendIds: [ben.id, cleo.id] }, ann.token)).data.id;
+        await call("POST", `${F}/${familyId}/join`, null, ben.token);
+        otherFamilyId = (await call("POST", F, { name: "Eltern", friendIds: [ben.id] }, ann.token)).data.id;
+        await call("POST", `${F}/${otherFamilyId}/join`, null, ben.token);
+        sessionId = (await call("POST", "/api/shared-sessions", { name: "Lerngruppe", friendIds: [ben.id, cleo.id] }, ann.token)).data.id;
+        await call("POST", `/api/shared-sessions/${sessionId}/join`, null, ben.token);
+        // cleo stays invited everywhere
+        [annLive, benLive, cleoLive] = await Promise.all([connect(ann.token), connect(ben.token), connect(cleo.token)]);
+    });
+    after(() => { for (const socket of sockets) socket.disconnect(); });
+
+    test("an entry by somebody else lands in the other members' inboxes, not mine", async () => {
+        const [notice] = await Promise.all([
+            next(benLive, "notification:new"),
+            silent(annLive, "notification:new"),
+            silent(cleoLive, "notification:new"),
+            addEntry(ann, { name: "Wäsche" }),
+        ]);
+        assert.equal(notice.kind, "entries_added");
+        assert.equal(notice.title, "Wäsche");
+        assert.equal(notice.body, "WG Süd");
+        assert.equal(notice.data.place, "family");
+        assert.equal(notice.data.placeId, familyId);
+        assert.equal(notice.data.count, 1);
+        assert.equal(notice.data.by.id, ann.id);
+        assert.equal(await waitForPushes(ben, "groups", "„Wäsche“ eingetragen"), 1);
+        assert.equal(pushesFor(ann, "groups", "Wäsche"), 0);
+        assert.equal(pushesFor(cleo, "groups", "Wäsche"), 0, "only invited");
+    });
+
+    test("several entries within half an hour are one notice", async () => {
+        const here = (n) => n.data.place === "family" && n.data.placeId === familyId;
+        await addEntry(ann, { name: "Bad" });
+        await countOnce(ben, here, 2);
+        await addEntry(ann, { name: "Flur" });
+        const rows = await countOnce(ben, here, 3);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].data.count, 3);
+        assert.equal(rows[0].title, "Flur");
+        assert.equal(await waitForPushes(ben, "groups", "3 Einträge"), 1);
+
+        await call("POST", "/api/notifications/read", null, ben.token);
+        await addEntry(ann, { name: "Keller" });
+        const after = await noticesOnce(ben, "entries_added", here, 2);
+        assert.equal(after.length, 2, "read: the next one is new");
+        assert.equal(after[1].data.count, 1);
+    });
+
+    test("the same person in two places makes two notices", async () => {
+        await call("POST", "/api/notifications/read", null, ben.token);
+        await addEntry(ann, { name: "Garten" });
+        await addEntry(ann, { name: "Oma anrufen" }, otherFamilyId);
+        const unread = await noticesOnce(ben, "entries_added", n => !n.read_at, 2);
+        assert.deepEqual(unread.map(n => [n.data.placeId, n.data.count]), [[familyId, 1], [otherFamilyId, 1]]);
+    });
+
+    test("entries at the same moment are still one notice", async () => {
+        await call("POST", "/api/notifications/read", null, ben.token);
+        await Promise.all(["Fenster", "Tür", "Dach"].map(name => addEntry(ann, { name }, otherFamilyId)));
+        const rows = await countOnce(ben, n => !n.read_at && n.data.placeId === otherFamilyId, 3);
+        assert.deepEqual(rows.map(n => n.data.count), [3]);
+        await call("POST", "/api/notifications/read", null, ben.token);
+    });
+
+    test("moving a task in is announced too", async () => {
+        const own = (await call("POST", "/api/tasks", { name: "Fahrrad", prio: 50, due: null, description: "" }, ben.token)).data;
+        const [notice] = await Promise.all([next(annLive, "notification:new"), call("POST", `${F}/${familyId}/tasks`, { taskId: own.id }, ben.token)]);
+        assert.equal(notice.kind, "entries_added");
+        assert.equal(notice.data.by.id, ben.id);
+        assert.equal(notice.title, "Fahrrad");
+    });
+
+    test("a session entry by somebody else is announced too", async () => {
+        await call("POST", "/api/notifications/read", null, ben.token);
+        const inSession = (n) => n.data.place === "session";
+        await call("POST", `/api/shared-sessions/${sessionId}/tasks`, { name: "Folien" }, ann.token);
+        await countOnce(ben, inSession, 1);
+        const own = (await call("POST", "/api/tasks", { name: "Skript", prio: 50, due: null, description: "" }, ann.token)).data;
+        await call("POST", `/api/shared-sessions/${sessionId}/tasks`, { taskId: own.id }, ann.token);
+        const rows = await countOnce(ben, inSession, 2);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].data.placeId, sessionId);
+        assert.equal(rows[0].data.count, 2);
+        assert.equal(rows[0].body, "Lerngruppe");
+        assert.equal((await notices(cleo, "entries_added")).length, 0, "invited only");
+        assert.equal((await notices(ann, "entries_added")).filter(n => n.data.place === "session").length, 0);
+        assert.equal(await waitForPushes(ben, "groups", "„Folien“ eingetragen"), 1);
+    });
+
+    test("a family entry given to me lands in my inbox", async () => {
+        const added = await addEntry(ann, { name: "Einkaufen", assignee_id: ben.id });
+        const entry = added.data.tasks.find(t => t.name === "Einkaufen");
+        const inFamily = (n) => n.data.familyId === familyId;
+        const [given] = await noticesOnce(ben, "task_assigned", inFamily, 1);
+        assert.ok(given, "notice");
+        assert.equal(given.title, "Einkaufen");
+        assert.equal(given.body, "WG Süd");
+        assert.equal(given.data.by.id, ann.id);
+        assert.equal(await waitForPushes(ben, "social", "Einkaufen"), 1);
+        // the one it was given to hears of it once: not also as a new entry
+        assert.equal((await noticesOnce(ben, "entries_added", n => n.title === "Einkaufen", 0)).length, 0);
+        assert.equal(pushesFor(ben, "groups", "Einkaufen"), 0);
+
+        // given on to ann by ann herself: nothing; to ben again: nothing new
+        await call("PATCH", `${F}/${familyId}/tasks/${entry.id}`, { assignee_id: ann.id }, ann.token);
+        assert.equal((await noticesOnce(ann, "task_assigned", () => true, 0)).length, 0);
+        await call("PATCH", `${F}/${familyId}/tasks/${entry.id}`, { name: "Einkaufen gehen" }, ann.token);
+        assert.equal((await notices(ben, "task_assigned")).filter(n => n.data.familyId === familyId).length, 1);
+        await call("PATCH", `${F}/${familyId}/tasks/${entry.id}`, { assignee_id: ben.id }, ann.token);
+        assert.equal((await noticesOnce(ben, "task_assigned", inFamily, 2)).length, 2, "given again");
+    });
+
+    test("family and session chat reach the others as a push", async () => {
+        await call("POST", `${F}/${familyId}/messages`, { text: "Hallo Familie" }, ann.token);
+        await call("POST", `/api/shared-sessions/${sessionId}/messages`, { text: "Hallo Gruppe" }, ann.token);
+        assert.equal(await waitForPushes(ben, "groups", "Hallo Familie"), 1);
+        assert.equal(await waitForPushes(ben, "groups", "Hallo Gruppe"), 1);
+        assert.equal(pushesFor(ann, "groups", "Hallo"), 0);
+        assert.equal(pushesFor(cleo, "groups", "Hallo"), 0);
+        assert.equal((await notices(ben, "chat")).length, 0, "no inbox notice");
+    });
+});
+
 describe("deleting an account", () => {
     test("needs the password; the last admin can't leave", async () => {
         const solo = await member("lastadmin", { admin: true });
@@ -1947,12 +2355,22 @@ describe("push notifications", () => {
         assert.equal((await call("PUT", "/api/push/subscription", device(1))).status, 401);
 
         const fresh = await call("PUT", "/api/push/subscription", device(1), pia.token);
-        assert.deepEqual(fresh.data.kinds, { plan: true, digest: true, messages: true, social: true });
+        assert.deepEqual(fresh.data.kinds, { plan: true, digest: true, messages: true, social: true, groups: true });
         const changed = await call("PUT", "/api/push/subscription", { ...device(1), kinds: { digest: false } }, pia.token);
-        assert.deepEqual(changed.data.kinds, { plan: true, digest: false, messages: true, social: true });
+        assert.deepEqual(changed.data.kinds, { plan: true, digest: false, messages: true, social: true, groups: true });
         const again = await call("PUT", "/api/push/subscription", device(1), pia.token);
         assert.equal(again.data.kinds.digest, false, "kinds not sent stay");
         assert.equal((await sql("SELECT count(*)::int AS n FROM push_subscriptions WHERE endpoint = $1", [device(1).endpoint]))[0].n, 1);
+    });
+
+    test("devices switch the new kind groups on and off", async () => {
+        const on = await call("PUT", "/api/push/subscription", device(8), pia.token);
+        assert.equal(on.data.kinds.groups, true);
+        const off = await call("PUT", "/api/push/subscription", { ...device(8), kinds: { groups: false } }, pia.token);
+        assert.equal(off.data.kinds.groups, false);
+        assert.equal(off.data.kinds.social, true, "the others stay");
+        assert.equal((await sql("SELECT groups FROM push_subscriptions WHERE endpoint = $1", [device(8).endpoint]))[0].groups, false);
+        await call("DELETE", "/api/push/subscription", { endpoint: device(8).endpoint }, pia.token);
     });
 
     test("only for accounts with app access", async () => {
@@ -2489,9 +2907,16 @@ describe("upload safety and profile pictures", () => {
         assert.equal((await call("POST", "/api/notebook", { body: "drei", attachments: [{ kind: "image", data: big }] }, pal.token)).status, 201);
     });
 
-    test("testers set a profile picture; friends see it, strangers don't", async () => {
+    test("everybody sets a profile picture (testers' old address still works)", async () => {
+        assert.equal((await call("PUT", "/api/profile/avatar", { data: WEBP }, pal.token)).status, 200);
         assert.equal((await call("PUT", "/api/tester/avatar", { data: WEBP }, pal.token)).data.code, "TESTER_REQUIRED");
-        assert.equal((await call("PUT", "/api/tester/avatar", { data: FAKE }, pia.token)).data.field, "data");
+        assert.equal((await call("PUT", "/api/profile/avatar", { data: WEBP }, outsider.token)).data.code, "PRO_REQUIRED");
+        assert.deepEqual(Object.keys((await call("GET", `/api/avatars?ids=${pal.id}`, null, pia.token)).data), [String(pal.id)]);
+        await call("DELETE", "/api/profile/avatar", null, pal.token);
+    });
+
+    test("friends see a profile picture, strangers don't", async () => {
+        assert.equal((await call("PUT", "/api/profile/avatar", { data: FAKE }, pia.token)).data.field, "data");
         assert.equal((await call("PUT", "/api/tester/avatar", { data: "data:image/gif;base64,R0lGODlhAQABAAAAACw=" }, pia.token)).data.field, "data", "no GIF");
         const set = await call("PUT", "/api/tester/avatar", { data: WEBP }, pia.token);
         assert.equal(set.status, 200);
@@ -2523,6 +2948,145 @@ describe("upload safety and profile pictures", () => {
         await call("PUT", "/api/tester/avatar", { data: PNG }, pia.token);
         assert.equal((await call("DELETE", "/api/profile/avatar", null, pia.token)).status, 200);
         assert.equal((await sql("SELECT count(*)::int AS n FROM user_avatars WHERE user_id = $1", [pia.id]))[0].n, 0);
+    });
+});
+
+describe("notes on the board of a family or a shared session", () => {
+    let bea, ben, bob, familyId, sessionId, beaNote, benNote;
+    const WEBP = "data:image/webp;base64,UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAwA0JaQAA3AA/vuUAAA=";
+    before(async () => {
+        bea = await member("boardbea");
+        ben = await member("boardben");
+        bob = await member("boardbob");
+        // the trash is in the notes area (testers)
+        await sql("UPDATE users SET is_tester = true WHERE username = 'boardbea'");
+        await befriend(bea, ben, "boardben");
+        familyId = (await call("POST", "/api/families", { name: "Board-WG", friendIds: [ben.id] }, bea.token)).data.id;
+        await call("POST", `/api/families/${familyId}/join`, null, ben.token);
+        sessionId = (await call("POST", "/api/shared-sessions", { name: "Board-Lernen", friendIds: [ben.id] }, bea.token)).data.id;
+        await call("POST", `/api/shared-sessions/${sessionId}/join`, null, ben.token);
+        beaNote = (await call("POST", "/api/notebook", { title: "Formeln", body: "a² + b² = c²", attachments: [{ kind: "image", data: WEBP, name: "skizze" }] }, bea.token)).data;
+        benNote = (await call("POST", "/api/notebook", { title: "Einkauf", body: "- [ ] Milch" }, ben.token)).data;
+    });
+
+    for (const [kind, base] of [["family", () => `/api/families/${familyId}`], ["session", () => `/api/shared-sessions/${sessionId}`]]) {
+        test(`${kind}: a member pins an own note, the others read it as it is now`, async () => {
+            const B = `${base()}/board`;
+            assert.equal((await call("POST", B, { noteId: benNote.id }, bea.token)).status, 404, "only my own notes");
+            assert.equal((await call("POST", B, { noteId: "x" }, bea.token)).data.field, "noteId");
+            assert.equal((await call("GET", B, null, bob.token)).status, 404, "not a member");
+            assert.equal((await call("POST", B, { noteId: beaNote.id }, bob.token)).status, 404);
+
+            const pin = await call("POST", B, { noteId: beaNote.id }, bea.token);
+            assert.equal(pin.status, 201);
+            assert.equal((await call("POST", B, { noteId: beaNote.id }, bea.token)).status, 200, "again: the same pin");
+            let board = (await call("GET", B, null, ben.token)).data;
+            assert.equal(board.length, 1);
+            assert.equal(board[0].title, "Formeln");
+            assert.equal(board[0].owner.username, "boardbea");
+            assert.equal(board[0].mine, false);
+            assert.deepEqual(board[0].attachments, [{ kind: "image", name: "skizze" }], "the list leaves the pictures' data out");
+            const one = (await call("GET", `${B}/${pin.data.id}`, null, ben.token)).data;
+            assert.equal(one.attachments[0].data, WEBP);
+
+            // edits show; where it is pinned is known to the owner only
+            await call("PUT", `/api/notebook/${beaNote.id}`, { body: "neu" }, bea.token);
+            board = (await call("GET", B, null, ben.token)).data;
+            assert.equal(board[0].body, "neu");
+            const where = (await call("GET", `/api/notebook/${beaNote.id}/boards`, null, bea.token)).data;
+            assert.ok(where.some(item => item.kind === kind && item.pinId === pin.data.id));
+            assert.equal((await call("GET", `/api/notebook/${beaNote.id}/boards`, null, ben.token)).status, 404);
+
+            // ben's pin: bea (the owner) takes it off; ben can't take bea's
+            const benPin = (await call("POST", B, { noteId: benNote.id }, ben.token)).data;
+            assert.equal((await call("DELETE", `${B}/${pin.data.id}`, null, ben.token)).data.code, "NOT_ALLOWED");
+            assert.equal((await call("DELETE", `${B}/${benPin.id}`, null, bea.token)).status, 200);
+            assert.deepEqual((await call("GET", B, null, bea.token)).data.map(item => item.noteId), [beaNote.id]);
+
+            // in the trash: not shown; back: shown again
+            await call("PUT", `/api/notebook/${beaNote.id}`, { trashed: true }, bea.token);
+            assert.equal((await call("GET", B, null, ben.token)).data.length, 0);
+            await call("PUT", `/api/notebook/${beaNote.id}`, { trashed: false }, bea.token);
+            assert.equal((await call("GET", B, null, ben.token)).data.length, 1);
+        });
+    }
+
+    test("a note of somebody who left isn't shown; deleting the note takes it off", async () => {
+        const B = `/api/families/${familyId}/board`;
+        await call("POST", B, { noteId: benNote.id }, ben.token);
+        assert.equal((await call("GET", B, null, bea.token)).data.length, 2);
+        await call("DELETE", `/api/families/${familyId}/members/${ben.id}`, null, ben.token);
+        assert.deepEqual((await call("GET", B, null, bea.token)).data.map(item => item.noteId), [beaNote.id]);
+
+        await call("DELETE", `/api/notebook/${beaNote.id}`, null, bea.token);
+        assert.equal((await call("GET", B, null, bea.token)).data.length, 0);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM board_notes WHERE note_id = $1", [beaNote.id]))[0].n, 0);
+    });
+
+    test("an ended session's board can be read, not pinned to", async () => {
+        const note = (await call("POST", "/api/notebook", { title: "Rest", body: "x" }, bea.token)).data;
+        await call("POST", `/api/shared-sessions/${sessionId}/end`, null, bea.token);
+        assert.equal((await call("POST", `/api/shared-sessions/${sessionId}/board`, { noteId: note.id }, bea.token)).data.code, "SESSION_ENDED");
+        assert.equal((await call("GET", `/api/shared-sessions/${sessionId}/board`, null, ben.token)).status, 200);
+    });
+});
+
+describe("the arcade: scores and the leaderboard", () => {
+    let ace, bo, waiting;
+    const send = (who, body) => call("POST", "/api/arcade/scores", { game: "reflex", level: "normal", ranked: true, ...body }, who.token);
+    const board = (who, game = "reflex", level = "normal") => call("GET", `/api/arcade/leaderboard?game=${game}&level=${level}`, null, who.token);
+    before(async () => {
+        ace = await member("arcadeace");
+        bo = await member("arcadebo");
+        // signed in, still waiting for beta access: the arcade is open for them too
+        waiting = await member("arcadewait", { pro: false });
+    });
+
+    test("anybody signed in plays, even while waiting for access; not signed in: no", async () => {
+        assert.equal((await call("POST", "/api/arcade/scores", { game: "reflex", level: "normal", score: 1, ranked: false })).status, 401);
+        assert.equal((await send(waiting, { score: 40 })).status, 200);
+        assert.equal((await call("GET", "/api/tasks", null, waiting.token)).data.code, "PRO_REQUIRED", "the app itself stays closed");
+    });
+
+    test("scores are checked: a known game and difficulty, a whole number within reach", async () => {
+        assert.equal((await send(ace, { game: "chess" })).data.field, "game");
+        assert.equal((await send(ace, { game: "reflex", level: "hard", score: 3 })).data.field, "game", "reflex has one difficulty");
+        assert.equal((await send(ace, { score: 1.5 })).data.field, "score");
+        assert.equal((await send(ace, { score: 100000 })).data.field, "score");
+        assert.equal((await send(ace, { score: 5, ranked: "yes" })).data.field, "ranked");
+    });
+
+    test("not ranked: only my personal best; ranked: the leaderboard too", async () => {
+        let saved = (await send(ace, { score: 90, ranked: false })).data;
+        assert.deepEqual(saved, { best: 90, rankedBest: null, rank: null });
+        assert.equal((await board(bo)).data.top.some(row => row.user.username === "arcadeace"), false);
+
+        saved = (await send(ace, { score: 50 })).data;
+        assert.equal(saved.best, 90, "a lower score doesn't lower the best");
+        assert.equal(saved.rankedBest, 50);
+        await send(bo, { score: 70 });
+        // equal to ace later: ace stays ahead
+        await send(waiting, { score: 50 });
+
+        const list = (await board(ace)).data;
+        assert.deepEqual(list.top.map(row => [row.user.username, row.score]), [["arcadebo", 70], ["arcadeace", 50], ["arcadewait", 50]]);
+        assert.equal(list.top[1].me, true);
+        assert.deepEqual(list.me, { rank: 2, score: 50 });
+        assert.equal(list.top[0].user.email, undefined, "only public fields");
+
+        const mine = (await call("GET", "/api/arcade/me", null, ace.token)).data;
+        assert.deepEqual(mine, [{ game: "reflex", level: "normal", best: 90, rankedBest: 50, plays: 2 }]);
+    });
+
+    test("quiz games have a board per difficulty; leaving takes me off every board", async () => {
+        await send(ace, { game: "guess", level: "hard", score: 4 });
+        assert.equal((await board(ace, "guess", "hard")).data.me.rank, 1);
+        assert.equal((await board(ace, "guess", "easy")).data.top.length, 0);
+
+        assert.equal((await call("DELETE", "/api/arcade/ranked", null, ace.token)).status, 200);
+        assert.equal((await board(bo)).data.top.some(row => row.user.username === "arcadeace"), false);
+        assert.equal((await board(ace)).data.me, null);
+        assert.equal((await call("GET", "/api/arcade/me", null, ace.token)).data.find(row => row.game === "reflex").best, 90, "the personal best stays");
     });
 });
 
@@ -2636,7 +3200,7 @@ describe("Android app: push through Firebase", () => {
         assert.equal((await call("PUT", "/api/push/subscription", { endpoint: "fcm:short" }, ana.token)).data.field, "endpoint");
         const saved = await call("PUT", "/api/push/subscription", { endpoint: `fcm:${token}` }, ana.token);
         assert.equal(saved.status, 200);
-        assert.deepEqual(saved.data.kinds, { plan: true, digest: true, messages: true, social: true });
+        assert.deepEqual(saved.data.kinds, { plan: true, digest: true, messages: true, social: true, groups: true });
         assert.equal((await call("POST", "/api/push/test", { endpoint: `fcm:${token}` }, ana.token)).data.sent, true);
         const line = `[DEV] Push to user ${ana.id} (plan, app): Quidey`;
         for (let i = 0; i < 20 && !log.includes(line); i++) await sleep(50);
@@ -2684,5 +3248,132 @@ describe("Quidey Pro: billing", () => {
         const line = "[DEV] Cancellation confirmation to nobody@example.com (matched 0)";
         for (let i = 0; i < 20 && !log.includes(line); i++) await sleep(50);
         assert.ok(log.includes(line));
+    });
+});
+
+describe("Reminders (testers): once or on weekdays, pushed except to devices that ring them", () => {
+    let rita, rolf, plain;
+    const web = { endpoint: "https://push.example.com/send/reminder-web", keys: { p256dh: "BKeyRemind_-x", auth: "authRemind" } };
+    const phone = "fcm:reminderphonetoken_abcdefghijklmnop";
+    const R = "/api/tester/reminders";
+    const pushesFor = (user, text) => log.split("\n").filter(line => line.includes(`[DEV] Push to user ${user.id} (plan`) && line.includes(text));
+    async function waitForPushes(user, text, n = 1) {
+        for (let i = 0; i < 40 && pushesFor(user, text).length < n; i++) await sleep(100);
+        return pushesFor(user, text);
+    }
+
+    before(async () => {
+        rita = await member("remrita");
+        rolf = await member("remrolf");
+        plain = await member("remplain");
+        await sql("UPDATE users SET is_tester = true WHERE id = ANY($1)", [[rita.id, rolf.id]]);
+    });
+
+    test("only testers, and the input is checked", async () => {
+        const soon = new Date(Date.now() + 3600e3).toISOString();
+        assert.equal((await call("GET", R, null, plain.token)).data.code, "TESTER_REQUIRED");
+        assert.equal((await call("POST", R, { text: "", at: soon }, rita.token)).data.field, "text");
+        assert.equal((await call("POST", R, { text: "x" }, rita.token)).data.field, "at");
+        assert.equal((await call("POST", R, { text: "x", at: "bald" }, rita.token)).data.field, "at");
+        assert.equal((await call("POST", R, { text: "x", at: new Date(Date.now() - 3600e3).toISOString() }, rita.token)).data.field, "at");
+        assert.equal((await call("POST", R, { text: "x", days: [], atTime: "07:30" }, rita.token)).data.field, "days");
+        assert.equal((await call("POST", R, { text: "x", days: [8], atTime: "07:30" }, rita.token)).data.field, "days");
+        assert.equal((await call("POST", R, { text: "x", days: [1], atTime: "7.30" }, rita.token)).data.field, "atTime");
+        assert.equal((await call("POST", R, { text: "x", at: soon, days: [1], atTime: "07:30" }, rita.token)).data.field, "at");
+        assert.equal((await call("POST", R, { text: "x".repeat(201), at: soon }, rita.token)).data.field, "text");
+    });
+
+    test("create, list, edit, done, delete; somebody else's stays hidden", async () => {
+        const at = new Date(Date.now() + 3600e3).toISOString();
+        let r = await call("POST", R, { text: "Mama anrufen", at }, rita.token);
+        assert.equal(r.status, 201);
+        const once = r.data;
+        assert.equal(once.text, "Mama anrufen");
+        assert.equal(once.at, at);
+        assert.equal(once.days, null);
+        r = await call("POST", R, { text: "Tabletten", days: [5, 1, 1], atTime: "07:30" }, rita.token);
+        const weekly = r.data;
+        assert.deepEqual(weekly.days, [1, 5]);
+        assert.equal(weekly.atTime, "07:30");
+        assert.equal(weekly.at, null);
+
+        let list = (await call("GET", R, null, rita.token)).data;
+        assert.deepEqual(list.map(x => x.id).sort(), [once.id, weekly.id].sort());
+        assert.equal((await call("GET", R, null, rolf.token)).data.length, 0);
+        assert.equal((await call("PATCH", `${R}/${once.id}`, { text: "nope" }, rolf.token)).status, 404);
+        assert.equal((await call("DELETE", `${R}/${once.id}`, null, rolf.token)).status, 404);
+
+        // once -> weekly and back
+        r = await call("PATCH", `${R}/${once.id}`, { days: [2], atTime: "18:00" }, rita.token);
+        assert.equal(r.data.at, null);
+        assert.deepEqual(r.data.days, [2]);
+        r = await call("PATCH", `${R}/${once.id}`, { text: "Papa anrufen", at }, rita.token);
+        assert.equal(r.data.text, "Papa anrufen");
+        assert.equal(r.data.days, null);
+
+        // done: a once reminder ends (still listed for 7 days), a weekly one goes on
+        r = await call("POST", `${R}/${once.id}/done`, null, rita.token);
+        assert.ok(r.data.doneAt);
+        r = await call("POST", `${R}/${weekly.id}/done`, null, rita.token);
+        assert.equal(r.data.doneAt, null);
+        list = (await call("GET", R, null, rita.token)).data;
+        assert.equal(list.length, 2);
+        assert.equal(list.at(-1).id, once.id, "done ones last");
+
+        assert.equal((await call("POST", `${R}/${weekly.id}/snooze`, { minutes: 0 }, rita.token)).data.field, "minutes");
+        r = await call("POST", `${R}/${weekly.id}/snooze`, { minutes: 10 }, rita.token);
+        assert.ok(Date.parse(r.data.snoozedUntil) > Date.now() + 9 * 60e3);
+
+        assert.equal((await call("DELETE", `${R}/${once.id}`, null, rita.token)).status, 200);
+        assert.equal((await call("DELETE", `${R}/${weekly.id}`, null, rita.token)).status, 200);
+        assert.equal((await call("GET", R, null, rita.token)).data.length, 0);
+    });
+
+    test("a due reminder is pushed once, to the browser but not to the phone that rings it", async () => {
+        assert.equal((await call("PUT", "/api/push/subscription", web, rolf.token)).status, 200);
+        assert.equal((await call("PUT", "/api/push/subscription", { endpoint: phone }, rolf.token)).status, 200);
+        let r = await call("PUT", `${R}/device`, { endpoint: phone, alarms: true }, rolf.token);
+        assert.deepEqual(r.data, { alarms: true, known: true });
+        assert.equal((await call("PUT", `${R}/device`, { endpoint: phone, alarms: "yes" }, rolf.token)).data.field, "alarms");
+        assert.equal((await call("PUT", `${R}/device`, { endpoint: "fcm:unknown_device_token_123456", alarms: true }, rolf.token)).data.known, false);
+
+        r = await call("POST", R, { text: "Wäsche aufhängen", at: new Date(Date.now() + 300).toISOString() }, rolf.token);
+        const pushes = await waitForPushes(rolf, "Wäsche aufhängen");
+        await sleep(600);
+        assert.equal(pushesFor(rolf, "Wäsche aufhängen").length, 1, "once, and only to the browser");
+        assert.ok(!pushes[0].includes(", app)"), "not to the phone");
+        const row = (await sql("SELECT fired_for, done_at FROM reminders WHERE id = $1", [r.data.id]))[0];
+        assert.ok(row.fired_for);
+        assert.equal(row.done_at, null, "still open until confirmed");
+
+        // snoozed: rings again
+        await sql("UPDATE reminders SET snoozed_until = now() + interval '300 milliseconds' WHERE id = $1", [r.data.id]);
+        assert.equal((await waitForPushes(rolf, "Wäsche aufhängen", 2)).length, 2);
+        assert.equal((await sql("SELECT snoozed_until FROM reminders WHERE id = $1", [r.data.id]))[0].snoozed_until, null);
+
+        // without alarms the phone gets the push too
+        await call("PUT", `${R}/device`, { endpoint: phone, alarms: false }, rolf.token);
+        await call("POST", R, { text: "Blumen gießen", at: new Date(Date.now() + 300).toISOString() }, rolf.token);
+        assert.equal((await waitForPushes(rolf, "Blumen gießen", 2)).length, 2);
+    });
+
+    test("a weekly reminder rings on the weekday at its time, once", async () => {
+        await sql("UPDATE users SET timezone = 'UTC' WHERE id = $1", [rita.id]);
+        await call("PUT", "/api/push/subscription", { ...web, endpoint: `${web.endpoint}-rita` }, rita.token);
+        const now = new Date();
+        const today = now.getUTCDay() === 0 ? 7 : now.getUTCDay();
+        const r = await call("POST", R, { text: "Wochenplan machen", days: [today], atTime: "12:00" }, rita.token);
+        // its time today: a minute ago (set directly: the API takes only HH:MM)
+        await sql("UPDATE reminders SET at_time = (now() AT TIME ZONE 'UTC')::time - interval '1 minute' WHERE id = $1", [r.data.id]);
+        assert.equal((await waitForPushes(rita, "Wochenplan machen")).length, 1);
+        await sleep(600);
+        assert.equal(pushesFor(rita, "Wochenplan machen").length, 1);
+    });
+
+    test("done ones are deleted after 30 days", async () => {
+        const r = await call("POST", R, { text: "Alt", at: new Date(Date.now() + 3600e3).toISOString() }, rita.token);
+        await sql("UPDATE reminders SET done_at = now() - interval '31 days' WHERE id = $1", [r.data.id]);
+        assert.ok(!(await call("GET", R, null, rita.token)).data.some(x => x.id === r.data.id));
+        assert.equal((await sql("SELECT count(*)::int AS n FROM reminders WHERE id = $1", [r.data.id]))[0].n, 0);
     });
 });

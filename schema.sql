@@ -2360,6 +2360,97 @@ CREATE INDEX IF NOT EXISTS collection_items_note ON public.collection_items (not
 ALTER TABLE public.users ADD COLUMN IF NOT EXISTS groups_imported_at timestamp with time zone;
 
 --
+-- 037: notes pinned to a family's or shared session's board (see migrations/037_board_notes.sql)
+--
+
+CREATE TABLE IF NOT EXISTS public.board_notes (
+    id serial PRIMARY KEY,
+    note_id integer NOT NULL REFERENCES public.notebook_notes(id) ON DELETE CASCADE,
+    family_id integer REFERENCES public.families(id) ON DELETE CASCADE,
+    session_id integer REFERENCES public.shared_sessions(id) ON DELETE CASCADE,
+    pinned_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT board_notes_one_board CHECK ((family_id IS NULL) <> (session_id IS NULL)),
+    CONSTRAINT board_notes_family_once UNIQUE (family_id, note_id),
+    CONSTRAINT board_notes_session_once UNIQUE (session_id, note_id)
+);
+CREATE INDEX IF NOT EXISTS board_notes_note ON public.board_notes (note_id);
+
+--
+-- 038: the arcade's scores (see migrations/038_arcade_scores.sql)
+--
+
+CREATE TABLE IF NOT EXISTS public.arcade_scores (
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    game text NOT NULL CHECK (char_length(game) BETWEEN 1 AND 20),
+    level text NOT NULL CHECK (level IN ('easy', 'normal', 'hard')),
+    best integer NOT NULL DEFAULT 0 CHECK (best >= 0),
+    ranked_best integer CHECK (ranked_best >= 0),
+    ranked_at timestamp with time zone,
+    plays integer NOT NULL DEFAULT 0,
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, game, level)
+);
+CREATE INDEX IF NOT EXISTS arcade_scores_board ON public.arcade_scores (game, level, ranked_best DESC, ranked_at)
+    WHERE ranked_best IS NOT NULL;
+
+--
+-- 039: reminders (see migrations/039_reminders.sql)
+--
+
+CREATE TABLE IF NOT EXISTS public.reminders (
+    id serial PRIMARY KEY,
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    text text NOT NULL CHECK (char_length(text) BETWEEN 1 AND 200),
+    at timestamp with time zone,
+    days smallint[],
+    at_time time without time zone,
+    snoozed_until timestamp with time zone,
+    done_at timestamp with time zone,
+    fired_for timestamp with time zone,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT reminders_once_or_weekly CHECK (
+        (at IS NOT NULL AND days IS NULL AND at_time IS NULL)
+        OR (at IS NULL AND at_time IS NOT NULL AND cardinality(days) BETWEEN 1 AND 7)
+    )
+);
+CREATE INDEX IF NOT EXISTS reminders_user ON public.reminders (user_id);
+CREATE INDEX IF NOT EXISTS reminders_open ON public.reminders (user_id) WHERE done_at IS NULL;
+
+ALTER TABLE public.push_subscriptions ADD COLUMN IF NOT EXISTS alarms boolean NOT NULL DEFAULT false;
+
+--
+-- 040: family events and reminders, done_by, push kind groups (see migrations/040_family_events_groups_push.sql)
+--
+
+ALTER TABLE public.family_tasks ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'task';
+ALTER TABLE public.family_tasks ADD COLUMN IF NOT EXISTS reminders integer[] NOT NULL DEFAULT '{}';
+ALTER TABLE public.family_tasks ADD COLUMN IF NOT EXISTS push_sent_for timestamp with time zone;
+ALTER TABLE public.family_tasks ADD COLUMN IF NOT EXISTS done_by integer REFERENCES public.users(id) ON DELETE SET NULL;
+ALTER TABLE public.family_tasks ADD COLUMN IF NOT EXISTS completed_at timestamp with time zone;
+ALTER TABLE public.family_tasks DROP CONSTRAINT IF EXISTS family_tasks_kind_check;
+ALTER TABLE public.family_tasks ADD CONSTRAINT family_tasks_kind_check CHECK (kind IN ('task', 'event'));
+ALTER TABLE public.family_tasks DROP CONSTRAINT IF EXISTS family_tasks_event_needs_due_check;
+ALTER TABLE public.family_tasks ADD CONSTRAINT family_tasks_event_needs_due_check CHECK (kind <> 'event' OR due IS NOT NULL);
+ALTER TABLE public.family_tasks DROP CONSTRAINT IF EXISTS family_tasks_reminders_check;
+ALTER TABLE public.family_tasks ADD CONSTRAINT family_tasks_reminders_check
+    CHECK (cardinality(reminders) <= 5 AND array_position(reminders, NULL) IS NULL
+        AND 0 <= ALL (reminders) AND 10080 >= ALL (reminders));
+
+ALTER TABLE public.shared_session_tasks ADD COLUMN IF NOT EXISTS done_by integer REFERENCES public.users(id) ON DELETE SET NULL;
+ALTER TABLE public.shared_session_tasks ADD COLUMN IF NOT EXISTS completed_at timestamp with time zone;
+
+ALTER TABLE public.push_subscriptions ADD COLUMN IF NOT EXISTS groups boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.notifications DROP CONSTRAINT IF EXISTS notifications_kind_check;
+ALTER TABLE public.notifications ADD CONSTRAINT notifications_kind_check
+    CHECK (kind IN ('broadcast', 'system', 'task_assigned', 'entries_added'));
+
+CREATE INDEX IF NOT EXISTS family_tasks_open_events ON public.family_tasks (due) WHERE kind = 'event' AND NOT done;
+CREATE INDEX IF NOT EXISTS family_tasks_done_by ON public.family_tasks (done_by, completed_at);
+CREATE INDEX IF NOT EXISTS shared_session_tasks_done_by ON public.shared_session_tasks (done_by, completed_at);
+
+--
 -- PostgreSQL database dump complete
 --
 

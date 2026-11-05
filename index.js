@@ -16,6 +16,7 @@ const { startFocusSchedule } = require("./utils/focus");
 const { PUSH_PUBLIC_KEY, PUSH_FCM_ENABLED, PUSH_KINDS, PUSH_MAX_DEVICES, PUSH_TEXTS, pushLater, deliver, startPushSchedule } = require("./utils/push");
 const http = require("node:http");
 const realtime = require("./realtime");
+const { toNotice, noticeEntryAdded, noticeFamilyAssigned, pushChat } = require("./utils/groupNotices");
 const { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
 const { FREE_LIMITS, FREE_STATS_DAYS, limited, usage, refuseOverLimit } = require("./utils/limits");
 const { FCM_ENDPOINT, isFcmEndpoint } = require("./utils/fcm");
@@ -459,8 +460,11 @@ const SHARED_TASK_FIELDS = {
 };
 
 // A shared session's tasks also can be events: they need a day and are done once they are
-// over (syncSessionEvents). Family calendars stay with SHARED_TASK_FIELDS.
+// over (syncSessionEvents).
 const SESSION_TASK_FIELDS = { ...SHARED_TASK_FIELDS, kind: TASK_EXTRAS.kind };
+// A family's entries too (syncFamilyEvents), and they have reminders, which reach every joined
+// member (kept only while the entry has a day)
+const FAMILY_TASK_FIELDS = { ...SESSION_TASK_FIELDS, reminders: TASK_EXTRAS.reminders };
 
 // Ids of the tasks a user may see and change: their own, and the ones shared with them that
 // they accepted. `param` is the query parameter holding the user id, e.g. "$2".
@@ -939,9 +943,9 @@ async function syncEvents(db, where, params = []) {
 // false, when the caller does). Returns the ids of the sessions that changed.
 async function syncSessionEvents(where, params = [], notify = true) {
     const result = await pool.query(
-        `UPDATE shared_session_tasks SET done = state.over
+        `UPDATE shared_session_tasks SET done = state.over, completed_at = CASE WHEN state.over THEN state.ends_at END
         FROM (
-            SELECT shared_session_tasks.id, ends.at <= now() AS over
+            SELECT shared_session_tasks.id, ends.at AS ends_at, ends.at <= now() AS over
             FROM shared_session_tasks
             JOIN shared_sessions ON shared_sessions.id = shared_session_tasks.session_id
             JOIN users ON users.id = shared_sessions.owner_id
@@ -958,6 +962,32 @@ async function syncSessionEvents(where, params = [], notify = true) {
         for (const sessionId of sessions) await notifySession(sessionId).catch(() => {});
     }
     return sessions;
+}
+
+// The same for a family's events, in the family owner's time zone; completed_at is when one
+// ended. Returns the ids of the families that changed (and tells their members unless notify is false).
+async function syncFamilyEvents(where, params = [], notify = true) {
+    const result = await pool.query(
+        `UPDATE family_tasks SET done = state.over, completed_at = CASE WHEN state.over THEN state.ends_at END
+        FROM (
+            SELECT family_tasks.id, ends.at AS ends_at, ends.at <= now() AS over
+            FROM family_tasks
+            JOIN families ON families.id = family_tasks.family_id
+            JOIN users ON users.id = families.owner_id
+            CROSS JOIN LATERAL (SELECT ${EVENT_END_SQL.replaceAll("tasks.", "family_tasks.")} AS at) AS ends
+            WHERE family_tasks.kind = 'event' AND family_tasks.due IS NOT NULL AND (${where})
+        ) AS state
+        WHERE family_tasks.id = state.id
+            AND (family_tasks.done IS DISTINCT FROM state.over
+                OR family_tasks.completed_at IS DISTINCT FROM CASE WHEN state.over THEN state.ends_at END)
+        RETURNING family_tasks.family_id`,
+        params
+    );
+    const families = [...new Set(result.rows.map(row => row.family_id))];
+    if (notify) {
+        for (const familyId of families) await notifyFamily(familyId).catch(() => {});
+    }
+    return families;
 }
 
 // syncEvents in a transaction of its own, so an ended event and its next repeat come together
@@ -984,6 +1014,7 @@ async function closePastEvents() {
         // an event after tomorrow can't be over yet, whatever the time zone
         changed = await syncEventsNow("NOT tasks.done AND tasks.due <= current_date + 1");
         await syncSessionEvents("NOT shared_session_tasks.done AND shared_session_tasks.due <= current_date + 1");
+        await syncFamilyEvents("NOT family_tasks.done AND family_tasks.due <= current_date + 1");
     } catch (err) {
         console.error("Closing past events failed:", err);
         return;
@@ -1850,13 +1881,7 @@ app.post("/api/messages/:userId/read", async (req, res) => {
     }
 });
 
-// My notifications (the latest 100), newest first
-// A notification as the app gets it (list and live); data only for kinds that have some
-// (task_assigned: { sessionId, taskId, by })
-const toNotice = (row) => ({
-    id: row.id, kind: row.kind, title: row.title, body: row.body, createdAt: row.created_at, readAt: row.read_at,
-    ...(row.data && { data: row.data }),
-});
+// My notifications (the latest 100), newest first (toNotice: utils/groupNotices.js)
 
 app.get("/api/notifications", async (req, res) => {
     try {
@@ -2899,7 +2924,7 @@ const publicUser = (row, prefix = "") => ({
 // Sending requests answers "does this username exist?", so it's limited per IP
 const friendRequestLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    limit: 30,
+    limit: limitFromEnv("RATE_LIMIT_FRIEND_REQUESTS", 30),
     skip: (req) => req.method === "OPTIONS",
     standardHeaders: "draft-8",
     legacyHeaders: false,
@@ -4351,6 +4376,7 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
         await logEvent(pool, session.sessionId, userId, "task_added", { taskId: created.rows[0].id, taskName: task.name });
         await sendSharedSession(res, session.sessionId, userId, 201);
         await notifySession(session.sessionId);
+        noticeEntryAdded(pool, { place: "session", placeId: session.sessionId, byId: userId, entryId: created.rows[0].id, name: task.name });
     } catch (err) {
         if (err.code === "23505") {
             return fail(res, 409, "TASK_ALREADY_SHARED", "This task is already in the session");
@@ -4414,9 +4440,9 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
             if (member?.status !== "joined") return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
         }
 
-        const values = [setDone ?? null, changesAssignee, assigneeId, taskId, name ?? null];
+        const values = [setDone ?? null, changesAssignee, assigneeId, taskId, name ?? null, userId];
         const sets = ["done = COALESCE($1, done)", "assignee_id = CASE WHEN $2 THEN $3::int ELSE assignee_id END",
-            "name = COALESCE($5, name)"];
+            "name = COALESCE($5, name)", ...doneBySets("$1", "$6")];
         for (const [column, value] of Object.entries(fields.values)) {
             values.push(value);
             sets.push(`${column} = $${values.length}`);
@@ -4616,6 +4642,7 @@ app.post("/api/shared-sessions/:id/messages", messageLimiter, async (req, res) =
         // the other members (and my other tabs) get it right away
         const event = loaded.events.find(e => e.id === eventId);
         if (event) realtime.toSession(session.sessionId, "session:event", { sessionId: session.sessionId, event });
+        pushChat(pool, { place: "session", placeId: session.sessionId, byId: userId, text });
     } catch (err) {
         serverError(res, err);
     }
@@ -4774,6 +4801,8 @@ const toFamilyMessage = (row) => ({
 //   week:   { weekStart, people: [{ userId, xp, focusMin, streak }] } (joined members who show
 //           their statistics, and me) }
 async function loadFamily(familyId, userId) {
+    // an event that ended since is shown done (whoever looks first ticks it off)
+    await syncFamilyEvents("family_tasks.family_id = $1", [familyId], false);
     const [family, members, tasks, groups] = await Promise.all([
         pool.query(
             `SELECT families.id, families.name, families.created_at, families.emoji, families.color,
@@ -4799,6 +4828,7 @@ async function loadFamily(familyId, userId) {
                 family_tasks.due, to_char(family_tasks.due_time, 'HH24:MI') AS due_time, family_tasks.prio,
                 family_tasks.duration_minutes, family_tasks.location, family_tasks.link, family_tasks.details,
                 family_tasks.color, family_tasks.created_at, family_tasks.group_id,
+                family_tasks.kind, family_tasks.reminders, family_tasks.completed_at,
                 users.id AS adder_id, users.username AS adder_username, users.display_name AS adder_display_name,
                 assignee.id AS assignee_id, assignee.username AS assignee_username, assignee.display_name AS assignee_display_name
             FROM family_tasks LEFT JOIN users ON users.id = family_tasks.added_by
@@ -4864,6 +4894,9 @@ async function loadFamily(familyId, userId) {
             assignee: task.assignee_id ? publicUser(task, "assignee_") : null,
             createdAt: task.created_at,
             groupId: task.group_id,
+            kind: task.kind,
+            reminders: task.reminders,
+            completedAt: task.completed_at,
         })),
         groups,
     };
@@ -5107,15 +5140,94 @@ app.delete(`${familyBase}/:id/members/:userId`, async (req, res) => {
     }
 });
 
+// The SQL that books who ticked an entry off and when: done ($done, null = not sent) by $me.
+// Ticked again while done keeps the first one; opened again clears both.
+const doneBySets = (doneParam, meParam) => [
+    `done_by = CASE WHEN ${doneParam}::boolean IS NULL THEN done_by WHEN ${doneParam} THEN (CASE WHEN done THEN done_by ELSE ${meParam}::int END) END`,
+    `completed_at = CASE WHEN ${doneParam}::boolean IS NULL THEN completed_at WHEN ${doneParam} THEN COALESCE(completed_at, now()) END`,
+];
+
+// Moves one of my own open tasks or events into a family: the entry gets its details and
+// reminders, my task is deleted (its groups, collections, notes and the per-task split of focus
+// time go with it; the focus sessions and their totals stay). Repeating ones and ones shared
+// with somebody stay mine. Answers the family (201) or { error }.
+async function moveTaskToFamily(req, res, family, extra) {
+    const userId = req.user.userId;
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const own = await client.query(
+            `SELECT tasks.id, tasks.name, tasks.description, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
+                tasks.prio, tasks.duration_minutes, tasks.location, tasks.link, tasks.details,
+                COALESCE(tasks.color, event_types.color) AS color, tasks.kind, tasks.reminders,
+                tasks.done, tasks.repeat, EXISTS (SELECT 1 FROM task_shares WHERE task_shares.task_id = tasks.id) AS shared
+            FROM tasks LEFT JOIN event_types ON event_types.id = tasks.event_type_id
+            WHERE tasks.id = $1 AND tasks.user_id = $2
+            FOR UPDATE OF tasks`,
+            [idParam(req.body.taskId), userId]
+        );
+        const task = own.rows[0];
+        const refuse = (status, code, message) => client.query("ROLLBACK").then(() => fail(res, status, code, message));
+        if (!task) return refuse(404, "TASK_NOT_FOUND", "Task not found");
+        if (task.done) return refuse(400, "TASK_DONE", "The task is done already");
+        if (task.repeat) return refuse(400, "TASK_REPEATS", "A repeating task stays with its owner");
+        if (task.shared) return refuse(400, "TASK_SHARED", "A shared task stays with its owner");
+
+        const { id, done, repeat, shared, ...fields } = task;
+        if (!fields.due) fields.reminders = [];
+        Object.assign(fields, extra);
+        const columns = ["family_id", "added_by", ...Object.keys(fields)];
+        const values = [family.familyId, userId, ...Object.values(fields)];
+        const created = await client.query(
+            `INSERT INTO family_tasks (${columns.join(", ")}) VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING id`,
+            values
+        );
+        await client.query("DELETE FROM tasks WHERE id = $1", [id]);
+        await client.query("COMMIT");
+        if (fields.kind === "event") await syncFamilyEvents("family_tasks.id = $1", [created.rows[0].id], false);
+        await sendFamily(res, family.familyId, userId, 201);
+        realtime.toUser(userId, "tasks:changed", {});
+        await notifyFamily(family.familyId);
+        return { entryId: created.rows[0].id, name: fields.name };
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+    } finally {
+        client.release();
+    }
+}
+
 // A calendar entry (or, without a day, an item on the family's list):
-// { name, assignee_id?, group_id? (testers: a sub-group), and any of SHARED_TASK_FIELDS }
+// { name, assignee_id?, group_id? (a sub-group), and any of FAMILY_TASK_FIELDS }, or
+// { taskId, assignee_id?, group_id? } moves one of my own tasks / events in (moveTaskToFamily).
+// An event needs a day; reminders are kept only with one.
 app.post(`${familyBase}/:id/tasks`, async (req, res) => {
     const userId = req.user.userId;
+    if (req.body?.taskId !== undefined) {
+        try {
+            const family = await requireFamily(req, res);
+            if (!family) return;
+            const extra = {};
+            const assignee = await familyAssignee(family.familyId, req.body);
+            if (assignee.error) return invalidInput(res, assignee.error);
+            if ("value" in assignee) extra.assignee_id = assignee.value;
+            const subGroup = await readSubGroup(req, "family", family.familyId);
+            if (subGroup.error) return invalidInput(res, subGroup.error);
+            if ("value" in subGroup) extra.group_id = subGroup.value;
+            const moved = await moveTaskToFamily(req, res, family, extra);
+            if (moved) announceFamilyEntry(family.familyId, userId, moved.entryId, moved.name, extra.assignee_id);
+        } catch (err) {
+            serverError(res, err);
+        }
+        return;
+    }
     const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, TASK_NAME_MAX) : "";
     if (!name) return fail(res, 400, "NAME_REQUIRED", "Name is required");
-    const fields = readTaskExtras(req.body, SHARED_TASK_FIELDS);
+    const fields = readTaskExtras(req.body, FAMILY_TASK_FIELDS);
     if (fields.error) return invalidInput(res, fields.error);
     if (fields.values.due_time && !fields.values.due) return invalidInput(res, "due_time");
+    if (fields.values.kind === "event" && !fields.values.due) return invalidInput(res, "due");
+    if (!fields.values.due) delete fields.values.reminders;
     try {
         const family = await requireFamily(req, res);
         if (!family) return;
@@ -5127,24 +5239,34 @@ app.post(`${familyBase}/:id/tasks`, async (req, res) => {
         if ("value" in subGroup) fields.values.group_id = subGroup.value;
         const columns = ["family_id", "name", "added_by", ...Object.keys(fields.values)];
         const values = [family.familyId, name, userId, ...Object.values(fields.values)];
-        await pool.query(
-            `INSERT INTO family_tasks (${columns.join(", ")}) VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")})`,
+        const created = await pool.query(
+            `INSERT INTO family_tasks (${columns.join(", ")}) VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING id, kind`,
             values
         );
+        // an event entered afterwards is over right away
+        if (created.rows[0].kind === "event") await syncFamilyEvents("family_tasks.id = $1", [created.rows[0].id], false);
         await sendFamily(res, family.familyId, userId, 201);
         await notifyFamily(family.familyId);
+        announceFamilyEntry(family.familyId, userId, created.rows[0].id, name, fields.values.assignee_id);
     } catch (err) {
         serverError(res, err);
     }
 });
 
-// Change an entry: { done?, name?, assignee_id?, group_id? (testers), and any of SHARED_TASK_FIELDS (null clears one) }
+// A new entry in a family: the other members hear of it, whoever it was given to once (as given to them)
+function announceFamilyEntry(familyId, byId, entryId, name, assigneeId) {
+    noticeEntryAdded(pool, { place: "family", placeId: familyId, byId, entryId, name, skip: assigneeId ? [assigneeId] : [] });
+    noticeFamilyAssigned(pool, { familyId, entryId, name, byId, assigneeId });
+}
+
+// Change an entry: { done?, name?, assignee_id?, group_id?, and any of FAMILY_TASK_FIELDS (null clears one) }.
+// An event is done once it is over, never by hand; without a day an entry has no reminders.
 app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
     const userId = req.user.userId;
     const taskId = idParam(req.params.taskId);
     const { done } = req.body ?? {};
     const name = req.body?.name === undefined ? undefined : cleanText(req.body.name, TASK_NAME_MAX);
-    const fields = readTaskExtras(req.body, SHARED_TASK_FIELDS);
+    const fields = readTaskExtras(req.body, FAMILY_TASK_FIELDS);
     if (done !== undefined && typeof done !== "boolean") return fail(res, 400, "DONE_REQUIRED", "done must be true or false");
     if (name === null || (req.body?.name !== undefined && name === undefined)) return invalidInput(res, "name");
     if (fields.error) return invalidInput(res, fields.error);
@@ -5161,22 +5283,40 @@ app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
         const subGroup = await readSubGroup(req, "family", family.familyId);
         if (subGroup.error) return invalidInput(res, subGroup.error);
         if ("value" in subGroup) fields.values.group_id = subGroup.value;
-        const before = await pool.query("SELECT due FROM family_tasks WHERE id = $1 AND family_id = $2", [taskId, family.familyId]);
+        const before = await pool.query("SELECT name, due, kind, assignee_id FROM family_tasks WHERE id = $1 AND family_id = $2", [taskId, family.familyId]);
         if (before.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
-        // a time of day needs a day; taking the day away takes the time along
-        const due = "due" in fields.values ? fields.values.due : before.rows[0].due;
+        const entry = before.rows[0];
+        // a time of day needs a day; taking the day away takes the time and the reminders along
+        const due = "due" in fields.values ? fields.values.due : entry.due;
         if (fields.values.due_time && !due) return invalidInput(res, "due_time");
         if (!due && !("due_time" in fields.values)) fields.values.due_time = null;
+        if (!due) fields.values.reminders = [];
+        // an event happens on a day and is done once it's over, never by hand
+        const kind = fields.values.kind ?? entry.kind;
+        if (kind === "event" && !due) return invalidInput(res, "due");
+        if (kind === "event" && done !== undefined && name === undefined && Object.keys(fields.values).length === 0
+            && req.body?.assignee_id === undefined && req.body?.group_id === undefined) {
+            return fail(res, 400, "EVENT_NOT_DONE_BY_HAND", "An event is done once it is over");
+        }
+        const setDone = kind === "event" ? null : done ?? null;
 
-        const values = [taskId, done ?? null, name ?? null];
-        const sets = ["done = COALESCE($2, done)", "name = COALESCE($3, name)"];
+        const values = [taskId, setDone, name ?? null, userId];
+        // (push_sent_for stays: a moved entry reminds again by itself, see PICK_DUE_FAMILY_ENTRIES,
+        // and an edit that keeps the time must not remind everybody once more)
+        const sets = ["done = COALESCE($2, done)", "name = COALESCE($3, name)", ...doneBySets("$2", "$4")];
         for (const [column, value] of Object.entries(fields.values)) {
             values.push(value);
             sets.push(`${column} = $${values.length}`);
         }
         await pool.query(`UPDATE family_tasks SET ${sets.join(", ")} WHERE id = $1`, values);
+        // a moved event can be over (or open again)
+        if (kind === "event") await syncFamilyEvents("family_tasks.id = $1", [taskId], false);
         await sendFamily(res, family.familyId, userId);
         await notifyFamily(family.familyId);
+        // given to somebody else than before (and not to myself): they hear of it
+        if (fields.values.assignee_id && fields.values.assignee_id !== entry.assignee_id) {
+            noticeFamilyAssigned(pool, { familyId: family.familyId, entryId: taskId, name: name ?? entry.name, byId: userId, assigneeId: fields.values.assignee_id });
+        }
     } catch (err) {
         serverError(res, err);
     }
@@ -5247,6 +5387,7 @@ app.post(`${familyBase}/:id/messages`, messageLimiter, async (req, res) => {
         );
         const message = toFamilyMessage(result.rows[0]);
         res.status(201).json(message);
+        pushChat(pool, { place: "family", placeId: family.familyId, byId: userId, text });
         for (const id of await familyMemberIds(family.familyId)) {
             realtime.toUser(id, "family:message", { familyId: family.familyId, message });
         }
@@ -5403,8 +5544,41 @@ app.delete("/api/event-types/:id", async (req, res) => {
 //              tasks of each collection (as booked on them in the sessions), the six biggest
 //   tasksDone: tasks ticked off in the period (events don't count)
 //   firstDay:  the first day with anything at all, to draw "everything" from there
+//   together:  { teamMs, places: [{ kind, id, name, emoji, color, done, events }], done: [{ id, name, completedAt, where }] }
+// Work in sessions and families counts too (events and tasksDone): their tasks I ticked off or
+// that were given to me, their events I added or that were given to me (once over). A session's
+// copy of one of my own tasks / events isn't counted twice.
 const STATS_DAY = /^\d{4}-\d{2}-\d{2}$/;
 const STATS_MAX_DAYS = 3700;
+const STATS_TOGETHER_PLACES = 8;
+const STATS_TOGETHER_DONE = 50;
+// shared_done / shared_events (+ _in: in the period) for the user in $1, period $2–$3, after `me`
+const STATS_SHARED_CTES = `
+    mine_elsewhere AS (SELECT id FROM tasks WHERE user_id = $1),
+    shared_done AS (
+        SELECT 'family' AS place, family_id AS place_id, id, name, completed_at FROM family_tasks
+        WHERE kind = 'task' AND done AND completed_at IS NOT NULL AND (done_by = $1 OR assignee_id = $1)
+        UNION ALL
+        SELECT 'session', session_id, id, name, completed_at FROM shared_session_tasks
+        WHERE kind = 'task' AND done AND completed_at IS NOT NULL AND (done_by = $1 OR assignee_id = $1)
+            AND (source_task_id IS NULL OR source_task_id NOT IN (SELECT id FROM mine_elsewhere))
+    ),
+    shared_done_in AS (
+        SELECT shared_done.* FROM shared_done, me
+        WHERE ($2::date IS NULL OR (completed_at AT TIME ZONE me.tz)::date >= $2::date)
+            AND ($3::date IS NULL OR (completed_at AT TIME ZONE me.tz)::date <= $3::date)
+    ),
+    shared_events AS (
+        SELECT 'family' AS place, family_id AS place_id, due AS day, COALESCE(duration_minutes, 0)::bigint * 60000 AS ms FROM family_tasks
+        WHERE kind = 'event' AND done AND (added_by = $1 OR assignee_id = $1)
+        UNION ALL
+        SELECT 'session', session_id, due, COALESCE(duration_minutes, 0)::bigint * 60000 FROM shared_session_tasks
+        WHERE kind = 'event' AND done AND (added_by = $1 OR assignee_id = $1)
+            AND (source_task_id IS NULL OR source_task_id NOT IN (SELECT id FROM mine_elsewhere))
+    ),
+    shared_events_in AS (
+        SELECT * FROM shared_events WHERE ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)
+    )`;
 
 app.get("/api/stats", async (req, res) => {
     const userId = req.user.userId;
@@ -5434,10 +5608,13 @@ app.get("/api/stats", async (req, res) => {
             focus_in AS (
                 SELECT * FROM focus WHERE ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)
             ),
+            ${STATS_SHARED_CTES},
             events AS (
                 SELECT tasks.due AS day, COALESCE(tasks.duration_minutes, 0)::bigint * 60000 AS ms, tasks.event_type_id
                 FROM tasks
                 WHERE tasks.user_id = $1 AND tasks.kind = 'event' AND tasks.done
+                -- a session's or family's event has no type of mine
+                UNION ALL SELECT day, ms, NULL FROM shared_events
             ),
             events_in AS (
                 SELECT * FROM events WHERE ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)
@@ -5461,10 +5638,41 @@ app.get("/api/stats", async (req, res) => {
                 (SELECT count(*)::int FROM tasks, me
                     WHERE tasks.user_id = $1 AND tasks.kind = 'task' AND tasks.done AND tasks.completed_at IS NOT NULL
                         AND ($2::date IS NULL OR (tasks.completed_at AT TIME ZONE me.tz)::date >= $2::date)
-                        AND ($3::date IS NULL OR (tasks.completed_at AT TIME ZONE me.tz)::date <= $3::date)) AS tasks_done`,
+                        AND ($3::date IS NULL OR (tasks.completed_at AT TIME ZONE me.tz)::date <= $3::date))
+                    + (SELECT count(*)::int FROM shared_done_in) AS tasks_done`,
             [userId, from, to]
         );
         const row = result.rows[0];
+        const together = (await pool.query(
+            `WITH me AS (SELECT COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = $1),
+            ${STATS_SHARED_CTES},
+            counted AS (
+                SELECT place, place_id, count(*)::int AS done, 0 AS events FROM shared_done_in GROUP BY place, place_id
+                UNION ALL
+                SELECT place, place_id, 0, count(*)::int FROM shared_events_in GROUP BY place, place_id
+            ),
+            places AS (
+                SELECT counted.place, counted.place_id, sum(counted.done)::int AS done, sum(counted.events)::int AS events,
+                    COALESCE(families.name, shared_sessions.name) AS name, families.emoji, families.color
+                FROM counted
+                LEFT JOIN families ON counted.place = 'family' AND families.id = counted.place_id
+                LEFT JOIN shared_sessions ON counted.place = 'session' AND shared_sessions.id = counted.place_id
+                GROUP BY counted.place, counted.place_id, families.name, shared_sessions.name, families.emoji, families.color
+            )
+            SELECT
+                (SELECT COALESCE(sum(time_ms), 0)::bigint FROM shared_time_days
+                    WHERE user_id = $1 AND ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)) AS team_ms,
+                (SELECT COALESCE(json_agg(json_build_object('kind', place, 'id', place_id, 'name', name, 'emoji', emoji, 'color', color,
+                        'done', done, 'events', events) ORDER BY done + events DESC, name), '[]')
+                    FROM (SELECT * FROM places WHERE name IS NOT NULL ORDER BY done + events DESC, name LIMIT ${STATS_TOGETHER_PLACES}) AS p) AS places,
+                (SELECT COALESCE(json_agg(json_build_object('id', d.id, 'name', d.name, 'completedAt', d.completed_at,
+                        'where', json_build_object('kind', d.place, 'id', d.place_id, 'name', COALESCE(families.name, shared_sessions.name)))
+                        ORDER BY d.completed_at DESC), '[]')
+                    FROM (SELECT * FROM shared_done_in ORDER BY completed_at DESC LIMIT ${STATS_TOGETHER_DONE}) AS d
+                    LEFT JOIN families ON d.place = 'family' AND families.id = d.place_id
+                    LEFT JOIN shared_sessions ON d.place = 'session' AND shared_sessions.id = d.place_id) AS done`,
+            [userId, from, to]
+        )).rows[0];
         const collections = hasTesterAccess(req.account) ? (await pool.query(
             `WITH me AS (SELECT COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = $1),
             focus_in AS (
@@ -5502,6 +5710,7 @@ app.get("/api/stats", async (req, res) => {
             groups: row.groups.map(group => ({ name: group.name, color: group.color, ms: Number(group.ms) })),
             ...(collections ? { collections: collections.map(c => ({ id: c.id, name: c.name, emoji: c.emoji, color: c.color, ms: Number(c.ms) })) } : {}),
             tasksDone: row.tasks_done,
+            together: { teamMs: Number(together.team_ms), places: together.places, done: together.done },
         });
     } catch (err) {
         serverError(res, err);
@@ -5708,7 +5917,7 @@ app.delete("/api/feed/:id/cheer", (req, res) => setCheer(req, res, false));
 // ---------- Push notifications ----------
 // A device (browser) turns them on in the app's settings: it asks its push service for an
 // address and hands it over here with its keys (see utils/push.js). One row per device; the
-// account signed in there last owns it. Kinds per device: plan, digest, messages, social.
+// account signed in there last owns it. Kinds per device: plan, digest, messages, social, groups.
 
 // Who did something, for the text of a push: { id, username, displayName }
 async function pushSender(userId) {
@@ -5747,7 +5956,7 @@ app.get("/api/push/key", (req, res) => {
     res.json({ publicKey: PUSH_PUBLIC_KEY || null, fcm: PUSH_FCM_ENABLED });
 });
 
-// This device wants pushes (again): { endpoint, keys: { p256dh, auth }, kinds?: { plan, digest, messages, social } }.
+// This device wants pushes (again): { endpoint, keys: { p256dh, auth }, kinds?: { plan, digest, messages, social, groups } }.
 // A device of the Android app sends { endpoint: 'fcm:<token>', kinds? } without keys.
 // Also called on every start of the app, so a renewed address or another account on the device
 // is picked up. Kinds not sent stay as they were (all on for a new device). Answers { kinds }.
@@ -5763,11 +5972,11 @@ app.put("/api/push/subscription", async (req, res) => {
     const wanted = PUSH_KINDS.map(kind => kinds?.[kind] ?? null);
     try {
         const saved = await pool.query(
-            `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, plan, digest, messages, social)
-            VALUES ($1, $2, $3, $4, COALESCE($5, true), COALESCE($6, true), COALESCE($7, true), COALESCE($8, true))
+            // one column per kind, $5 … in the order of PUSH_KINDS
+            `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, ${PUSH_KINDS.join(", ")})
+            VALUES ($1, $2, $3, $4, ${PUSH_KINDS.map((_, i) => `COALESCE($${i + 5}::boolean, true)`).join(", ")})
             ON CONFLICT (endpoint) DO UPDATE SET user_id = EXCLUDED.user_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth,
-                plan = COALESCE($5, push_subscriptions.plan), digest = COALESCE($6, push_subscriptions.digest),
-                messages = COALESCE($7, push_subscriptions.messages), social = COALESCE($8, push_subscriptions.social),
+                ${PUSH_KINDS.map((kind, i) => `${kind} = COALESCE($${i + 5}::boolean, push_subscriptions.${kind})`).join(", ")},
                 updated_at = now()
             RETURNING ${PUSH_KINDS.join(", ")}`,
             [userId, endpoint, app ? null : keys.p256dh, app ? null : keys.auth, ...wanted]
@@ -6195,6 +6404,185 @@ app.post("/api/routines/:id/runs", async (req, res) => {
     }
 });
 
+// ---------- Reminders (testers) ----------
+// A reminder is a text and a time, no task: once { text, at: ISO time } or on weekdays
+// { text, days: [1..7] (Monday = 1), atTime: "HH:MM" } in my time zone. Pushed at its time
+// (utils/focus.js); the Android app rings them itself as an alarm clock and tells the server so
+// for its device (PUT /api/tester/reminders/device), which then gets no push for them.
+// "Erledigt" ends a once reminder (a weekly one goes on), "später" rings again in N minutes.
+const REMINDER_MAX = 100;
+const REMINDER_TEXT_MAX = 200;
+const REMINDER_AHEAD_MS = 2 * 366 * 24 * 60 * 60 * 1000;
+
+// { values } (columns) or { field } (the invalid one). Partial: only what was sent; a new time
+// replaces the whole schedule (once <-> weekly) and starts it afresh.
+function cleanReminder(body, partial) {
+    const out = {};
+    if (!partial || body.text !== undefined) {
+        const text = cleanText(body.text, REMINDER_TEXT_MAX);
+        if (!text) return { field: "text" };
+        out.text = text;
+    }
+    const once = body.at !== undefined;
+    const weekly = body.days !== undefined || body.atTime !== undefined;
+    if (once && weekly) return { field: "at" };
+    if (!partial && !once && !weekly) return { field: "at" };
+    if (once) {
+        const at = typeof body.at === "string" && body.at.length <= 40 ? Date.parse(body.at) : NaN;
+        if (Number.isNaN(at) || at < Date.now() - 60 * 1000 || at > Date.now() + REMINDER_AHEAD_MS) return { field: "at" };
+        Object.assign(out, { at: new Date(at).toISOString(), days: null, at_time: null });
+    }
+    if (weekly) {
+        const days = body.days;
+        if (!Array.isArray(days) || days.length < 1 || days.length > 7 || days.some(day => !Number.isInteger(day) || day < 1 || day > 7)) return { field: "days" };
+        if (typeof body.atTime !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(body.atTime)) return { field: "atTime" };
+        Object.assign(out, { at: null, days: [...new Set(days)].sort(), at_time: body.atTime });
+    }
+    return { values: out };
+}
+
+const REMINDER_COLUMNS = `id, text, at, days, to_char(at_time, 'HH24:MI') AS at_time_text, snoozed_until, done_at, fired_for, created_at`;
+const reminderJson = (row) => ({
+    id: row.id,
+    text: row.text,
+    at: row.at ?? null,
+    days: row.days ?? null,
+    atTime: row.at_time_text ?? null,
+    snoozedUntil: row.snoozed_until ?? null,
+    doneAt: row.done_at ?? null,
+    firedFor: row.fired_for ?? null,
+    createdAt: row.created_at,
+});
+const remindersChanged = (userId) => realtime.toUser(userId, "reminders:changed", {});
+
+// the open ones and those done in the last 7 days; done ones older than 30 days go
+app.get("/api/tester/reminders", async (req, res) => {
+    try {
+        await pool.query("DELETE FROM reminders WHERE user_id = $1 AND done_at < now() - interval '30 days'", [req.user.userId]);
+        const result = await pool.query(
+            `SELECT ${REMINDER_COLUMNS} FROM reminders
+            WHERE user_id = $1 AND (done_at IS NULL OR done_at > now() - interval '7 days')
+            ORDER BY done_at DESC NULLS FIRST, id`,
+            [req.user.userId]
+        );
+        res.json(result.rows.map(reminderJson));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.post("/api/tester/reminders", async (req, res) => {
+    const { field, values } = cleanReminder(req.body ?? {}, false);
+    if (field) return invalidInput(res, field);
+    try {
+        const count = await pool.query("SELECT count(*)::int AS n FROM reminders WHERE user_id = $1 AND done_at IS NULL", [req.user.userId]);
+        if (count.rows[0].n >= REMINDER_MAX) return res.status(409).json({ error: "Too many reminders", code: "REMINDER_LIMIT" });
+        const saved = await pool.query(
+            `INSERT INTO reminders (user_id, text, at, days, at_time) VALUES ($1, $2, $3, $4::smallint[], $5)
+            RETURNING ${REMINDER_COLUMNS}`,
+            [req.user.userId, values.text, values.at, values.days, values.at_time]
+        );
+        remindersChanged(req.user.userId);
+        res.status(201).json(reminderJson(saved.rows[0]));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// This device rings reminders itself (the Android app with exact alarms allowed): { endpoint, alarms }.
+// Answers { alarms, known } (known: the device has push on; without, nothing is pushed to it anyway).
+app.put("/api/tester/reminders/device", async (req, res) => {
+    const { endpoint, alarms } = req.body ?? {};
+    if (typeof endpoint !== "string" || endpoint.length < 1 || endpoint.length > 4100) return invalidInput(res, "endpoint");
+    if (typeof alarms !== "boolean") return invalidInput(res, "alarms");
+    try {
+        const result = await pool.query(
+            "UPDATE push_subscriptions SET alarms = $3 WHERE endpoint = $1 AND user_id = $2 RETURNING alarms",
+            [endpoint, req.user.userId, alarms]
+        );
+        res.json({ alarms: result.rows[0]?.alarms ?? alarms, known: result.rows.length > 0 });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.patch("/api/tester/reminders/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Reminder");
+    const { field, values } = cleanReminder(req.body ?? {}, true);
+    if (field) return invalidInput(res, field);
+    const columns = Object.keys(values);
+    if (columns.length === 0) return invalidInput(res, "text");
+    const sets = columns.map((column, i) => `${column} = $${i + 3}${column === "days" ? "::smallint[]" : ""}`);
+    // a new time rings afresh (also a reminder that was done)
+    if (values.at !== undefined) sets.push("fired_for = NULL", "snoozed_until = NULL", "done_at = NULL");
+    try {
+        const result = await pool.query(
+            `UPDATE reminders SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 AND user_id = $2 RETURNING ${REMINDER_COLUMNS}`,
+            [id, req.user.userId, ...columns.map(column => values[column])]
+        );
+        if (result.rows.length === 0) return notFound(res, "Reminder");
+        remindersChanged(req.user.userId);
+        res.json(reminderJson(result.rows[0]));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.delete("/api/tester/reminders/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Reminder");
+    try {
+        const result = await pool.query("DELETE FROM reminders WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
+        if (result.rows.length === 0) return notFound(res, "Reminder");
+        remindersChanged(req.user.userId);
+        res.json({ deleted: id });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// "Erledigt": a once reminder is over; a weekly one only drops its snooze. Either way the time
+// that is ringing now counts as sent (no push follows on the other devices).
+app.post("/api/tester/reminders/:id/done", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Reminder");
+    try {
+        const result = await pool.query(
+            `UPDATE reminders SET done_at = CASE WHEN at IS NOT NULL THEN now() ELSE NULL END,
+                snoozed_until = NULL, fired_for = GREATEST(fired_for, now()), updated_at = now()
+            WHERE id = $1 AND user_id = $2 RETURNING ${REMINDER_COLUMNS}`,
+            [id, req.user.userId]
+        );
+        if (result.rows.length === 0) return notFound(res, "Reminder");
+        remindersChanged(req.user.userId);
+        res.json(reminderJson(result.rows[0]));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// "Später": rings again in { minutes } (1–120)
+app.post("/api/tester/reminders/:id/snooze", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Reminder");
+    const minutes = req.body?.minutes;
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 120) return invalidInput(res, "minutes");
+    try {
+        const result = await pool.query(
+            `UPDATE reminders SET snoozed_until = now() + make_interval(mins => $3), done_at = NULL,
+                fired_for = GREATEST(fired_for, now()), updated_at = now()
+            WHERE id = $1 AND user_id = $2 RETURNING ${REMINDER_COLUMNS}`,
+            [id, req.user.userId, minutes]
+        );
+        if (result.rows.length === 0) return notFound(res, "Reminder");
+        remindersChanged(req.user.userId);
+        res.json(reminderJson(result.rows[0]));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
 // ---------- Notebook (Fokusraum) ----------
 // Notes of my own, on their own or about a task: { title, body, taskId?, pinned, attachments }.
 // attachments: [{ kind: 'link', url, title? } | { kind: 'image', data: 'data:image/…;base64,…', name? }]
@@ -6425,6 +6813,8 @@ app.put("/api/notebook/:id", async (req, res) => {
         );
         if (result.rows.length === 0) return notFound(res, "Note");
         res.json(noteJson(result.rows[0], true));
+        // the boards it is pinned to show it as it is now
+        if (columns.some(column => NOTE_CONTENT_COLUMNS.includes(column) || column === "trashed_at")) notifyBoardsOfNote(id).catch(() => {});
     } catch (err) {
         serverError(res, err);
     }
@@ -6434,9 +6824,188 @@ app.delete("/api/notebook/:id", async (req, res) => {
     const id = idParam(req.params.id);
     if (!id) return notFound(res, "Note");
     try {
+        const boards = await boardsOfNote(id);
         const result = await pool.query("DELETE FROM notebook_notes WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
         if (result.rows.length === 0) return notFound(res, "Note");
         res.json({ deleted: id });
+        for (const board of boards) notifyBoard(board.kind, board.id).catch(() => {});
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- boards: notes pinned in a family or a shared session ----------
+// A joined member pins one of their own notes (not in the trash) to the board of a family or of
+// an open shared session (board_notes). It stays their note: the others read it as it is now
+// (edits show there, the trash or deleting it takes it off) and can't change it. The note's
+// owner and the family's / session's owner take a note off the board. Notes of people who are
+// no longer in it aren't shown.
+//   GET    /api/families/:id/board | /api/shared-sessions/:id/board   the board (pictures without their data)
+//   GET    .../board/:pinId                                           one note with its pictures
+//   POST   .../board { noteId }                                       pin it (again: the same pin)
+//   DELETE .../board/:pinId                                           take it off
+//   GET    /api/notebook/:id/boards                                   where a note of mine is pinned
+// Live: "board:changed" { kind: 'family' | 'session', id } to the joined members.
+const BOARD_NOTES_MAX = 30;
+const BOARDS = {
+    family: { column: "family_id", members: "family_members", memberColumn: "family_id" },
+    session: { column: "session_id", members: "shared_session_members", memberColumn: "session_id" },
+};
+
+// The board I may look at (change: also pin to it), or null after answering the request
+async function boardAccess(kind, req, res, change = false) {
+    if (kind === "family") {
+        const family = await requireFamily(req, res);
+        return family && { kind, id: family.familyId, isOwner: family.isOwner };
+    }
+    const sessionId = idParam(req.params.id);
+    const membership = sessionId && await getMembership(sessionId, req.user.userId);
+    if (!membership || membership.status !== "joined") {
+        fail(res, 404, "SESSION_NOT_FOUND", "Session not found");
+        return null;
+    }
+    if (change && membership.ended_at) {
+        fail(res, 409, "SESSION_ENDED", "This session has ended");
+        return null;
+    }
+    return { kind, id: sessionId, isOwner: membership.owner_id === req.user.userId };
+}
+
+// The pins of a board that are shown (only pinId's with one), newest first
+async function loadBoard(kind, boardId, pinId = null) {
+    const { column, members, memberColumn } = BOARDS[kind];
+    const result = await pool.query(
+        `SELECT board_notes.id AS pin_id, board_notes.pinned_at, notebook_notes.id, notebook_notes.user_id,
+            notebook_notes.title, notebook_notes.body, notebook_notes.attachments, notebook_notes.color,
+            notebook_notes.updated_at, users.id AS owner_id, users.username AS owner_username, users.display_name AS owner_display_name
+        FROM board_notes
+        JOIN notebook_notes ON notebook_notes.id = board_notes.note_id
+        JOIN users ON users.id = notebook_notes.user_id
+        WHERE board_notes.${column} = $1 AND notebook_notes.trashed_at IS NULL
+            AND ($2::int IS NULL OR board_notes.id = $2)
+            AND EXISTS (SELECT 1 FROM ${members} AS member WHERE member.${memberColumn} = $1
+                AND member.user_id = notebook_notes.user_id AND member.status = 'joined')
+        ORDER BY board_notes.pinned_at DESC`,
+        [boardId, pinId]
+    );
+    return result.rows;
+}
+
+const boardNoteJson = (row, full, viewerId, isOwner) => ({
+    id: row.pin_id,
+    noteId: row.id,
+    title: row.title,
+    body: row.body,
+    color: row.color,
+    attachments: full ? row.attachments : row.attachments.map(item => item.kind === "image" ? { kind: "image", name: item.name ?? null } : item),
+    updatedAt: row.updated_at,
+    pinnedAt: row.pinned_at,
+    owner: publicUser(row, "owner_"),
+    mine: row.user_id === viewerId,
+    canRemove: row.user_id === viewerId || isOwner,
+});
+
+// The joined members of a board load it again
+async function notifyBoard(kind, boardId) {
+    const { members, memberColumn } = BOARDS[kind];
+    const result = await pool.query(`SELECT user_id FROM ${members} WHERE ${memberColumn} = $1 AND status = 'joined'`, [boardId]);
+    for (const row of result.rows) realtime.toUser(row.user_id, "board:changed", { kind, id: boardId });
+}
+
+async function boardsOfNote(noteId) {
+    const result = await pool.query("SELECT id, family_id, session_id FROM board_notes WHERE note_id = $1", [noteId]);
+    return result.rows.map(row => row.family_id
+        ? { kind: "family", id: row.family_id, pinId: row.id }
+        : { kind: "session", id: row.session_id, pinId: row.id });
+}
+
+async function notifyBoardsOfNote(noteId) {
+    for (const board of await boardsOfNote(noteId)) await notifyBoard(board.kind, board.id);
+}
+
+for (const [kind, base] of [["family", "/api/families"], ["session", "/api/shared-sessions"]]) {
+    app.get(`${base}/:id/board`, async (req, res) => {
+        try {
+            const board = await boardAccess(kind, req, res);
+            if (!board) return;
+            const rows = await loadBoard(kind, board.id);
+            res.json(rows.map(row => boardNoteJson(row, false, req.user.userId, board.isOwner)));
+        } catch (err) {
+            serverError(res, err);
+        }
+    });
+
+    app.get(`${base}/:id/board/:pinId`, async (req, res) => {
+        const pinId = idParam(req.params.pinId);
+        try {
+            const board = await boardAccess(kind, req, res);
+            if (!board) return;
+            const [row] = pinId ? await loadBoard(kind, board.id, pinId) : [];
+            if (!row) return notFound(res, "Note");
+            res.json(boardNoteJson(row, true, req.user.userId, board.isOwner));
+        } catch (err) {
+            serverError(res, err);
+        }
+    });
+
+    app.post(`${base}/:id/board`, async (req, res) => {
+        const noteId = idParam(req.body?.noteId);
+        if (!noteId) return invalidInput(res, "noteId");
+        try {
+            const board = await boardAccess(kind, req, res, true);
+            if (!board) return;
+            const note = await pool.query("SELECT 1 FROM notebook_notes WHERE id = $1 AND user_id = $2 AND trashed_at IS NULL", [noteId, req.user.userId]);
+            if (note.rows.length === 0) return notFound(res, "Note");
+            const { column } = BOARDS[kind];
+            const already = await pool.query(`SELECT id FROM board_notes WHERE ${column} = $1 AND note_id = $2`, [board.id, noteId]);
+            if (already.rows.length === 0) {
+                const count = await pool.query(`SELECT count(*)::int AS n FROM board_notes WHERE ${column} = $1`, [board.id]);
+                if (count.rows[0].n >= BOARD_NOTES_MAX) return fail(res, 409, "BOARD_FULL", "This board is full");
+            }
+            const saved = await pool.query(
+                `INSERT INTO board_notes (note_id, ${column}) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id`,
+                [noteId, board.id]
+            );
+            const pinId = saved.rows[0]?.id ?? already.rows[0]?.id;
+            const [row] = await loadBoard(kind, board.id, pinId);
+            res.status(saved.rows.length ? 201 : 200).json(boardNoteJson(row, false, req.user.userId, board.isOwner));
+            if (saved.rows.length) notifyBoard(kind, board.id).catch(() => {});
+        } catch (err) {
+            serverError(res, err);
+        }
+    });
+
+    app.delete(`${base}/:id/board/:pinId`, async (req, res) => {
+        const pinId = idParam(req.params.pinId);
+        try {
+            const board = await boardAccess(kind, req, res);
+            if (!board) return;
+            const { column } = BOARDS[kind];
+            const pin = pinId && await pool.query(
+                `SELECT notebook_notes.user_id FROM board_notes JOIN notebook_notes ON notebook_notes.id = board_notes.note_id
+                WHERE board_notes.id = $1 AND board_notes.${column} = $2`,
+                [pinId, board.id]
+            );
+            if (!pin || pin.rows.length === 0) return notFound(res, "Note");
+            if (pin.rows[0].user_id !== req.user.userId && !board.isOwner) {
+                return fail(res, 403, "NOT_ALLOWED", "Only the note's owner or the owner can take it off");
+            }
+            await pool.query("DELETE FROM board_notes WHERE id = $1", [pinId]);
+            res.json({ deleted: pinId });
+            notifyBoard(kind, board.id).catch(() => {});
+        } catch (err) {
+            serverError(res, err);
+        }
+    });
+}
+
+app.get("/api/notebook/:id/boards", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Note");
+    try {
+        const note = await pool.query("SELECT 1 FROM notebook_notes WHERE id = $1 AND user_id = $2", [id, req.user.userId]);
+        if (note.rows.length === 0) return notFound(res, "Note");
+        res.json(await boardsOfNote(id));
     } catch (err) {
         serverError(res, err);
     }
@@ -6778,10 +7347,131 @@ app.delete("/api/tester/collections/:id/items/:kind/:itemId", async (req, res) =
     }
 });
 
-// ---------- profile pictures (testers first) ----------
-// One square picture per account (user_avatars), made small by the app (WebP / JPEG / PNG, at
-// most AVATAR_DATA_MAX characters as a data: URL). Testers can set one (PUT /api/tester/avatar);
-// anybody can take theirs away (DELETE /api/profile/avatar), admins anybody's
+// ---------- the arcade ----------
+// Small games for everybody signed in, also while waiting for beta access (so no requirePro).
+// Each run's score is sent with its mode: ranked (it counts for the leaderboard, everybody sees
+// display and user name with it) or not (only my own best). arcade_scores keeps per account, game
+// and difficulty the personal best and the ranked best. Scores come from the app, so they are only
+// checked to be plausible (ARCADE_GAMES' max); the leaderboard is for fun, not for prizes.
+//   GET    /api/arcade/me                                   my bests [{ game, level, best, rankedBest, plays }]
+//   POST   /api/arcade/scores { game, level, score, ranked } → { best, rankedBest, rank }
+//   GET    /api/arcade/leaderboard?game=&level=             { top: [{ rank, user, score, me }], me: { rank, score } | null }
+//   DELETE /api/arcade/ranked                               off every leaderboard (personal bests stay)
+const ARCADE_GAMES = {
+    guess: { levels: ["easy", "normal", "hard"], max: 500 },
+    scramble: { levels: ["easy", "normal", "hard"], max: 500 },
+    sequence: { levels: ["easy", "normal", "hard"], max: 500 },
+    reflex: { levels: ["normal"], max: 10000 }, // endless: a run lasts until a light is missed
+    pattern: { levels: ["normal"], max: 200 },
+};
+const ARCADE_TOP = 25;
+
+const arcadeLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_ARCADE", 60),
+    skip: (req) => req.method === "OPTIONS",
+    keyGenerator: (req) => `arcade:${req.user.userId}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many scores, slow down", code: "RATE_LIMITED" },
+});
+
+const arcadeGameOf = (game, level) => {
+    const known = typeof game === "string" && Object.hasOwn(ARCADE_GAMES, game) ? ARCADE_GAMES[game] : null;
+    return known && known.levels.includes(level) ? known : null;
+};
+
+// My place on a board: ahead of me are better scores and equal ones reached earlier
+async function arcadeRank(game, level, userId) {
+    const result = await pool.query(
+        `SELECT 1 + (SELECT count(*) FROM arcade_scores AS other
+            WHERE other.game = mine.game AND other.level = mine.level AND other.ranked_best IS NOT NULL
+                AND (other.ranked_best > mine.ranked_best
+                    OR (other.ranked_best = mine.ranked_best AND other.ranked_at < mine.ranked_at)))::int AS rank,
+            mine.ranked_best
+        FROM arcade_scores AS mine
+        WHERE mine.user_id = $1 AND mine.game = $2 AND mine.level = $3 AND mine.ranked_best IS NOT NULL`,
+        [userId, game, level]
+    );
+    return result.rows[0] ? { rank: result.rows[0].rank, score: result.rows[0].ranked_best } : null;
+}
+
+app.use("/api/arcade", authenticateToken);
+
+app.get("/api/arcade/me", async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT game, level, best, ranked_best, plays FROM arcade_scores WHERE user_id = $1 ORDER BY game, level",
+            [req.user.userId]
+        );
+        res.json(result.rows.map(row => ({ game: row.game, level: row.level, best: row.best, rankedBest: row.ranked_best, plays: row.plays })));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.post("/api/arcade/scores", arcadeLimiter, async (req, res) => {
+    const { game, level = "normal", score, ranked = false } = req.body ?? {};
+    const known = arcadeGameOf(game, level);
+    if (!known) return invalidInput(res, "game");
+    if (!Number.isInteger(score) || score < 0 || score > known.max) return invalidInput(res, "score");
+    if (typeof ranked !== "boolean") return invalidInput(res, "ranked");
+    try {
+        const saved = await pool.query(
+            `INSERT INTO arcade_scores (user_id, game, level, best, ranked_best, ranked_at, plays)
+            VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN $4::int END, CASE WHEN $5 THEN now() END, 1)
+            ON CONFLICT (user_id, game, level) DO UPDATE SET
+                best = GREATEST(arcade_scores.best, EXCLUDED.best),
+                ranked_at = CASE WHEN $5 AND (arcade_scores.ranked_best IS NULL OR $4 > arcade_scores.ranked_best)
+                    THEN now() ELSE arcade_scores.ranked_at END,
+                ranked_best = CASE WHEN $5 THEN GREATEST(COALESCE(arcade_scores.ranked_best, 0), $4) ELSE arcade_scores.ranked_best END,
+                plays = arcade_scores.plays + 1,
+                updated_at = now()
+            RETURNING best, ranked_best`,
+            [req.user.userId, game, level, score, ranked]
+        );
+        const mine = await arcadeRank(game, level, req.user.userId);
+        res.json({ best: saved.rows[0].best, rankedBest: saved.rows[0].ranked_best, rank: mine?.rank ?? null });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.get("/api/arcade/leaderboard", async (req, res) => {
+    const game = req.query.game;
+    const level = req.query.level ?? "normal";
+    if (!arcadeGameOf(game, level)) return invalidInput(res, "game");
+    try {
+        const result = await pool.query(
+            `SELECT users.id, users.username, users.display_name, arcade_scores.ranked_best
+            FROM arcade_scores JOIN users ON users.id = arcade_scores.user_id
+            WHERE arcade_scores.game = $1 AND arcade_scores.level = $2 AND arcade_scores.ranked_best IS NOT NULL
+            ORDER BY arcade_scores.ranked_best DESC, arcade_scores.ranked_at ASC
+            LIMIT $3`,
+            [game, level, ARCADE_TOP]
+        );
+        res.json({
+            top: result.rows.map((row, i) => ({ rank: i + 1, user: publicUser(row), score: row.ranked_best, me: row.id === req.user.userId })),
+            me: await arcadeRank(game, level, req.user.userId),
+        });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.delete("/api/arcade/ranked", async (req, res) => {
+    try {
+        await pool.query("UPDATE arcade_scores SET ranked_best = NULL, ranked_at = NULL WHERE user_id = $1", [req.user.userId]);
+        res.json({ ranked: false });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- profile pictures ----------
+// One picture per account (user_avatars), cut to a circle and made small by the app (WebP / JPEG /
+// PNG, at most AVATAR_DATA_MAX characters as a data: URL). Anybody can set one
+// (PUT /api/profile/avatar; testers first used /api/tester/avatar, which still answers) and take theirs away (DELETE /api/profile/avatar), admins anybody's
 // (DELETE /api/admin/users/:id/avatar). A picture is seen by its owner and the people who also
 // see the owner's online status: friends, people in open shared sessions and families.
 // The app asks which of the people it shows have one (GET /api/avatars?ids=…, answers
@@ -6801,7 +7491,8 @@ async function visibleAvatarOwners(viewerId, ids) {
     return new Set(ids.filter(id => audience.has(id)));
 }
 
-app.put("/api/tester/avatar", async (req, res) => {
+// PUT /api/profile/avatar (everybody; /api/tester/avatar stays for older app versions)
+async function setAvatar(req, res) {
     const picture = readImageData(req.body?.data, AVATAR_DATA_MAX, ["webp", "jpeg", "png"]);
     if (!picture) return invalidInput(res, "data");
     try {
@@ -6816,7 +7507,9 @@ app.put("/api/tester/avatar", async (req, res) => {
     } catch (err) {
         serverError(res, err);
     }
-});
+}
+app.put("/api/profile/avatar", setAvatar);
+app.put("/api/tester/avatar", setAvatar);
 
 app.delete("/api/profile/avatar", async (req, res) => {
     try {
