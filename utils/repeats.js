@@ -7,6 +7,17 @@ const REPEATS = ['daily', 'weekly', 'monthly', 'yearly'];
 const MAX_PREVIEWS = 400;
 const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
 
+// A task's day as text: node-postgres returns a `date` column as a Date at local midnight, so read
+// it with local getters (toISOString would shift it by the timezone); text is cut to its day
+function dayOf(value) {
+    if (value instanceof Date) {
+        if (Number.isNaN(value.getTime())) return '';
+        const pad = (n, width = 2) => String(n).padStart(width, '0');
+        return `${pad(value.getFullYear(), 4)}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
+    }
+    return typeof value === 'string' ? value.slice(0, 10) : '';
+}
+
 const toKey = (date) => date.toISOString().slice(0, 10);
 const fromKey = (key) => new Date(`${key}T00:00:00Z`);
 
@@ -40,9 +51,10 @@ function repeatDate(start, repeat, n) {
 // end (repeat_left) stops after that many steps; days deleted on their own (repeat_skip) are left
 // out but still count as a step. Dates compare as text, which is right for YYYY-MM-DD.
 function projectRepeats(tasks, until) {
+    if (typeof until !== 'string' || !DAY_KEY.test(until)) throw new Error(`projectRepeats: until must be YYYY-MM-DD, got ${until}`);
     const previews = [];
     for (const task of tasks) {
-        const start = typeof task.due === 'string' ? task.due.slice(0, 10) : '';
+        const start = dayOf(task.due);
         if (task.done || !REPEATS.includes(task.repeat) || !DAY_KEY.test(start)) continue;
         const skipped = new Set(task.repeat_skip ?? []);
         const steps = Number.isInteger(task.repeat_left) ? Math.min(task.repeat_left, MAX_PREVIEWS) : MAX_PREVIEWS;
