@@ -3513,6 +3513,10 @@ describe("study goals", () => {
             ["DELETE", `/parts/${partId}`],
             ["PUT", `/goals/${goal.id}/parts/order`, { ids: goal.parts.map(p => p.id) }],
         ];
+        const foreignSub = await newSubject(other, "Fremd");
+        const mineSub = await newSubject(tess, "Eigen");
+        assert.equal((await call("PATCH", `${S}/goals/${goal.id}`, { subjectId: foreignSub.id }, tess.token)).status, 404, "move to somebody else's subject");
+        assert.equal((await call("PATCH", `${S}/goals/${goal.id}`, { subjectId: mineSub.id }, tess.token)).status, 200);
         for (const [m, p, b] of calls) assert.equal((await call(m, S + p, b, o)).status, 404, `${m} ${p}`);
         assert.equal((await call("POST", `${S}/goals`, { subjectId: sub.id, kind: "other", name: "x", due: daysFromToday(3), planMode: "days", parts: [{ name: "x", estimateMinutes: 60 }] }, o)).status, 404);
         assert.equal((await call("GET", `${S}/goals?subject=${sub.id}`, null, o)).data.length, 0);
@@ -3566,6 +3570,8 @@ describe("study goals", () => {
         assert.equal(r.data.aiAuto, true);
         assert.equal((await call("PUT", `${S}/settings`, { windows: [{ weekday: 2, start: "18:00", end: "17:00" }] }, tess.token)).data.code, "invalid_window");
         assert.equal((await call("PUT", `${S}/settings`, { windows: [{ weekday: 8, start: "10:00", end: "11:00" }] }, tess.token)).data.code, "invalid_window");
+        const many = Array.from({ length: 51 }, () => ({ weekday: 1, start: "10:00", end: "11:00" }));
+        assert.equal((await call("PUT", `${S}/settings`, { windows: many }, tess.token)).data.code, "invalid_window");
         assert.equal((await call("PUT", `${S}/settings`, { windows, sessionMinutes: 10 }, tess.token)).data.code, "invalid_input");
         assert.equal((await call("GET", `${S}/settings`, null, tess.token)).data.windows.length, 3, "a refused PUT changes nothing");
         assert.equal((await call("GET", `${S}/settings`, null, other.token)).data.windows.length, 0);

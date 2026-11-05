@@ -71,6 +71,22 @@ module.exports = ({ pool, realtime }) => {
         id: row.id, name: row.name, emoji: row.emoji, color: row.color, archived: row.archived, nextGoal,
     });
 
+    // Runs fn(client) in one transaction.
+    async function inTransaction(fn) {
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            const result = await fn(client);
+            await client.query('COMMIT');
+            return result;
+        } catch (err) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw err;
+        } finally {
+            client.release();
+        }
+    }
+
     // ---------- subjects ----------
     router.get('/subjects', async (req, res) => {
         const userId = req.user.userId;
@@ -315,24 +331,18 @@ module.exports = ({ pool, realtime }) => {
         const id = idParam(req.params.id);
         const mode = req.query.sessions === undefined ? 'keep' : req.query.sessions;
         if (mode !== 'keep' && mode !== 'delete') return invalid(res, 'sessions');
-        const [found] = await loadGoals(pool, userId, { id });
-        if (!found) return notFound(res);
-        const clock = await getClock(pool, userId);
-        const doomed = mode === 'delete' ? found.sessions.filter((s) => isPending(s, clock)).map((s) => s.taskId) : [];
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            if (doomed.length) await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [doomed, userId]);
+        if (!(await ownedGoal(pool, userId, id))) return notFound(res);
+        let removed = 0;
+        await inTransaction(async (client) => {
+            if (mode === 'delete') {
+                const partIds = (await client.query('SELECT id FROM goal_parts WHERE goal_id = $1', [id])).rows.map((r) => r.id);
+                const doomed = await pendingTaskIds(client, userId, partIds, await getClock(client, userId));
+                if (doomed.length) removed = (await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [doomed, userId])).rowCount;
+            }
             await client.query('DELETE FROM goals WHERE id = $1 AND user_id = $2', [id, userId]); // parts go, tasks keep (goal_part_id -> null)
-            await client.query('COMMIT');
-        } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-        } finally {
-            client.release();
-        }
+        });
         changed(userId);
-        res.json({ ok: true, removedSessions: doomed.length });
+        res.json({ ok: true, removedSessions: removed });
     });
 
     // ---------- parts ----------
@@ -391,41 +401,27 @@ module.exports = ({ pool, realtime }) => {
         res.status(201).json(await partDetail(userId, goalId, partId));
     });
 
-    // Finishing a part: its credit is kept, its replaceable sessions go, their minutes count as freed.
-    async function finishPart(userId, part) {
-        const client = await pool.connect();
-        let removed = 0;
-        try {
-            await client.query('BEGIN');
-            const clock = await getClock(client, userId);
-            const sessions = await loadSessions(client, userId, [part.id]);
-            const credit = Math.round(sessions.reduce((sum, s) => sum + sessionCredit(s), 0));
-            const gone = sessions.filter((s) => isReplaceable(s, clock));
-            await client.query('UPDATE goal_parts SET done_at = now(), actual_minutes = $2 WHERE id = $1', [part.id, credit]);
-            if (gone.length) {
-                removed = (await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [gone.map((s) => s.taskId), userId])).rowCount;
-                await client.query(
-                    'UPDATE goals SET freed_minutes = freed_minutes + $2 WHERE id = $1',
-                    [part.goal_id, gone.reduce((sum, s) => sum + s.minutes, 0)]
-                );
-            }
-            await client.query('COMMIT');
-        } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-        } finally {
-            client.release();
-        }
-        if (removed) changed(userId);
+    // Finishing a part (inside the caller's transaction): its credit is kept, its replaceable sessions go,
+    // their minutes count as freed. Returns how many tasks were deleted.
+    async function finishPart(client, userId, part) {
+        const clock = await getClock(client, userId);
+        const sessions = await loadSessions(client, userId, [part.id]);
+        const credit = Math.round(sessions.reduce((sum, s) => sum + sessionCredit(s), 0));
+        const gone = sessions.filter((s) => isReplaceable(s, clock));
+        await client.query('UPDATE goal_parts SET done_at = now(), actual_minutes = $2 WHERE id = $1', [part.id, credit]);
+        if (!gone.length) return 0;
+        const removed = (await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [gone.map((s) => s.taskId), userId])).rowCount;
+        await client.query('UPDATE goals SET freed_minutes = freed_minutes + $2 WHERE id = $1', [part.goal_id, gone.reduce((sum, s) => sum + s.minutes, 0)]);
+        return removed;
     }
 
     router.patch('/parts/:id', async (req, res) => {
         const userId = req.user.userId;
-        const part = await ownedPart(pool, userId, idParam(req.params.id));
-        if (!part) return notFound(res);
+        const partId = idParam(req.params.id);
+        if (!(await ownedPart(pool, userId, partId))) return notFound(res);
         const body = req.body || {};
         const sets = [];
-        const params = [part.id];
+        const params = [partId];
         const set = (column, value) => { params.push(value); sets.push(`${column} = $${params.length}`); };
         if (body.name !== undefined) {
             const name = cleanName(body.name, 200);
@@ -439,24 +435,47 @@ module.exports = ({ pool, realtime }) => {
             set('estimate_source', 'manual');
         }
         if (body.doneAt === undefined && sets.length === 0) return invalid(res, 'body');
-        if (sets.length) await pool.query(`UPDATE goal_parts SET ${sets.join(', ')} WHERE id = $1`, params);
-        if (body.doneAt !== undefined) {
-            if (body.doneAt && !part.done_at) await finishPart(userId, part);
-            else if (!body.doneAt && part.done_at) await pool.query('UPDATE goal_parts SET done_at = NULL, actual_minutes = NULL WHERE id = $1', [part.id]);
-        }
-        res.json(await partDetail(userId, part.goal_id, part.id));
+        let removed = 0;
+        let goalId;
+        const found = await inTransaction(async (client) => {
+            const part = (await client.query(
+                `SELECT goal_parts.id, goal_parts.goal_id, goal_parts.done_at FROM goal_parts
+                JOIN goals ON goals.id = goal_parts.goal_id WHERE goal_parts.id = $1 AND goals.user_id = $2 FOR UPDATE OF goal_parts`,
+                [partId, userId]
+            )).rows[0];
+            if (!part) return false;
+            goalId = part.goal_id;
+            if (sets.length) await client.query(`UPDATE goal_parts SET ${sets.join(', ')} WHERE id = $1`, params);
+            if (body.doneAt !== undefined) {
+                if (body.doneAt && !part.done_at) removed = await finishPart(client, userId, part);
+                else if (!body.doneAt && part.done_at) await client.query('UPDATE goal_parts SET done_at = NULL, actual_minutes = NULL WHERE id = $1', [partId]);
+            }
+            return true;
+        });
+        if (!found) return notFound(res);
+        if (removed) changed(userId);
+        res.json(await partDetail(userId, goalId, partId));
     });
 
     router.delete('/parts/:id', async (req, res) => {
         const userId = req.user.userId;
-        const part = await ownedPart(pool, userId, idParam(req.params.id));
-        if (!part) return notFound(res);
-        const clock = await getClock(pool, userId);
-        const doomed = await pendingTaskIds(pool, userId, [part.id], clock); // past ones stay as plain tasks
-        if (doomed.length) await pool.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [doomed, userId]);
-        await pool.query('DELETE FROM goal_parts WHERE id = $1', [part.id]);
-        if (doomed.length) changed(userId);
-        res.json({ ok: true, removedSessions: doomed.length });
+        const partId = idParam(req.params.id);
+        let removed = 0;
+        const found = await inTransaction(async (client) => {
+            const part = (await client.query(
+                `SELECT goal_parts.id FROM goal_parts JOIN goals ON goals.id = goal_parts.goal_id
+                WHERE goal_parts.id = $1 AND goals.user_id = $2 FOR UPDATE OF goal_parts`,
+                [partId, userId]
+            )).rows[0];
+            if (!part) return false;
+            const doomed = await pendingTaskIds(client, userId, [partId], await getClock(client, userId)); // past ones stay as plain tasks
+            if (doomed.length) removed = (await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [doomed, userId])).rowCount;
+            await client.query('DELETE FROM goal_parts WHERE id = $1', [partId]);
+            return true;
+        });
+        if (!found) return notFound(res);
+        if (removed) changed(userId);
+        res.json({ ok: true, removedSessions: removed });
     });
 
     router.put('/goals/:id/parts/order', async (req, res) => {
@@ -510,7 +529,7 @@ module.exports = ({ pool, realtime }) => {
         const body = req.body || {};
         let windows = null;
         if (body.windows !== undefined) {
-            if (!Array.isArray(body.windows)) return fail(res, 400, 'invalid_window', 'windows must be a list');
+            if (!Array.isArray(body.windows) || body.windows.length > 50) return fail(res, 400, 'invalid_window', 'windows must be a list');
             windows = [];
             for (const w of body.windows) {
                 const ok = w && Number.isInteger(w.weekday) && w.weekday >= 1 && w.weekday <= 7
