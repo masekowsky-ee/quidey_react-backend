@@ -48,14 +48,29 @@ test('planningDays (days): starts tomorrow from 19:00 on', () => {
     assert.equal(planningDays(goal(), TODAY, 19 * 60, w)[0], '2026-11-10');
 });
 
-test('planningDays (slots): starts tomorrow once today\'s windows are over', () => {
+test('planningDays (slots): starts tomorrow once no window today has a session left', () => {
     const g = goal({ planMode: 'slots' });
     const w = everyDay('15:00', '19:00');
-    assert.equal(planningDays(g, TODAY, 19 * 60 - 1, w)[0], '2026-11-09');
-    assert.equal(planningDays(g, TODAY, 19 * 60, w)[0], '2026-11-10');
+    // 18:15 leaves exactly 45 minutes; 18:11 rounds up to 18:15
+    assert.equal(planningDays(g, TODAY, 18 * 60 + 11, w, 45)[0], '2026-11-09');
+    assert.equal(planningDays(g, TODAY, 18 * 60 + 15, w, 45)[0], '2026-11-09');
+    // 18:16 rounds up to 18:20: only 40 minutes left
+    assert.equal(planningDays(g, TODAY, 18 * 60 + 16, w, 45)[0], '2026-11-10');
+    assert.equal(planningDays(g, TODAY, 18 * 60 + 30, w, 45)[0], '2026-11-10');
+    assert.equal(planningDays(g, TODAY, 19 * 60, w, 45)[0], '2026-11-10');
     // two windows today: still open while the later one runs
     const two = [{ weekday: 1, start: '08:00', end: '09:00' }, { weekday: 1, start: '18:00', end: '20:00' }, ...everyDay('15:00', '16:00').slice(1)];
-    assert.equal(planningDays(g, TODAY, 12 * 60, two)[0], '2026-11-09');
+    assert.equal(planningDays(g, TODAY, 12 * 60, two, 45)[0], '2026-11-09');
+});
+
+test('slots: at 18:30 with windows to 19:00, today is no planning day and 3 sessions stay evenly spaced', () => {
+    const { sessions } = plan(input({
+        nowMinutes: 18 * 60 + 30,
+        windows: everyDay('15:00', '19:00'),
+        goals: [goal({ planMode: 'slots', due: '2026-11-16', parts: [{ id: 'p1', position: 1, role: 'part', remaining: 135 }] })],
+    }));
+    // planning days 10..15 (six), sessions on days 0, 2, 4
+    assert.deepEqual(dates(sessions), ['2026-11-10', '2026-11-12', '2026-11-14']);
 });
 
 test('planningDays (slots): only weekdays that have a window', () => {
@@ -153,8 +168,18 @@ test('slots: a gap of exactly sessionMinutes after the buffers fits, one minute 
     const fits = run('16:05');
     assert.deepEqual(times(fits.sessions), ['15:10']);
     const tooShort = run('16:04');
-    // the only other room is after 16:44 + 10 = 16:44..18:00
+    // the only other room is after the second event: 16:34 + 10 = 16:44..18:00
     assert.deepEqual(times(tooShort.sessions), ['16:44']);
+});
+
+test('slots: an event ending 14:55 just before a 15:00 window pushes the first slot to 15:05', () => {
+    const { sessions } = plan(input({
+        nowMinutes: 9 * 60,
+        windows: monOnly('15:00', '19:00'),
+        busy: [{ date: TODAY, start: '14:00', minutes: 55 }],
+        goals: [goal({ planMode: 'slots', due: '2026-11-10', parts: [{ id: 'p1', position: 1, role: 'part', remaining: 45 }] })],
+    }));
+    assert.deepEqual(times(sessions), ['15:05']);
 });
 
 test('slots: two windows on one weekday are both used', () => {
@@ -240,6 +265,41 @@ test('kept: on another day it changes nothing today', () => {
     assert.equal(sessions.length, 4);
 });
 
+test('kept (pending): its minutes come off its part\'s remaining, so they are not planned twice', () => {
+    const kept = [{ goalId: 'g1', partId: 'p1', date: '2026-11-12', time: null, minutes: 45, pending: true }];
+    const { sessions, shortfall } = plan(input({
+        kept,
+        goals: [goal({ parts: [{ id: 'p1', position: 1, role: 'part', remaining: 90 }] })],
+    }));
+    assert.equal(sessions.reduce((sum, s) => sum + s.minutes, 0), 45);
+    assert.deepEqual(shortfall, { g1: 0 });
+});
+
+test('kept (not pending, done or with focus time): remaining is not reduced', () => {
+    const kept = [{ goalId: 'g1', partId: 'p1', date: '2026-11-12', time: null, minutes: 45, pending: false }];
+    const { sessions } = plan(input({
+        kept,
+        goals: [goal({ parts: [{ id: 'p1', position: 1, role: 'part', remaining: 90 }] })],
+    }));
+    assert.equal(sessions.reduce((sum, s) => sum + s.minutes, 0), 90);
+});
+
+test('kept (pending): remaining never goes below 0, other parts are untouched', () => {
+    const kept = [
+        { goalId: 'g1', partId: 'p1', date: '2026-11-12', time: null, minutes: 45, pending: true },
+        { goalId: 'g1', partId: 'p1', date: '2026-11-13', time: null, minutes: 45, pending: true },
+    ];
+    const { sessions, shortfall } = plan(input({
+        kept,
+        goals: [goal({ parts: [
+            { id: 'p1', position: 1, role: 'part', remaining: 60 },
+            { id: 'p2', position: 2, role: 'part', remaining: 45 },
+        ] })],
+    }));
+    assert.deepEqual(sessions.map((s) => [s.partId, s.minutes]), [['p2', 45]]);
+    assert.deepEqual(shortfall, { g1: 0 });
+});
+
 // ---------- parts ----------
 
 test('parts: sessions go to parts in position order, whatever the input order', () => {
@@ -295,6 +355,44 @@ test('never a session on or after the due date', () => {
     const { sessions } = plan(input({ dailyMaxMinutes: 720, goals: [goal({ parts: [{ id: 'p1', position: 1, role: 'part', remaining: 5000 }] })] }));
     assert.ok(sessions.length > 0);
     assert.ok(sessions.every((s) => s.date < '2026-11-15'));
+});
+
+// ---------- malformed input ----------
+
+test('plan: a malformed today or due throws a TypeError', () => {
+    for (const today of ['2026-11-9', '09.11.2026', '', null, new Date('2026-11-09T00:00:00Z'), '2026-13-40']) {
+        assert.throws(() => plan(input({ today })), TypeError, String(today));
+    }
+    for (const due of ['2026-11-15T00:00:00Z', undefined, new Date('2026-11-15T00:00:00Z'), '2026-02-30x']) {
+        assert.throws(() => plan(input({ goals: [goal({ due })] })), TypeError, String(due));
+    }
+});
+
+test('plan: non-positive or non-finite session length or daily max throws a TypeError', () => {
+    for (const bad of [0, -45, NaN, Infinity, undefined, '45']) {
+        assert.throws(() => plan(input({ sessionMinutes: bad })), TypeError, `sessionMinutes ${bad}`);
+        assert.throws(() => plan(input({ dailyMaxMinutes: bad })), TypeError, `dailyMaxMinutes ${bad}`);
+    }
+});
+
+test('chunk: a non-positive or non-finite size throws instead of looping', () => {
+    for (const bad of [0, -1, NaN, Infinity, undefined]) {
+        assert.throws(() => chunk(100, bad), TypeError, String(bad));
+    }
+});
+
+// ---------- ties ----------
+
+test('ties: numeric ids break numerically, goal 9 before goal 10', () => {
+    const { sessions, shortfall } = plan(input({
+        dailyMaxMinutes: 45,
+        goals: [
+            goal({ id: 10, due: '2026-11-10', parts: [{ id: 101, position: 1, role: 'part', remaining: 45 }] }),
+            goal({ id: 9, due: '2026-11-10', parts: [{ id: 91, position: 1, role: 'part', remaining: 45 }] }),
+        ],
+    }));
+    assert.deepEqual(sessions.map((s) => s.goalId), [9]);
+    assert.deepEqual(shortfall, { 9: 0, 10: 45 });
 });
 
 // ---------- determinism ----------

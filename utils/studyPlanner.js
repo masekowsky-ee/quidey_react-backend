@@ -14,6 +14,17 @@ const DAYS_CUTOFF = 19 * 60;    // `days` mode: from 19:00 on, today is no longe
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
 
+const isPositive = (n) => typeof n === 'number' && Number.isFinite(n) && n > 0;
+// A real calendar day as 'YYYY-MM-DD' text (a Date object or '2026-02-30' is not)
+const isDay = (value) => typeof value === 'string' && DAY_KEY.test(value)
+    && !Number.isNaN(Date.parse(`${value}T00:00:00Z`))
+    && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+// Today's slots start no earlier than now, rounded up to 5 minutes
+const roundUp = (minutes) => Math.ceil(minutes / 5) * 5;
+// Numbers compare as numbers (9 before 10), anything else as text
+const compareIds = (a, b) => (typeof a === 'number' && typeof b === 'number'
+    ? a - b
+    : String(a).localeCompare(String(b)));
 const toMinutes = (hhmm) => {
     const [h, m] = String(hhmm).split(':').map(Number);
     return h * 60 + m;
@@ -33,6 +44,7 @@ const windowsOn = (day, windows) => {
 
 // Minutes cut into session lengths; a leftover under 15 minutes goes into the previous chunk
 function chunk(minutes, sessionMinutes) {
+    if (!isPositive(sessionMinutes)) throw new TypeError(`chunk: session length must be a positive number, got ${sessionMinutes}`);
     const chunks = [];
     let left = Math.max(0, Math.round(minutes || 0));
     while (left > 0) {
@@ -45,12 +57,14 @@ function chunk(minutes, sessionMinutes) {
 }
 
 // The days a goal can be studied on: from today (tomorrow once today is over) to the day before
-// `due`. In `slots` mode only weekdays that have a window count.
-function planningDays(goal, today, nowMinutes, windows) {
-    if (!DAY_KEY.test(goal.due || '') || !DAY_KEY.test(today || '')) return [];
+// `due`. In `slots` mode only weekdays that have a window count, and today only while some window
+// still has a whole session left after now (rounded up to 5 minutes).
+function planningDays(goal, today, nowMinutes, windows, sessionMinutes = 1) {
+    if (!isDay(goal.due) || !isDay(today)) return [];
     const slots = goal.planMode === 'slots';
+    const now = roundUp(nowMinutes);
     const todayOver = slots
-        ? !windowsOn(today, windows).some((w) => w.end > nowMinutes)
+        ? !windowsOn(today, windows).some((w) => w.end - Math.max(w.start, now) >= sessionMinutes)
         : nowMinutes >= DAYS_CUTOFF;
     const days = [];
     for (let day = todayOver ? addDays(today, 1) : today; day < goal.due; day = addDays(day, 1)) {
@@ -86,32 +100,51 @@ function freeGaps(date, windows, busy, keptOnDay) {
     return gaps;
 }
 
+// Malformed input must surface (→ 400), not look like "doesn't fit"
+function validate(input) {
+    if (!isDay(input.today)) throw new TypeError(`plan: today must be 'YYYY-MM-DD', got ${input.today}`);
+    for (const key of ['sessionMinutes', 'dailyMaxMinutes']) {
+        if (!isPositive(input[key])) throw new TypeError(`plan: ${key} must be a positive number, got ${input[key]}`);
+    }
+    for (const goal of input.goals) {
+        if (!isDay(goal.due)) throw new TypeError(`plan: goal ${goal.id} due must be 'YYYY-MM-DD', got ${goal.due}`);
+    }
+}
+
+// Minutes per part already covered by pending kept sessions (future, not done, no focus time):
+// they are still in the part's `remaining`, so planning them again would double-book (ruling 7)
+function pendingByPart(kept) {
+    const minutes = new Map();
+    for (const k of kept) {
+        if (k.pending) minutes.set(k.partId, (minutes.get(k.partId) || 0) + (Number(k.minutes) || 0));
+    }
+    return minutes;
+}
+
 // A goal's chunks in the order they are handed out: parts by position, each cut into sessions
-function goalState(goal, input) {
-    const parts = [...goal.parts].sort((a, b) => a.position - b.position || String(a.id).localeCompare(String(b.id)));
+function goalState(goal, input, pending) {
+    const parts = [...goal.parts].sort((a, b) => a.position - b.position || compareIds(a.id, b.id));
     const queue = [];
     for (const part of parts) {
-        for (const minutes of chunk(part.remaining, input.sessionMinutes)) queue.push({ partId: part.id, minutes });
+        const remaining = Math.max(0, (Number(part.remaining) || 0) - (pending.get(part.id) || 0));
+        for (const minutes of chunk(remaining, input.sessionMinutes)) queue.push({ partId: part.id, minutes });
     }
     const total = queue.reduce((sum, c) => sum + c.minutes, 0);
-    const days = planningDays(goal, input.today, input.nowMinutes, input.windows);
+    const days = planningDays(goal, input.today, input.nowMinutes, input.windows, input.sessionMinutes);
     return { goal, queue, total, planned: 0, days, pace: days.length ? total / days.length : Infinity };
 }
 
 // Urgency: earliest due, then highest pace, then id
 const byUrgency = (a, b) => (a.goal.due < b.goal.due ? -1 : a.goal.due > b.goal.due ? 1 : 0)
     || b.pace - a.pace
-    || String(a.goal.id).localeCompare(String(b.goal.id));
+    || compareIds(a.goal.id, b.goal.id);
 
 // What the day still has room for: minutes under the daily max, and (for `slots`) free gaps
 function dayState(date, input) {
     const keptOnDay = input.kept.filter((k) => k.date === date);
     const keptMinutes = keptOnDay.reduce((sum, k) => sum + (Number(k.minutes) || 0), 0);
     let gaps = freeGaps(date, input.windows, input.busy, keptOnDay);
-    if (date === input.today) {
-        const now = Math.ceil(input.nowMinutes / 5) * 5;
-        gaps = cut(gaps, 0, now);
-    }
+    if (date === input.today) gaps = cut(gaps, 0, roundUp(input.nowMinutes));
     return { date, capacity: input.dailyMaxMinutes - keptMinutes, gaps };
 }
 
@@ -133,7 +166,9 @@ function place(state, day) {
 }
 
 function plan(input) {
-    const states = input.goals.map((goal) => goalState(goal, input)).sort(byUrgency);
+    validate(input);
+    const pending = pendingByPart(input.kept);
+    const states = input.goals.map((goal) => goalState(goal, input, pending)).sort(byUrgency);
     const allDays = [...new Set(states.flatMap((s) => s.days))].sort();
     const sessions = [];
 
