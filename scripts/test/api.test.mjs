@@ -3417,3 +3417,221 @@ describe("Reminders (testers): once or on weekdays, pushed except to devices tha
         assert.equal((await sql("SELECT count(*)::int AS n FROM reminders WHERE id = $1", [r.data.id]))[0].n, 0);
     });
 });
+
+describe("study goals", () => {
+    const S = "/api/tester/study";
+    let tess, other, plain;
+
+    before(async () => {
+        tess = await member("studytess");
+        other = await member("studyother");
+        plain = await member("studyplain");
+        await sql("UPDATE users SET is_tester = true WHERE id = ANY($1)", [[tess.id, other.id]]);
+        await sql("UPDATE users SET is_tester = false WHERE id = $1", [plain.id]);
+    });
+
+    const newSubject = async (user, name) => (await call("POST", `${S}/subjects`, { name, color: "blue" }, user.token)).data;
+    const newGoal = async (user, subjectId, extra = {}) => {
+        const r = await call("POST", `${S}/goals`, {
+            subjectId, kind: "exam", name: "Klausur", due: daysFromToday(10), planMode: "days",
+            parts: [{ name: "A", estimateMinutes: 60, estimateSource: "manual" }, { name: "B", estimateMinutes: 90 }, { name: "C", estimateMinutes: 120 }],
+            ...extra,
+        }, user.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        return (await call("GET", `${S}/goals/${r.data.id}`, null, user.token)).data;
+    };
+    // a planned session of a part: kind task with goal_part_id
+    const session = async (user, partId, due, extra = {}) => (await sql(
+        `INSERT INTO tasks (name, kind, user_id, due, duration_minutes, goal_part_id, done) VALUES ('S', 'task', $1, $2, 45, $3, $4) RETURNING id`,
+        [user.id, due, partId, !!extra.done]))[0].id;
+
+    test("testers only", async () => {
+        assert.equal((await call("GET", `${S}/subjects`, null, plain.token)).data.code, "TESTER_REQUIRED");
+    });
+
+    test("subjects: create, duplicate names, patch, list with next goal", async () => {
+        const sub = await newSubject(tess, "Mathe");
+        assert.equal(sub.name, "Mathe");
+        assert.equal(sub.archived, false);
+        assert.equal((await call("POST", `${S}/subjects`, { name: "  mathe " }, tess.token)).status, 400);
+        assert.equal((await call("POST", `${S}/subjects`, { name: "" }, tess.token)).data.code, "invalid_input");
+        assert.equal((await call("POST", `${S}/subjects`, { name: "x".repeat(61) }, tess.token)).data.code, "invalid_input");
+        assert.equal((await newSubject(other, "Mathe")).name, "Mathe", "names are per user");
+        const goal = await newGoal(tess, sub.id, { name: "Analysis  \n 1" });
+        assert.equal(goal.name, "Analysis 1");
+        const list = (await call("GET", `${S}/subjects`, null, tess.token)).data;
+        const mine = list.find(s => s.id === sub.id);
+        assert.equal(mine.nextGoal.id, goal.id);
+        assert.equal(mine.nextGoal.progress, 0);
+        assert.equal(mine.nextGoal.behindMinutes, 0);
+        const r = await call("PATCH", `${S}/subjects/${sub.id}`, { name: "Mathematik", archived: true }, tess.token);
+        assert.equal(r.data.name, "Mathematik");
+        assert.equal(r.data.archived, true);
+        assert.equal((await call("PATCH", `${S}/subjects/${sub.id}`, { color: "beige" }, tess.token)).status, 400);
+    });
+
+    test("an exam gets a review part last; validation errors", async () => {
+        const sub = await newSubject(tess, "Physik");
+        const goal = await newGoal(tess, sub.id);
+        assert.equal(goal.parts.length, 4);
+        const last = goal.parts.at(-1);
+        assert.equal(last.role, "review");
+        assert.equal(last.estimateMinutes, 60);
+        assert.equal(last.estimateSource, "default");
+        assert.deepEqual(goal.parts.map(p => p.position), [0, 1, 2, 3]);
+        assert.equal(goal.parts[0].credit, 0);
+        assert.equal(goal.parts[0].remaining, 60);
+        assert.equal(goal.due, daysFromToday(10));
+        assert.equal(goal.status, "active");
+
+        const base = { subjectId: sub.id, kind: "assignment", name: "Hausarbeit", due: daysFromToday(5), planMode: "days", parts: [{ name: "x", estimateMinutes: 60 }] };
+        assert.equal((await call("POST", `${S}/goals`, { ...base, due: daysFromToday(-1) }, tess.token)).data.code, "due_in_past");
+        assert.equal((await call("POST", `${S}/goals`, { ...base, parts: [] }, tess.token)).data.code, "no_parts");
+        assert.equal((await call("POST", `${S}/goals`, { ...base, parts: [{ name: "x", estimateMinutes: 5 }] }, tess.token)).data.code, "invalid_input");
+        assert.equal((await call("POST", `${S}/goals`, { ...base, kind: "party" }, tess.token)).data.code, "invalid_input");
+        assert.equal((await call("POST", `${S}/goals`, { ...base, parts: Array.from({ length: 41 }, () => ({ name: "x", estimateMinutes: 60 })) }, tess.token)).data.code, "invalid_input");
+        const ok = await call("POST", `${S}/goals`, base, tess.token);
+        assert.equal(ok.status, 201);
+        assert.equal((await call("GET", `${S}/goals/${ok.data.id}`, null, tess.token)).data.parts.length, 1, "no review part for assignments");
+        const filtered = (await call("GET", `${S}/goals?subject=${sub.id}`, null, tess.token)).data;
+        assert.equal(filtered.length, 2);
+    });
+
+    test("another user's ids are 404 on every route", async () => {
+        const sub = await newSubject(tess, "Chemie");
+        const goal = await newGoal(tess, sub.id);
+        const partId = goal.parts[0].id;
+        const o = other.token;
+        const calls = [
+            ["PATCH", `/subjects/${sub.id}`, { name: "Z" }],
+            ["DELETE", `/subjects/${sub.id}`],
+            ["GET", `/goals/${goal.id}`],
+            ["PATCH", `/goals/${goal.id}`, { name: "Z" }],
+            ["DELETE", `/goals/${goal.id}?sessions=keep`],
+            ["POST", `/goals/${goal.id}/parts`, { name: "Z", estimateMinutes: 30 }],
+            ["PATCH", `/parts/${partId}`, { name: "Z" }],
+            ["DELETE", `/parts/${partId}`],
+            ["PUT", `/goals/${goal.id}/parts/order`, { ids: goal.parts.map(p => p.id) }],
+        ];
+        for (const [m, p, b] of calls) assert.equal((await call(m, S + p, b, o)).status, 404, `${m} ${p}`);
+        assert.equal((await call("POST", `${S}/goals`, { subjectId: sub.id, kind: "other", name: "x", due: daysFromToday(3), planMode: "days", parts: [{ name: "x", estimateMinutes: 60 }] }, o)).status, 404);
+        assert.equal((await call("GET", `${S}/goals?subject=${sub.id}`, null, o)).data.length, 0);
+        assert.equal((await call("GET", `${S}/goals/${goal.id}`, null, tess.token)).status, 200, "still there");
+    });
+
+    test("parts: add, edit, reorder, delete", async () => {
+        const sub = await newSubject(tess, "Info");
+        const goal = await newGoal(tess, sub.id);
+        let r = await call("POST", `${S}/goals/${goal.id}/parts`, { name: "D", estimateMinutes: 30 }, tess.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        let g = (await call("GET", `${S}/goals/${goal.id}`, null, tess.token)).data;
+        assert.equal(g.parts.length, 5);
+        const dPart = g.parts.find(p => p.name === "D");
+        assert.equal(dPart.estimateSource, "manual");
+        r = await call("PATCH", `${S}/parts/${dPart.id}`, { estimateMinutes: 45, name: "D2" }, tess.token);
+        assert.equal(r.data.estimateMinutes, 45);
+        assert.equal((await call("PATCH", `${S}/parts/${dPart.id}`, { estimateMinutes: 10 }, tess.token)).data.code, "invalid_input");
+        const ids = g.parts.map(p => p.id).reverse();
+        assert.equal((await call("PUT", `${S}/goals/${goal.id}/parts/order`, { ids }, tess.token)).status, 200);
+        g = (await call("GET", `${S}/goals/${goal.id}`, null, tess.token)).data;
+        assert.deepEqual(g.parts.map(p => p.id), ids);
+        assert.equal((await call("PUT", `${S}/goals/${goal.id}/parts/order`, { ids: ids.slice(1) }, tess.token)).data.code, "invalid_input");
+        assert.equal((await call("DELETE", `${S}/parts/${dPart.id}`, null, tess.token)).status, 200);
+        g = (await call("GET", `${S}/goals/${goal.id}`, null, tess.token)).data;
+        assert.equal(g.parts.length, 4);
+    });
+
+    test("goal patch and settings", async () => {
+        const sub = await newSubject(tess, "Kunst");
+        const goal = await newGoal(tess, sub.id);
+        let r = await call("PATCH", `${S}/goals/${goal.id}`, { name: "Neu", dueTime: "10:30", planMode: "slots", status: "archived" }, tess.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        r = await call("GET", `${S}/goals/${goal.id}`, null, tess.token);
+        assert.equal(r.data.dueTime, "10:30");
+        assert.equal(r.data.planMode, "slots");
+        assert.equal(r.data.status, "archived");
+
+        r = await call("GET", `${S}/settings`, null, tess.token);
+        assert.deepEqual(r.data.windows, []);
+        assert.equal(r.data.sessionMinutes, 45);
+        assert.equal(r.data.dailyMaxMinutes, 180);
+        assert.equal(r.data.aiAuto, false);
+        assert.equal(typeof r.data.aiAvailable, "boolean");
+        const windows = [{ weekday: 1, start: "16:00", end: "18:00" }, { weekday: 1, start: "19:00", end: "20:00" }, { weekday: 3, start: "10:00", end: "11:00" }];
+        r = await call("PUT", `${S}/settings`, { windows, sessionMinutes: 30, dailyMaxMinutes: 240, aiAuto: true }, tess.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        r = await call("GET", `${S}/settings`, null, tess.token);
+        assert.deepEqual(r.data.windows, windows);
+        assert.equal(r.data.sessionMinutes, 30);
+        assert.equal(r.data.aiAuto, true);
+        assert.equal((await call("PUT", `${S}/settings`, { windows: [{ weekday: 2, start: "18:00", end: "17:00" }] }, tess.token)).data.code, "invalid_window");
+        assert.equal((await call("PUT", `${S}/settings`, { windows: [{ weekday: 8, start: "10:00", end: "11:00" }] }, tess.token)).data.code, "invalid_window");
+        assert.equal((await call("PUT", `${S}/settings`, { windows, sessionMinutes: 10 }, tess.token)).data.code, "invalid_input");
+        assert.equal((await call("GET", `${S}/settings`, null, tess.token)).data.windows.length, 3, "a refused PUT changes nothing");
+        assert.equal((await call("GET", `${S}/settings`, null, other.token)).data.windows.length, 0);
+    });
+
+    test("deleting a goal keeps or removes its future sessions", async () => {
+        const sub = await newSubject(tess, "Latein");
+        for (const mode of ["keep", "delete"]) {
+            const goal = await newGoal(tess, sub.id, { name: `G-${mode}` });
+            const part = goal.parts[0].id;
+            const future = await session(tess, part, daysFromToday(3));
+            const past = await session(tess, part, daysFromToday(-3));
+            const doneToday = await session(tess, part, daysFromToday(0), { done: true });
+            const r = await call("DELETE", `${S}/goals/${goal.id}?sessions=${mode}`, null, tess.token);
+            assert.equal(r.status, 200, JSON.stringify(r.data));
+            assert.equal((await call("GET", `${S}/goals/${goal.id}`, null, tess.token)).status, 404);
+            const rows = await sql("SELECT id, goal_part_id FROM tasks WHERE id = ANY($1)", [[future, past, doneToday]]);
+            const byId = Object.fromEntries(rows.map(x => [x.id, x]));
+            assert.equal(byId[past].goal_part_id, null, "past stays as a plain task");
+            assert.equal(byId[doneToday].goal_part_id, null);
+            if (mode === "keep") assert.equal(byId[future].goal_part_id, null, "kept as plain task");
+            else assert.equal(byId[future], undefined, "future session removed");
+        }
+        const goal = await newGoal(tess, sub.id);
+        assert.equal((await call("DELETE", `${S}/goals/${goal.id}?sessions=maybe`, null, tess.token)).data.code, "invalid_input");
+    });
+
+    test("deleting a subject removes its goals and their future sessions", async () => {
+        const sub = await newSubject(tess, "Sport");
+        const goal = await newGoal(tess, sub.id);
+        const future = await session(tess, goal.parts[0].id, daysFromToday(2));
+        const past = await session(tess, goal.parts[0].id, daysFromToday(-2));
+        assert.equal((await call("DELETE", `${S}/subjects/${sub.id}`, null, tess.token)).status, 200);
+        assert.equal((await call("GET", `${S}/goals/${goal.id}`, null, tess.token)).status, 404);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE id = $1", [future]))[0].n, 0);
+        const rows = await sql("SELECT goal_part_id FROM tasks WHERE id = $1", [past]);
+        assert.equal(rows[0].goal_part_id, null);
+    });
+
+    test("finishing a part credits it and frees its replaceable sessions", async () => {
+        const sub = await newSubject(tess, "Geschichte");
+        const goal = await newGoal(tess, sub.id);
+        const part = goal.parts[0].id; // 60 min
+        const doneS = await session(tess, part, daysFromToday(-1), { done: true }); // 45 credit
+        const futureS = await session(tess, part, daysFromToday(2));
+        const pinnedS = await session(tess, part, daysFromToday(3));
+        await sql("UPDATE tasks SET plan_pinned = true WHERE id = $1", [pinnedS]);
+        const r = await call("PATCH", `${S}/parts/${part}`, { doneAt: true }, tess.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        const row = (await sql("SELECT actual_minutes, done_at FROM goal_parts WHERE id = $1", [part]))[0];
+        assert.equal(row.actual_minutes, 45);
+        assert.ok(row.done_at);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE id = $1", [futureS]))[0].n, 0, "replaceable removed");
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE id = $1", [pinnedS]))[0].n, 1, "pinned stays");
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE id = $1", [doneS]))[0].n, 1);
+        assert.equal((await sql("SELECT freed_minutes FROM goals WHERE id = $1", [goal.id]))[0].freed_minutes, 45);
+        const g = (await call("GET", `${S}/goals/${goal.id}`, null, tess.token)).data;
+        assert.equal(g.parts[0].remaining, 0);
+        assert.equal(g.parts[0].credit, 45);
+        assert.ok(g.parts[0].doneAt);
+        assert.deepEqual(g.sessions.map(s => s.taskId).sort(), [doneS, pinnedS].sort());
+
+        const re = await call("PATCH", `${S}/parts/${part}`, { doneAt: null }, tess.token);
+        assert.equal(re.status, 200);
+        const reopened = (await sql("SELECT actual_minutes, done_at FROM goal_parts WHERE id = $1", [part]))[0];
+        assert.equal(reopened.done_at, null);
+        assert.equal(reopened.actual_minutes, null);
+    });
+});

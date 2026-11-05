@@ -269,6 +269,7 @@ function requireTester(req, res, next) {
 }
 
 app.use("/api/tester", authenticateToken, requireTester);
+app.use("/api/tester/study", require("./study")({ pool, realtime }));
 
 // Overall limit per account (or per IP before signing in): plenty for the app, which polls
 // every few seconds, but stops scripts from hammering the API
