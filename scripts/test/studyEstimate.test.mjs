@@ -122,3 +122,12 @@ test('makeAiClient is null without a key', () => {
     delete process.env.ANTHROPIC_API_KEY;
     try { assert.equal(makeAiClient(), null); } finally { if (old !== undefined) process.env.ANTHROPIC_API_KEY = old; }
 });
+
+test('wantsAi: an explicit ai:false wins over aiAuto, ai:true or aiAuto ask (ruling 32)', () => {
+    const { wantsAi } = require('../../utils/studyEstimate');
+    assert.equal(wantsAi({ ai: false, aiAuto: true }), false);
+    assert.equal(wantsAi({ ai: undefined, aiAuto: true }), true);
+    assert.equal(wantsAi({ ai: true, aiAuto: false }), true);
+    assert.equal(wantsAi({ ai: undefined, aiAuto: false }), false);
+    assert.equal(wantsAi({ ai: false, aiAuto: false }), false);
+});

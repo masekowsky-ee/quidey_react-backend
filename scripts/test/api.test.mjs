@@ -3450,6 +3450,12 @@ describe("study goals", () => {
         assert.equal((await call("GET", `${S}/subjects`, null, plain.token)).data.code, "TESTER_REQUIRED");
     });
 
+    test("study routes count against the overall /api rate limit", async () => {
+        const res = await fetch(`${API}${S}/subjects`, { headers: { Authorization: `Bearer ${tess.token}` } });
+        assert.equal(res.status, 200);
+        assert.ok(res.headers.get("ratelimit-policy"), "the global limiter answered");
+    });
+
     test("subjects: create, duplicate names, patch, list with next goal", async () => {
         const sub = await newSubject(tess, "Mathe");
         assert.equal(sub.name, "Mathe");
@@ -3598,6 +3604,15 @@ describe("study goals", () => {
         }
         const goal = await newGoal(tess, sub.id);
         assert.equal((await call("DELETE", `${S}/goals/${goal.id}?sessions=maybe`, null, tess.token)).data.code, "invalid_input");
+    });
+
+    test("a kept session of a deleted goal is no longer pinned", async () => {
+        const sub = await newSubject(tess, "Musik");
+        const goal = await newGoal(tess, sub.id);
+        const kept = await session(tess, goal.parts[0].id, daysFromToday(3));
+        await sql("UPDATE tasks SET plan_pinned = true WHERE id = $1", [kept]);
+        assert.equal((await call("DELETE", `${S}/goals/${goal.id}?sessions=keep`, null, tess.token)).status, 200);
+        assert.deepEqual((await sql("SELECT goal_part_id, plan_pinned FROM tasks WHERE id = $1", [kept]))[0], { goal_part_id: null, plan_pinned: false });
     });
 
     test("deleting a subject removes its goals and their future sessions", async () => {
@@ -3928,6 +3943,63 @@ describe("study plan", () => {
         assert.equal((await sql("SELECT freed_minutes FROM goals WHERE id = $1", [g.id]))[0].freed_minutes, 0);
     });
 
+    test("apply detaches a missed session that carries a note instead of deleting it (ruling 28)", async () => {
+        const me = await tester();
+        const g = await goal(me, (await subject(me)).id);
+        const noted = await session(me, g.parts[0].id, daysFromToday(-2), { pinned: true });
+        await sql("INSERT INTO notes (task_id, content) VALUES ($1, 'Formeln')", [noted]);
+        const plain = await session(me, g.parts[1].id, daysFromToday(-2));
+        await apply(me);
+        const [row] = await sql("SELECT goal_part_id, plan_pinned FROM tasks WHERE id = $1", [noted]);
+        assert.deepEqual(row, { goal_part_id: null, plan_pinned: false }, "kept as a plain task");
+        assert.equal((await sql("SELECT count(*)::int AS n FROM notes WHERE task_id = $1", [noted]))[0].n, 1, "the note survives");
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE id = $1", [plain]))[0].n, 0, "a plain missed session goes");
+    });
+
+    test("a goal whose due date is over is left out of preview, status and the subject's next goal", async () => {
+        const me = await tester();
+        const sub = await subject(me);
+        const past = await goal(me, sub.id, { name: "Vorbei" });
+        const missed = await session(me, past.parts[0].id, daysFromToday(-3));
+        await sql("UPDATE goals SET due = $2 WHERE id = $1", [past.id, daysFromToday(-1)]);
+        const p = await preview(me);
+        assert.deepEqual(p.goals, [], JSON.stringify(p));
+        assert.deepEqual(p.shortfall, {});
+        const st = (await call("GET", `${S}/status`, null, me.token)).data;
+        assert.deepEqual(st.goals, []);
+        const mine = (await call("GET", `${S}/subjects`, null, me.token)).data.find(s => s.id === sub.id);
+        assert.equal(mine.nextGoal, null);
+        await apply(me);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE id = $1", [missed]))[0].n, 1, "its history stays");
+        // due today still counts
+        const today = await goal(me, sub.id, { name: "Heute", due: daysFromToday(1) });
+        await sql("UPDATE goals SET due = $2 WHERE id = $1", [today.id, daysFromToday(0)]);
+        assert.deepEqual((await preview(me)).goals.map(x => x.goalId), [today.id]);
+        const g = (await call("GET", `${S}/goals/${past.id}`, null, me.token)).data;
+        assert.equal(g.parts.length, 3, "the goal itself is still there");
+    });
+
+    test("a new subject colour recolours that subject's planned sessions", async () => {
+        const me = await tester();
+        const sub = await subject(me);
+        const other = await subject(me, "Andere", { color: "blue" });
+        await goal(me, sub.id);
+        await goal(me, other.id, { name: "Fremd" });
+        await apply(me);
+        const r = await call("PATCH", `${S}/subjects/${sub.id}`, { color: "pink" }, me.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        const rows = await sql(
+            `SELECT tasks.color, goals.subject_id FROM tasks JOIN goal_parts ON goal_parts.id = tasks.goal_part_id
+            JOIN goals ON goals.id = goal_parts.goal_id WHERE tasks.user_id = $1`, [me.id]);
+        assert.ok(rows.length >= 12);
+        for (const row of rows) assert.equal(row.color, row.subject_id === sub.id ? "pink" : "blue");
+        assert.equal((await call("PATCH", `${S}/subjects/${sub.id}`, { color: null }, me.token)).status, 200);
+        const cleared = await sql(
+            `SELECT tasks.color FROM tasks JOIN goal_parts ON goal_parts.id = tasks.goal_part_id
+            JOIN goals ON goals.id = goal_parts.goal_id WHERE goals.subject_id = $1`, [sub.id]);
+        assert.ok(cleared.every(x => x.color === null));
+    });
+
     test("slots: timed events (with repeats) and timed tasks are busy", async () => {
         const me = await tester();
         const windows = [1, 2, 3, 4, 5, 6, 7].map(weekday => ({ weekday, start: "16:00", end: "18:00" }));
@@ -4248,6 +4320,11 @@ describe("study status and estimates", () => {
         const fresh = await tester();
         r = await estimate(fresh, { parts: ["x"], kind: "presentation", ai: true });
         assert.deepEqual(r.data, { estimates: [{ minutes: 90, source: "default" }], aiUsed: false, aiFailed: false }, "no key: no AI, not a failure");
+
+        await sql("UPDATE users SET study_ai_auto = true WHERE id = $1", [fresh.id]);
+        r = await estimate(fresh, { parts: ["x"], kind: "presentation", ai: false });
+        assert.deepEqual(r.data, { estimates: [{ minutes: 90, source: "default" }], aiUsed: false, aiFailed: false }, "ai:false with aiAuto: no AI");
+        assert.equal((await estimate(fresh, { ai: "no" })).data.code, "invalid_input", "ai is a boolean");
     });
 
     test("estimate: input checks", async () => {

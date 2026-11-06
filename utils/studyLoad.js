@@ -146,12 +146,17 @@ async function loadBusy(db, userId, today, until, activePartIds) {
 }
 
 // The goals that are planned (and watched for push/status): status 'active' in a subject that is not
-// archived (spec §1: archiving hides a subject and everything in it; controller ruling 17).
-// ACTIVE_GOAL_SQL is the same rule for queries on `goals` with the user in $1.
+// archived (spec §1: archiving hides a subject and everything in it; controller ruling 17), whose due
+// date is not over (`today` in the user's timezone; a goal due before today has ended, ruling 29: its
+// parts and sessions stay for the history estimates).
+// ACTIVE_GOAL_SQL is the status + archive part of the rule for queries on `goals` with the user in $1
+// (locks and "Jetzt lernen", which answers a past due date with its own code).
 const ACTIVE_GOAL_SQL = `goals.status = 'active'
     AND goals.subject_id IN (SELECT id FROM subjects WHERE subjects.user_id = $1 AND NOT subjects.archived)`;
-async function loadActiveGoals(db, userId) {
-    return (await loadGoals(db, userId)).filter((g) => g.goal.status === 'active' && !g.goal.subjectArchived);
+const isEnded = (goal, today) => goal.due < today;
+const isPlanned = (goal, today) => goal.status === 'active' && !goal.subjectArchived && !isEnded(goal, today);
+async function loadActiveGoals(db, userId, today) {
+    return (await loadGoals(db, userId)).filter((g) => isPlanned(g.goal, today));
 }
 
 // Everything the planner needs for one user, read in their timezone (spec §2, §3):
@@ -162,7 +167,7 @@ async function loadActiveGoals(db, userId) {
 // `kept`, pending when nothing is credited yet (controller ruling 12; the planner deducts it).
 async function loadPlanInput(db, userId, now = new Date()) {
     const clock = await getClock(db, userId, now);
-    const goals = await loadActiveGoals(db, userId);
+    const goals = await loadActiveGoals(db, userId, clock.today);
     const windows = (await db.query(
         `SELECT weekday, to_char(start_time, 'HH24:MI') AS start, to_char(end_time, 'HH24:MI') AS "end"
         FROM study_windows WHERE user_id = $1 ORDER BY weekday, start_time, end_time, id`,
@@ -233,5 +238,5 @@ function inputHash(input, extra = {}) {
 
 module.exports = {
     getClock, loadSessions, loadGoals, partView, goalView, goalProgress,
-    ACTIVE_GOAL_SQL, loadActiveGoals, loadPlanInput, statusOf, inputHash,
+    ACTIVE_GOAL_SQL, isEnded, isPlanned, loadActiveGoals, loadPlanInput, statusOf, inputHash,
 };

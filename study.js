@@ -6,11 +6,11 @@ const express = require('express');
 const { rateLimit } = require('express-rate-limit');
 const { sessionCredit, isPending, isReplaceable, goalStatus } = require('./utils/studyStatus');
 const {
-    reviewMinutes, makeAiClient, estimateParts, askAi, aiModel, pageCount,
+    reviewMinutes, makeAiClient, estimateParts, askAi, aiModel, pageCount, wantsAi,
 } = require('./utils/studyEstimate');
 const { plan } = require('./utils/studyPlanner');
 const {
-    getClock, loadSessions, loadGoals, goalView, goalProgress, loadPlanInput, statusOf, inputHash, ACTIVE_GOAL_SQL,
+    getClock, loadSessions, loadGoals, goalView, goalProgress, loadPlanInput, statusOf, inputHash, ACTIVE_GOAL_SQL, isEnded,
 } = require('./utils/studyLoad');
 
 const COLORS = ['red', 'orange', 'yellow', 'green', 'teal', 'blue', 'violet', 'pink'];
@@ -52,6 +52,13 @@ function cleanEmoji(value) {
     if (typeof value !== 'string' || value.includes('\u0000') || value.length > 16) return undefined;
     return value;
 }
+
+// Something of the user's hangs on the task (a note, a group, a collection, a share): a replan never
+// deletes such a session, it is kept (rulings 19, 28). For queries on `tasks`.
+const ATTACHED = `(EXISTS (SELECT 1 FROM notes WHERE notes.task_id = tasks.id)
+    OR EXISTS (SELECT 1 FROM task_groups WHERE task_groups.task_id = tasks.id)
+    OR EXISTS (SELECT 1 FROM collection_items WHERE collection_items.task_id = tasks.id)
+    OR EXISTS (SELECT 1 FROM task_shares WHERE task_shares.task_id = tasks.id))`;
 
 // Thrown inside inTransaction to roll back and hand `value` to the caller instead of an error.
 class Rollback {
@@ -123,6 +130,13 @@ module.exports = ({ pool, realtime, loadTask }) => {
         return sessions.filter((s) => isPending(s, clock)).map((s) => s.taskId);
     }
 
+    // Sessions that are about to lose their goal (goal_part_id -> null) are plain tasks from then on:
+    // nothing to give back to the planner, so not pinned any more.
+    async function unpinParts(db, userId, partIds) {
+        if (!partIds.length) return;
+        await db.query('UPDATE tasks SET plan_pinned = false WHERE user_id = $1 AND goal_part_id = ANY($2::int[]) AND plan_pinned', [userId, partIds]);
+    }
+
     async function ownedSubject(db, userId, id) {
         if (id == null) return null;
         return (await db.query('SELECT * FROM subjects WHERE id = $1 AND user_id = $2', [id, userId])).rows[0] || null;
@@ -161,7 +175,8 @@ module.exports = ({ pool, realtime, loadTask }) => {
             'SELECT * FROM subjects WHERE user_id = $1 ORDER BY archived, lower(name), id', [userId]
         )).rows;
         const clock = await getClock(pool, userId);
-        const goals = (await loadGoals(pool, userId)).filter((g) => g.goal.status === 'active'); // sorted by due
+        // sorted by due; a goal whose day is over has ended (ruling 29)
+        const goals = (await loadGoals(pool, userId)).filter((g) => g.goal.status === 'active' && !isEnded(g.goal, clock.today));
         res.json(subjects.map((s) => {
             const next = goals.find((g) => g.goal.subjectId === s.id);
             return subjectView(s, next ? {
@@ -217,16 +232,31 @@ module.exports = ({ pool, realtime, loadTask }) => {
         if (field) return invalid(res, field);
         const keys = Object.keys(values);
         if (keys.length === 0) return invalid(res, 'body');
+        const recolour = values.color !== undefined;
+        let row;
         try {
-            const row = (await pool.query(
-                `UPDATE subjects SET ${keys.map((k, i) => `${k} = $${i + 3}`).join(', ')} WHERE id = $1 AND user_id = $2 RETURNING *`,
-                [id, userId, ...keys.map((k) => values[k])]
-            )).rows[0];
-            res.json(subjectView(row));
+            row = await inTransaction(async (client) => {
+                const saved = (await client.query(
+                    `UPDATE subjects SET ${keys.map((k, i) => `${k} = $${i + 3}`).join(', ')} WHERE id = $1 AND user_id = $2 RETURNING *`,
+                    [id, userId, ...keys.map((k) => values[k])]
+                )).rows[0];
+                if (recolour) {
+                    // its planned sessions take the new colour (ruling 29); goals before tasks, like POST /replan
+                    await client.query('SELECT id FROM goals WHERE subject_id = $1 AND user_id = $2 ORDER BY id FOR UPDATE', [id, userId]);
+                    await client.query(
+                        `UPDATE tasks SET color = $3 WHERE user_id = $2 AND goal_part_id IN (SELECT goal_parts.id FROM goal_parts
+                            JOIN goals ON goals.id = goal_parts.goal_id WHERE goals.subject_id = $1 AND goals.user_id = $2)`,
+                        [id, userId, values.color]
+                    );
+                }
+                return saved;
+            });
         } catch (err) {
             if (err.code === '23505') return fail(res, 400, 'subject_exists', 'A subject with this name exists');
             throw err;
         }
+        if (recolour) changed(userId);
+        res.json(subjectView(row));
     });
 
     router.delete('/subjects/:id', async (req, res) => {
@@ -246,6 +276,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
             )).rows.map((r) => r.id);
             const taskIds = await pendingTaskIds(client, userId, partIds, clock);
             if (taskIds.length) removed = (await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [taskIds, userId])).rowCount;
+            await unpinParts(client, userId, partIds); // what stays is a plain task now
             await client.query('DELETE FROM subjects WHERE id = $1 AND user_id = $2', [id, userId]);
             await client.query('COMMIT');
         } catch (err) {
@@ -405,11 +436,12 @@ module.exports = ({ pool, realtime, loadTask }) => {
         await inTransaction(async (client) => {
             // the goal before its tasks, in the same order as POST /replan (no deadlock between them)
             await client.query('SELECT id FROM goals WHERE id = $1 AND user_id = $2 FOR UPDATE', [id, userId]);
+            const partIds = (await client.query('SELECT id FROM goal_parts WHERE goal_id = $1', [id])).rows.map((r) => r.id);
             if (mode === 'delete') {
-                const partIds = (await client.query('SELECT id FROM goal_parts WHERE goal_id = $1', [id])).rows.map((r) => r.id);
                 const doomed = await pendingTaskIds(client, userId, partIds, await getClock(client, userId));
                 if (doomed.length) removed = (await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [doomed, userId])).rowCount;
             }
+            await unpinParts(client, userId, partIds);
             await client.query('DELETE FROM goals WHERE id = $1 AND user_id = $2', [id, userId]); // parts go, tasks keep (goal_part_id -> null)
         });
         changed(userId);
@@ -483,10 +515,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
             `DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2 AND goal_part_id IS NOT NULL
                 AND NOT COALESCE(done, false) AND NOT COALESCE(plan_pinned, false)
                 AND NOT EXISTS (SELECT 1 FROM session_tasks WHERE session_tasks.task_id = tasks.id AND session_tasks.time_ms > 0)
-                AND NOT EXISTS (SELECT 1 FROM notes WHERE notes.task_id = tasks.id)
-                AND NOT EXISTS (SELECT 1 FROM task_groups WHERE task_groups.task_id = tasks.id)
-                AND NOT EXISTS (SELECT 1 FROM collection_items WHERE collection_items.task_id = tasks.id)
-                AND NOT EXISTS (SELECT 1 FROM task_shares WHERE task_shares.task_id = tasks.id)
+                AND NOT ${ATTACHED}
             RETURNING id, duration_minutes`,
             [ids, userId]
         )).rows;
@@ -572,6 +601,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
             if (!part) return false;
             const doomed = await pendingTaskIds(client, userId, [partId], await getClock(client, userId)); // past ones stay as plain tasks
             if (doomed.length) removed = (await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [doomed, userId])).rowCount;
+            await unpinParts(client, userId, [partId]);
             await client.query('DELETE FROM goal_parts WHERE id = $1', [partId]);
             return true;
         });
@@ -736,7 +766,14 @@ module.exports = ({ pool, realtime, loadTask }) => {
 
                 const gone = current.sessions.filter((s) => s.status !== 'kept').map((s) => s.taskId);
                 if (gone.length) {
-                    await client.query(`DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2 AND ${MY_SESSION}`, [gone, userId]);
+                    // a missed session with a note, group, collection or share is kept as a plain task, the
+                    // rest goes (ruling 28; a replaceable one with an attachment is already 'kept')
+                    await client.query(
+                        `UPDATE tasks SET goal_part_id = NULL, plan_pinned = false
+                        WHERE id = ANY($1::int[]) AND user_id = $2 AND ${MY_SESSION} AND ${ATTACHED}`,
+                        [gone, userId]
+                    );
+                    await client.query(`DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2 AND ${MY_SESSION} AND NOT ${ATTACHED}`, [gone, userId]);
                 }
                 const colors = new Map((await client.query(
                     'SELECT id, color FROM subjects WHERE user_id = $1', [userId]
@@ -886,6 +923,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         if (!Array.isArray(body.parts) || body.parts.length < 1 || body.parts.length > MAX_PARTS) return invalid(res, 'parts');
         const parts = body.parts.map((p) => cleanName(p, 200));
         if (parts.includes(null)) return invalid(res, 'parts');
+        if (body.ai != null && typeof body.ai !== 'boolean') return invalid(res, 'ai');
         let subjectId = null;
         if (body.subjectId != null) {
             subjectId = idParam(body.subjectId);
@@ -912,7 +950,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         let estimates = estimateParts({ parts: named, kind: body.kind, history });
 
         const clock = await getClock(pool, userId);
-        const client = body.ai === true || clock.aiAuto ? makeAiClient() : null;
+        const client = wantsAi({ ai: body.ai ?? undefined, aiAuto: clock.aiAuto }) ? makeAiClient() : null;
         const open = estimates.flatMap((e, i) => (e.source === 'default' ? [i] : [])); // only what nothing else could estimate
         let aiUsed = false;
         let aiFailed = false;

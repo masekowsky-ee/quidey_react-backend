@@ -131,4 +131,11 @@ function makeAiClient() {
     return new Ctor({ apiKey: process.env.ANTHROPIC_API_KEY, maxRetries: 0 });
 }
 
-module.exports = { pageCount, estimateParts, reviewMinutes, askAi, makeAiClient, aiModel, MAX_PARTS };
+// Whether a request may ask the AI: `ai: true` always, the setting "automatisch" (aiAuto) unless the
+// request says `ai: false` (the app's debounced runs while typing, controller ruling 32).
+function wantsAi({ ai, aiAuto }) {
+    if (ai === false) return false;
+    return ai === true || !!aiAuto;
+}
+
+module.exports = { pageCount, estimateParts, reviewMinutes, askAi, makeAiClient, aiModel, wantsAi, MAX_PARTS };
