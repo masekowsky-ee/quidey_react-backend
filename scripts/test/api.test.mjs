@@ -4160,8 +4160,53 @@ describe("study status and estimates", () => {
         assert.deepEqual(s.notifiedMinutes, { [g.id]: 0 });
         assert.equal((await sql("SELECT id FROM tasks WHERE goal_part_id = $1 AND NOT done", [a])).length, 0);
         assert.equal((await status(me)).goals[0].freedMinutes, 45, "not counted twice");
+        await sql("UPDATE goals SET behind_notified_minutes = 90 WHERE id = $1", [g.id]);
         await apply(me);
         assert.equal((await status(me)).goals[0].freedMinutes, 0);
+        assert.deepEqual((await status(me)).notifiedMinutes, { [g.id]: 0 }, "a fresh plan starts clean");
+    });
+
+    test("GET /status frees only sessions that are still plain: pinned and noted ones stay", async () => {
+        const me = await tester();
+        const g = await goal(me, (await subject(me)).id);
+        await apply(me);
+        const a = g.parts[0].id;
+        const [plainId] = (await sql("SELECT id FROM tasks WHERE goal_part_id = $1", [a])).map(r => r.id);
+        const pinnedId = await session(me, a, daysFromToday(2));
+        await sql("UPDATE tasks SET plan_pinned = true WHERE id = $1", [pinnedId]);
+        const notedId = await session(me, a, daysFromToday(3));
+        await sql("INSERT INTO notes (task_id, content) VALUES ($1, 'wichtig')", [notedId]);
+        await session(me, a, daysFromToday(0), { done: true });
+        const s = await status(me);
+        assert.equal(s.goals[0].freedMinutes, 45, "only the plain session counts");
+        const left = (await sql("SELECT id FROM tasks WHERE goal_part_id = $1 AND NOT done ORDER BY id", [a])).map(r => r.id);
+        assert.deepEqual(left, [pinnedId, notedId]);
+        assert.ok(!left.includes(plainId));
+        assert.equal((await sql("SELECT count(*)::int AS n FROM notes WHERE task_id = $1", [notedId]))[0].n, 1);
+    });
+
+    test("GET /status does not delete a session that was ticked off after it was read", async () => {
+        const me = await tester();
+        const g = await goal(me, (await subject(me)).id);
+        await apply(me);
+        const a = g.parts[0].id;
+        const [plainId] = (await sql("SELECT id FROM tasks WHERE goal_part_id = $1", [a])).map(r => r.id);
+        await session(me, a, daysFromToday(0), { done: true });
+        const phone = new pg.Client(conn(DB));
+        await phone.connect();
+        try {
+            await phone.query("BEGIN");
+            await phone.query("UPDATE tasks SET done = true WHERE id = $1", [plainId]); // not committed: the read still sees it open
+            const pending = status(me);
+            await sleep(600); // the request has read the old state and waits on the row lock
+            await phone.query("COMMIT");
+            const s = await pending;
+            assert.equal(s.goals[0].freedMinutes, 0);
+        } finally {
+            await phone.end();
+        }
+        const row = (await sql("SELECT done FROM tasks WHERE id = $1", [plainId]))[0];
+        assert.ok(row && row.done, "the ticked-off session is still there");
     });
 
     test("behind after a missed session, 'So lassen' hides it until it grows", async () => {

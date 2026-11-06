@@ -472,6 +472,26 @@ module.exports = ({ pool, realtime, loadTask }) => {
         res.status(201).json(await partDetail(userId, goalId, partId));
     });
 
+    const sumMinutes = (rows) => rows.reduce((sum, r) => sum + (r.duration_minutes ?? 0), 0);
+
+    // Deletes only the sessions that are still replaceable at delete time (the caller classified them
+    // from an earlier read; the phone may have ticked, pinned or annotated one since, and PUT /api/tasks
+    // takes no goal lock). Returns the rows really deleted: [{ id, duration_minutes }].
+    async function deleteReplaceable(client, userId, ids) {
+        if (!ids.length) return [];
+        return (await client.query(
+            `DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2 AND goal_part_id IS NOT NULL
+                AND NOT COALESCE(done, false) AND NOT COALESCE(plan_pinned, false)
+                AND NOT EXISTS (SELECT 1 FROM session_tasks WHERE session_tasks.task_id = tasks.id AND session_tasks.time_ms > 0)
+                AND NOT EXISTS (SELECT 1 FROM notes WHERE notes.task_id = tasks.id)
+                AND NOT EXISTS (SELECT 1 FROM task_groups WHERE task_groups.task_id = tasks.id)
+                AND NOT EXISTS (SELECT 1 FROM collection_items WHERE collection_items.task_id = tasks.id)
+                AND NOT EXISTS (SELECT 1 FROM task_shares WHERE task_shares.task_id = tasks.id)
+            RETURNING id, duration_minutes`,
+            [ids, userId]
+        )).rows;
+    }
+
     // Locks the goal of one of my parts: goal before parts and tasks, the order POST /replan uses.
     async function lockGoalOfPart(client, userId, partId) {
         await client.query(
@@ -490,9 +510,9 @@ module.exports = ({ pool, realtime, loadTask }) => {
         const gone = sessions.filter((s) => isReplaceable(s, clock));
         await client.query('UPDATE goal_parts SET done_at = now(), actual_minutes = $2 WHERE id = $1', [part.id, credit]);
         if (!gone.length) return 0;
-        const removed = (await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [gone.map((s) => s.taskId), userId])).rowCount;
-        await client.query('UPDATE goals SET freed_minutes = freed_minutes + $2 WHERE id = $1', [part.goal_id, gone.reduce((sum, s) => sum + s.minutes, 0)]);
-        return removed;
+        const deleted = await deleteReplaceable(client, userId, gone.map((s) => s.taskId));
+        if (deleted.length) await client.query('UPDATE goals SET freed_minutes = freed_minutes + $2 WHERE id = $1', [part.goal_id, sumMinutes(deleted)]);
+        return deleted.length;
     }
 
     router.patch('/parts/:id', async (req, res) => {
@@ -734,7 +754,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
                     );
                 }
                 // only the goals just planned (goals of an archived subject keep theirs)
-                await client.query('UPDATE goals SET freed_minutes = 0 WHERE user_id = $1 AND id = ANY($2::int[])', [userId, current.goals.map((g) => g.goal.id)]);
+                await client.query('UPDATE goals SET freed_minutes = 0, behind_notified_minutes = 0 WHERE user_id = $1 AND id = ANY($2::int[])', [userId, current.goals.map((g) => g.goal.id)]);
                 return { ok: true };
             });
         } catch (err) {
@@ -800,9 +820,9 @@ module.exports = ({ pool, realtime, loadTask }) => {
                 const open = new Set(fresh.parts.filter((p) => !p.doneAt).map((p) => p.id));
                 const gone = fresh.sessions.filter((s) => aheadPartIds.includes(s.partId) && open.has(s.partId) && isReplaceable(s, clock));
                 if (!gone.length) return 0;
-                await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [gone.map((s) => s.taskId), userId]);
-                await client.query('UPDATE goals SET freed_minutes = freed_minutes + $2 WHERE id = $1', [id, gone.reduce((sum, s) => sum + s.minutes, 0)]);
-                return gone.length;
+                const deleted = await deleteReplaceable(client, userId, gone.map((s) => s.taskId));
+                if (deleted.length) await client.query('UPDATE goals SET freed_minutes = freed_minutes + $2 WHERE id = $1', [id, sumMinutes(deleted)]);
+                return deleted.length;
             });
         }
         return deleted;
