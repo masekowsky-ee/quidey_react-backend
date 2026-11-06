@@ -10,7 +10,7 @@ const {
 } = require('./utils/studyEstimate');
 const { plan } = require('./utils/studyPlanner');
 const {
-    getClock, loadSessions, loadGoals, goalView, goalProgress, loadPlanInput, inputHash, ACTIVE_GOAL_SQL,
+    getClock, loadSessions, loadGoals, goalView, goalProgress, loadPlanInput, statusOf, inputHash, ACTIVE_GOAL_SQL,
 } = require('./utils/studyLoad');
 
 const COLORS = ['red', 'orange', 'yellow', 'green', 'teal', 'blue', 'violet', 'pink'];
@@ -826,10 +826,6 @@ module.exports = ({ pool, realtime, loadTask }) => {
             });
         }
         return deleted;
-    }
-
-    function statusOf({ goals, clock, input }) {
-        return goals.map((g) => ({ g, status: goalStatus({ ...g, busy: input.busy }, clock) }));
     }
 
     router.get('/status', async (req, res) => {

@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import net from "node:net";
+import { createRequire } from "node:module";
 import pg from "pg";
 import dotenv from "dotenv";
 import { io } from "socket.io-client";
@@ -2395,9 +2396,9 @@ describe("push notifications", () => {
         assert.equal((await call("PUT", "/api/push/subscription", device(1))).status, 401);
 
         const fresh = await call("PUT", "/api/push/subscription", device(1), pia.token);
-        assert.deepEqual(fresh.data.kinds, { plan: true, digest: true, messages: true, social: true, groups: true });
+        assert.deepEqual(fresh.data.kinds, { plan: true, digest: true, messages: true, social: true, groups: true, study: true });
         const changed = await call("PUT", "/api/push/subscription", { ...device(1), kinds: { digest: false } }, pia.token);
-        assert.deepEqual(changed.data.kinds, { plan: true, digest: false, messages: true, social: true, groups: true });
+        assert.deepEqual(changed.data.kinds, { plan: true, digest: false, messages: true, social: true, groups: true, study: true });
         const again = await call("PUT", "/api/push/subscription", device(1), pia.token);
         assert.equal(again.data.kinds.digest, false, "kinds not sent stay");
         assert.equal((await sql("SELECT count(*)::int AS n FROM push_subscriptions WHERE endpoint = $1", [device(1).endpoint]))[0].n, 1);
@@ -3240,7 +3241,7 @@ describe("Android app: push through Firebase", () => {
         assert.equal((await call("PUT", "/api/push/subscription", { endpoint: "fcm:short" }, ana.token)).data.field, "endpoint");
         const saved = await call("PUT", "/api/push/subscription", { endpoint: `fcm:${token}` }, ana.token);
         assert.equal(saved.status, 200);
-        assert.deepEqual(saved.data.kinds, { plan: true, digest: true, messages: true, social: true, groups: true });
+        assert.deepEqual(saved.data.kinds, { plan: true, digest: true, messages: true, social: true, groups: true, study: true });
         assert.equal((await call("POST", "/api/push/test", { endpoint: `fcm:${token}` }, ana.token)).data.sent, true);
         const line = `[DEV] Push to user ${ana.id} (plan, app): Quidey`;
         for (let i = 0; i < 20 && !log.includes(line); i++) await sleep(50);
@@ -4261,5 +4262,125 @@ describe("study status and estimates", () => {
             const r = await estimate(me, body);
             assert.deepEqual([r.status, r.data.code], [400, "invalid_input"], JSON.stringify(body));
         }
+    });
+});
+
+describe("study push (kind study)", () => {
+    const S = "/api/tester/study";
+    let count = 0;
+    let pool;
+    let pushStudyBehind;
+    let zone; // a time zone where it is night right now, so the server's own schedule never sends to these users
+    const lines = [];
+    const realLog = console.log;
+    const pushes = (user) => lines.filter(l => l.startsWith(`[DEV] Push to user ${user.id} (study): `));
+
+    before(async () => {
+        // the module sends for real when VAPID keys are set (.env): not here, it only logs
+        process.env.VAPID_PUBLIC_KEY = "";
+        process.env.VAPID_PRIVATE_KEY = "";
+        process.env.FIREBASE_SERVICE_ACCOUNT_FILE = "";
+        ({ pushStudyBehind } = createRequire(import.meta.url)("../../utils/push.js"));
+        pool = new pg.Pool(conn(DB));
+        const hour = new Date().getUTCHours();
+        const offset = (((3 - hour) % 24) + 36) % 24 - 12; // -12 … 11: the zone's local hour is 3 now
+        zone = offset === 0 ? "UTC" : `Etc/GMT${offset > 0 ? "-" : "+"}${Math.abs(offset)}`;
+        console.log = (...args) => { lines.push(args.join(" ")); };
+        // goals of the earlier tests would be notified too
+        await sql("UPDATE goals SET status = 'archived'");
+    });
+    after(async () => {
+        console.log = realLog;
+        await pool?.end();
+    });
+
+    const tester = async () => {
+        const user = await member(`studypush${++count}`);
+        await sql("UPDATE users SET is_tester = true, timezone = $2 WHERE id = $1", [user.id, zone]);
+        return user;
+    };
+    const today = async () => (await sql("SELECT to_char(now() AT TIME ZONE $1, 'YYYY-MM-DD') AS d", [zone]))[0].d;
+    const plusDays = async (day, n) => (await sql("SELECT to_char($1::date + $2::int, 'YYYY-MM-DD') AS d", [day, n]))[0].d;
+    // that day at hh:mm in the user's zone, as an instant
+    const at = async (day, time) => (await sql("SELECT (($1::date + $2::time) AT TIME ZONE $3) AS t", [day, time, zone]))[0].t;
+    const makeGoal = async (user) => {
+        const subject = (await call("POST", `${S}/subjects`, { name: "Mathe", color: "blue" }, user.token)).data;
+        const r = await call("POST", `${S}/goals`, {
+            subjectId: subject.id, kind: "assignment", name: "Hausarbeit", due: await plusDays(await today(), 10), planMode: "days",
+            parts: [{ name: "A", estimateMinutes: 45 }, { name: "B", estimateMinutes: 90 }],
+        }, user.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        return (await call("GET", `${S}/goals/${r.data.id}`, null, user.token)).data;
+    };
+    const missed = async (user, partId, due) => sql(
+        `INSERT INTO tasks (name, kind, user_id, due, duration_minutes, goal_part_id, done, plan_pinned)
+        VALUES ('S', 'task', $1, $2, 45, $3, false, false)`, [user.id, due, partId]);
+    const device = async (user, n, kinds) => {
+        const r = await call("PUT", "/api/push/subscription", { endpoint: `https://push.example.com/send/study-${user.id}-${n}`, keys: { p256dh: `BKeyS${user.id}${n}`, auth: `authS${user.id}${n}` }, kinds }, user.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        return r.data;
+    };
+
+    test("PUT /api/push/subscription accepts kinds.study", async () => {
+        const me = await tester();
+        const on = await device(me, 1, { study: false });
+        assert.equal(on.kinds.study, false);
+        assert.equal((await device(me, 1, { study: true })).kinds.study, true);
+        assert.equal((await sql("SELECT study FROM push_subscriptions WHERE user_id = $1", [me.id]))[0].study, true);
+    });
+
+    test("one push a day at 09:00 for a missed session, none at 07:30, a new one when the deficit grew by a session", async () => {
+        const me = await tester();
+        const g = await makeGoal(me);
+        await device(me, 1);
+        const day = await today();
+        await missed(me, g.parts[0].id, await plusDays(day, -1));
+
+        assert.equal(await pushStudyBehind(pool, await at(day, "07:30")), 0, "too early");
+        assert.equal(pushes(me).length, 0);
+
+        assert.equal(await pushStudyBehind(pool, await at(day, "09:00")), 1);
+        assert.equal(pushes(me).length, 1);
+        assert.match(pushes(me)[0], /Hausarbeit liegt 0,8 h zurück/);
+        const row = (await sql("SELECT behind_notified_minutes, to_char(behind_notified_on, 'YYYY-MM-DD') AS on FROM goals WHERE id = $1", [g.id]))[0];
+        assert.deepEqual(row, { behind_notified_minutes: 45, on: day });
+
+        assert.equal(await pushStudyBehind(pool, await at(day, "10:00")), 0, "once a day");
+        assert.equal(await pushStudyBehind(pool, await at(await plusDays(day, 1), "09:00")), 0, "same deficit as notified");
+        assert.equal(pushes(me).length, 1);
+
+        await missed(me, g.parts[1].id, day); // over by tomorrow: one more session behind
+        assert.equal(await pushStudyBehind(pool, await at(await plusDays(day, 1), "19:00")), 0, "not after 19:00");
+        assert.equal(await pushStudyBehind(pool, await at(await plusDays(day, 1), "09:00")), 1);
+        assert.equal(pushes(me).length, 2);
+        assert.equal((await sql("SELECT behind_notified_minutes FROM goals WHERE id = $1", [g.id]))[0].behind_notified_minutes, 90);
+    });
+
+    test("a goal that is not behind is reset to 0", async () => {
+        const me = await tester();
+        const g = await makeGoal(me);
+        await device(me, 1);
+        await sql("UPDATE goals SET behind_notified_minutes = 45 WHERE id = $1", [g.id]);
+        assert.equal(await pushStudyBehind(pool, await at(await today(), "09:00")), 0);
+        assert.equal((await sql("SELECT behind_notified_minutes FROM goals WHERE id = $1", [g.id]))[0].behind_notified_minutes, 0);
+        assert.equal(pushes(me).length, 0);
+    });
+
+    test("nothing for a device with study off, nor for an account that is not a tester", async () => {
+        const off = await tester();
+        const goalOff = await makeGoal(off);
+        await device(off, 1, { study: false });
+        await missed(off, goalOff.parts[0].id, await plusDays(await today(), -1));
+
+        const plain = await tester();
+        const goalPlain = await makeGoal(plain);
+        await device(plain, 1);
+        await missed(plain, goalPlain.parts[0].id, await plusDays(await today(), -1));
+        await sql("UPDATE users SET is_tester = false WHERE id = $1", [plain.id]);
+
+        await pushStudyBehind(pool, await at(await today(), "09:00"));
+        assert.equal(pushes(off).length, 0);
+        assert.equal(pushes(plain).length, 0);
+        assert.equal((await sql("SELECT behind_notified_minutes FROM goals WHERE id = $1", [goalOff.id]))[0].behind_notified_minutes, 0, "not marked: nothing was delivered");
     });
 });

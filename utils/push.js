@@ -16,6 +16,8 @@
 //   social    friend requests, invites, tasks shared with / given to me (in a session or a
 //             family), news from the team; for admins also new beta requests
 //   groups    somebody else added entries to a family / session I'm in; messages in their chats
+//   study     a study goal (exam, assignment, …) is behind its plan (testers only): at most one a day,
+//             08:00-19:00 in my time zone, see pushStudyBehind
 // "plan" also brings the reminders of my families' entries (to every joined member).
 // Only accounts with app access get anything (closed beta). A device the push service no longer
 // knows (404 / 410) is forgotten.
@@ -24,9 +26,11 @@
 // their messages through Firebase Cloud Messaging (utils/fcm.js, FIREBASE_SERVICE_ACCOUNT_FILE).
 
 const webpush = require("web-push");
-const { APP_ACCESS_SQL } = require("./access");
+const { APP_ACCESS_SQL, TESTER_ACCESS_SQL } = require("./access");
 const { DEFAULT_TIMEZONE } = require("./reminderMails");
 const { FCM_ENABLED, isFcmEndpoint, sendFcm } = require("./fcm");
+const { loadPlanInput, statusOf } = require("./studyLoad");
+const { shouldNotify, pushText } = require("./studyStatus");
 
 const PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 const PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
@@ -39,14 +43,14 @@ else if (process.env.NODE_ENV === "production") {
     console.warn("VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY are not set: no push notifications are sent. Make a pair with `npx web-push generate-vapid-keys`.");
 }
 
-const KINDS = ["plan", "digest", "messages", "social", "groups"];
+const KINDS = ["plan", "digest", "messages", "social", "groups", "study"];
 const MAX_DEVICES = 10;
 // a reminder more than this late (server was down, phone offline) isn't worth it any more
 const LATE_LIMIT = "1 hour";
 const DIGEST_FROM = "07:30";
 const DIGEST_UNTIL = "11:00";
 // how long the push service keeps a message for a phone that is offline (seconds)
-const TTL = { plan: 60 * 60, digest: 3 * 60 * 60, messages: 24 * 60 * 60, social: 24 * 60 * 60, groups: 24 * 60 * 60 };
+const TTL = { plan: 60 * 60, digest: 3 * 60 * 60, messages: 24 * 60 * 60, social: 24 * 60 * 60, groups: 24 * 60 * 60, study: 3 * 60 * 60 };
 
 // Where a group notice leads: a family's page or a session's
 const placeUrl = (place) => (place.kind === "family" ? `/family/${place.id}` : `/together/${place.id}`);
@@ -360,6 +364,57 @@ async function pushDigests(pool) {
     return picked.rows.length;
 }
 
+// Study goals that are behind their plan: at most one push per user and day, 08:00-19:00 in my time
+// zone (shouldNotify decides), and only when the deficit is new or grew by a whole session. One push
+// for all goals that qualify; their behind_notified_minutes / behind_notified_on are set when it went
+// out, a goal that is not behind any more is reset to 0. Testers with an active goal and a device that
+// wants "study". `now` is for the tests. Returns how many users were notified.
+async function pushStudyBehind(pool, now = new Date()) {
+    const users = await pool.query(
+        `SELECT users.id, users.language FROM users
+        WHERE ${TESTER_ACCESS_SQL}
+            AND EXISTS (SELECT 1 FROM goals WHERE goals.user_id = users.id AND goals.status = 'active')
+            AND EXISTS (SELECT 1 FROM push_subscriptions WHERE push_subscriptions.user_id = users.id AND push_subscriptions.study)`
+    );
+    let notified = 0;
+    for (const user of users.rows) {
+        try {
+            const loaded = await loadPlanInput(pool, user.id, now);
+            const { today, nowMinutes, sessionMinutes } = loaded.clock;
+            const marks = new Map((await pool.query(
+                "SELECT id, behind_notified_minutes, behind_notified_on = $2::date AS today FROM goals WHERE user_id = $1",
+                [user.id, today]
+            )).rows.map((row) => [row.id, row]));
+            const rows = statusOf(loaded).map(({ g, status }) => ({
+                id: g.goal.id, name: g.goal.name, behindMinutes: status.behindMinutes,
+                notifiedMinutes: marks.get(g.goal.id)?.behind_notified_minutes ?? 0,
+            }));
+            const sentToday = rows.some((row) => marks.get(row.id)?.today);
+            const recovered = rows.filter((row) => row.behindMinutes === 0 && row.notifiedMinutes !== 0).map((row) => row.id);
+            if (recovered.length) {
+                await pool.query("UPDATE goals SET behind_notified_minutes = 0 WHERE user_id = $1 AND id = ANY($2::int[])", [user.id, recovered]);
+            }
+            const due = rows.filter((row) => shouldNotify({ deficit: row.behindMinutes, notifiedMinutes: row.notifiedMinutes, sentToday, nowMinutes, sessionMinutes }));
+            if (due.length === 0) continue;
+            const sent = await pushToUsers(pool, [user.id], "study", (language) => ({
+                ...pushText(due.map((row) => ({ name: row.name, behindMinutes: row.behindMinutes })), language),
+                url: "/study?replan=1", tag: "study",
+            }));
+            if (sent === 0) continue; // nowhere to deliver: try again later
+            for (const row of due) {
+                await pool.query(
+                    "UPDATE goals SET behind_notified_minutes = $3, behind_notified_on = $4::date WHERE id = $1 AND user_id = $2",
+                    [row.id, user.id, row.behindMinutes, today]
+                );
+            }
+            notified++;
+        } catch (err) {
+            console.error(`Study push for user ${user.id} failed:`, err);
+        }
+    }
+    return notified;
+}
+
 // Checks every `everyMs` (first check right away); returns a function that stops it
 function startPushSchedule(pool, everyMs = 60 * 1000) {
     let running = false;
@@ -370,6 +425,7 @@ function startPushSchedule(pool, everyMs = 60 * 1000) {
             await pushDueEntries(pool);
             await pushFamilyEntries(pool);
             await pushDigests(pool);
+            await pushStudyBehind(pool);
         } catch (err) {
             console.error("Push check failed:", err);
         } finally {
@@ -384,5 +440,5 @@ function startPushSchedule(pool, everyMs = 60 * 1000) {
 
 module.exports = {
     PUSH_ENABLED: ENABLED, PUSH_PUBLIC_KEY: PUBLIC_KEY, PUSH_FCM_ENABLED: FCM_ENABLED, PUSH_KINDS: KINDS, PUSH_MAX_DEVICES: MAX_DEVICES, PUSH_TEXTS: TEXTS,
-    pushToUsers, pushLater, deliver, startPushSchedule, pushDueEntries, pushFamilyEntries, pushDigests,
+    pushToUsers, pushLater, deliver, startPushSchedule, pushDueEntries, pushFamilyEntries, pushDigests, pushStudyBehind,
 };

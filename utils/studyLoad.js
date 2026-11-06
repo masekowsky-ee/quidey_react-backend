@@ -8,14 +8,14 @@ const { projectRepeats } = require('./repeats');
 
 const BUSY_DEFAULT_MINUTES = 60; // a timed item without a length
 
-// The user's settings and "now" in their timezone.
-async function getClock(db, userId) {
+// The user's settings and "now" in their timezone. `now` (a Date) is for tests and the push job.
+async function getClock(db, userId, now = new Date()) {
     const { rows } = await db.query(
         `SELECT to_char(local_now, 'YYYY-MM-DD') AS today,
             (extract(hour FROM local_now) * 60 + extract(minute FROM local_now))::int AS now_minutes,
             study_session_minutes, study_daily_max_minutes, study_ai_auto
-        FROM (SELECT *, now() AT TIME ZONE COALESCE(timezone, 'Europe/Berlin') AS local_now FROM users WHERE id = $1) u`,
-        [userId]
+        FROM (SELECT *, $2::timestamptz AT TIME ZONE COALESCE(timezone, 'Europe/Berlin') AS local_now FROM users WHERE id = $1) u`,
+        [userId, now]
     );
     const row = rows[0];
     return {
@@ -160,8 +160,8 @@ async function loadActiveGoals(db, userId) {
 // as loadGoals gives them. Missed sessions are left out of the planner (their minutes are in
 // `remaining`), replaceable ones too (the planner plans their minutes again); everything else is
 // `kept`, pending when nothing is credited yet (controller ruling 12; the planner deducts it).
-async function loadPlanInput(db, userId) {
-    const clock = await getClock(db, userId);
+async function loadPlanInput(db, userId, now = new Date()) {
+    const clock = await getClock(db, userId, now);
     const goals = await loadActiveGoals(db, userId);
     const windows = (await db.query(
         `SELECT weekday, to_char(start_time, 'HH24:MI') AS start, to_char(end_time, 'HH24:MI') AS "end"
@@ -204,6 +204,11 @@ async function loadPlanInput(db, userId) {
     return { input, sessions, goals, clock };
 }
 
+// goalStatus of every goal of a loadPlanInput() result: [{ g, status }] (GET /status and the study push).
+function statusOf({ goals, clock, input }) {
+    return goals.map((g) => ({ g, status: goalStatus({ ...g, busy: input.busy }, clock) }));
+}
+
 // JSON with object keys sorted and every array sorted by its items' own canonical text, so the
 // same data gives the same text whatever order it was read in (no array in a plan input or
 // result carries meaning in its order: parts have positions, sessions dates and times).
@@ -228,5 +233,5 @@ function inputHash(input, extra = {}) {
 
 module.exports = {
     getClock, loadSessions, loadGoals, partView, goalView, goalProgress,
-    ACTIVE_GOAL_SQL, loadActiveGoals, loadPlanInput, inputHash,
+    ACTIVE_GOAL_SQL, loadActiveGoals, loadPlanInput, statusOf, inputHash,
 };
