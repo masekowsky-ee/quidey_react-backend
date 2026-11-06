@@ -5,7 +5,10 @@
 const express = require('express');
 const { sessionCredit, isPending, isReplaceable } = require('./utils/studyStatus');
 const { reviewMinutes, makeAiClient } = require('./utils/studyEstimate');
-const { getClock, loadSessions, loadGoals, goalView, goalProgress } = require('./utils/studyLoad');
+const { plan } = require('./utils/studyPlanner');
+const {
+    getClock, loadSessions, loadGoals, goalView, goalProgress, loadPlanInput, inputHash,
+} = require('./utils/studyLoad');
 
 const COLORS = ['red', 'orange', 'yellow', 'green', 'teal', 'blue', 'violet', 'pink'];
 const KINDS = ['exam', 'assignment', 'presentation', 'other'];
@@ -47,7 +50,67 @@ function cleanEmoji(value) {
     return value;
 }
 
-module.exports = ({ pool, realtime }) => {
+// Thrown inside inTransaction to roll back and hand `value` to the caller instead of an error.
+class Rollback {
+    constructor(value) { this.value = value; }
+}
+
+// The planner refused its input (malformed date or minutes): answered with 400.
+class PlanInputError extends Error {}
+
+// Sessions in date order, untimed ones first on a day.
+const bySlot = (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0)
+    || (a.time != null) - (b.time != null)
+    || (a.time < b.time ? -1 : a.time > b.time ? 1 : 0)
+    || (a.taskId ?? 0) - (b.taskId ?? 0);
+const slot = (s) => ({ date: s.date, time: s.time ?? null });
+const toHHMM = (minutes) => `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
+
+// What applying would change, per goal (spec §3): each part's replaceable sessions are matched with
+// its new ones in date order. Same day and time: unchanged; otherwise moved; new ones left over are
+// new, old ones left over dropped. Missed sessions are dropped too.
+function previewOf(goals, sessions, result, hash) {
+    return {
+        inputHash: hash,
+        shortfall: result.shortfall,
+        goals: goals.map(({ goal, parts }) => {
+            const summary = { moved: 0, added: 0, dropped: 0, unchanged: 0 };
+            const changes = [];
+            for (const part of parts) {
+                const old = sessions.filter((s) => s.partId === part.id && s.status === 'replaceable').sort(bySlot);
+                const next = result.sessions.filter((s) => s.partId === part.id).sort(bySlot);
+                const partName = part.name;
+                for (let i = 0; i < Math.max(old.length, next.length); i++) {
+                    const from = old[i];
+                    const to = next[i];
+                    if (from && to) {
+                        if (from.date === to.date && (from.time ?? null) === (to.time ?? null)) {
+                            summary.unchanged++;
+                        } else {
+                            summary.moved++;
+                            changes.push({ type: 'moved', partName, from: slot(from), to: slot(to), minutes: to.minutes });
+                        }
+                    } else if (to) {
+                        summary.added++;
+                        changes.push({ type: 'new', partName, to: slot(to), minutes: to.minutes });
+                    } else {
+                        summary.dropped++;
+                        changes.push({ type: 'dropped', partName, from: slot(from), minutes: from.minutes });
+                    }
+                }
+                for (const s of sessions.filter((x) => x.partId === part.id && x.status === 'missed')) {
+                    summary.dropped++;
+                    changes.push({ type: 'dropped', partName, from: slot(s), minutes: s.minutes });
+                }
+            }
+            // by the day they are about: where a session goes, or where it was
+            changes.sort((a, b) => bySlot(a.to || a.from, b.to || b.from));
+            return { goalId: goal.id, name: goal.name, summary, changes };
+        }),
+    };
+}
+
+module.exports = ({ pool, realtime, loadTask }) => {
     const router = express.Router();
     const changed = (userId) => realtime.toUser(userId, 'tasks:changed', {});
 
@@ -71,7 +134,7 @@ module.exports = ({ pool, realtime }) => {
         id: row.id, name: row.name, emoji: row.emoji, color: row.color, archived: row.archived, nextGoal,
     });
 
-    // Runs fn(client) in one transaction.
+    // Runs fn(client) in one transaction. fn may throw a Rollback to undo everything and return its value.
     async function inTransaction(fn) {
         const client = await pool.connect();
         try {
@@ -81,6 +144,7 @@ module.exports = ({ pool, realtime }) => {
             return result;
         } catch (err) {
             await client.query('ROLLBACK').catch(() => {});
+            if (err instanceof Rollback) return err.value;
             throw err;
         } finally {
             client.release();
@@ -574,6 +638,129 @@ module.exports = ({ pool, realtime }) => {
             client.release();
         }
         res.json(await settingsView(userId));
+    });
+
+    // ---------- plan: preview, apply, "Jetzt lernen", unpin ----------
+    // The plan as applying it now would write it: the loaded input, the planner's result, its
+    // fingerprint and the preview.
+    async function currentPlan(db, userId) {
+        const loaded = await loadPlanInput(db, userId);
+        let result;
+        try {
+            result = plan(loaded.input);
+        } catch (err) {
+            if (err instanceof TypeError) throw new PlanInputError(err.message);
+            throw err;
+        }
+        const ids = (status) => loaded.sessions.filter((s) => s.status === status).map((s) => s.taskId).sort((a, b) => a - b);
+        const hash = inputHash(loaded.input, { replaceable: ids('replaceable'), missed: ids('missed'), result });
+        return { ...loaded, result, hash, preview: previewOf(loaded.goals, loaded.sessions, result, hash) };
+    }
+
+    const planInputFailed = (res, err) => {
+        if (!(err instanceof PlanInputError)) throw err;
+        return fail(res, 400, 'invalid_input', 'Invalid plan input');
+    };
+
+    // Only tasks that are sessions of my goals (spec §6: the planner writes nothing else).
+    const MY_SESSION = `goal_part_id IN (SELECT goal_parts.id FROM goal_parts
+        JOIN goals ON goals.id = goal_parts.goal_id WHERE goals.user_id = $2)`;
+
+    router.get('/plan', async (req, res) => {
+        try {
+            res.json((await currentPlan(pool, req.user.userId)).preview);
+        } catch (err) {
+            planInputFailed(res, err);
+        }
+    });
+
+    // All or nothing: the plan is computed again inside the transaction; when it is not the one
+    // the preview showed (inputHash), nothing changes and the fresh preview comes back with 409.
+    router.post('/replan', async (req, res) => {
+        const userId = req.user.userId;
+        const hash = req.body && req.body.inputHash;
+        if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) return invalid(res, 'inputHash');
+        let outcome;
+        try {
+            outcome = await inTransaction(async (client) => {
+                // two applies (or an apply and a goal edit) take turns; the sessions can't change under us
+                await client.query("SELECT id FROM goals WHERE user_id = $1 AND status = 'active' ORDER BY id FOR UPDATE", [userId]);
+                await client.query(
+                    `SELECT tasks.id FROM tasks
+                    JOIN goal_parts ON goal_parts.id = tasks.goal_part_id
+                    JOIN goals ON goals.id = goal_parts.goal_id
+                    WHERE tasks.user_id = $1 AND goals.user_id = $1 AND goals.status = 'active'
+                    ORDER BY tasks.id FOR UPDATE OF tasks`,
+                    [userId]
+                );
+                const current = await currentPlan(client, userId);
+                if (current.hash !== hash) throw new Rollback({ stale: current.preview });
+
+                const gone = current.sessions.filter((s) => s.status !== 'kept').map((s) => s.taskId);
+                if (gone.length) {
+                    await client.query(`DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2 AND ${MY_SESSION}`, [gone, userId]);
+                }
+                const colors = new Map((await client.query(
+                    'SELECT id, color FROM subjects WHERE user_id = $1', [userId]
+                )).rows.map((r) => [r.id, r.color]));
+                const parts = new Map(current.goals.flatMap(({ goal, parts: list }) => list.map((p) => [p.id, { name: p.name, color: colors.get(goal.subjectId) ?? null }])));
+                const rows = current.result.sessions.map((s) => ({ ...s, ...parts.get(s.partId) }));
+                if (rows.length) {
+                    await client.query(
+                        `INSERT INTO tasks (kind, user_id, name, color, due, due_time, duration_minutes, goal_part_id, plan_pinned, reminders)
+                        SELECT 'task', $1, name, color, due, due_time, minutes, part_id, false, '{}'
+                        FROM unnest($2::text[], $3::text[], $4::date[], $5::time[], $6::int[], $7::int[])
+                            AS s(name, color, due, due_time, minutes, part_id)`,
+                        [userId, rows.map((r) => r.name), rows.map((r) => r.color), rows.map((r) => r.date),
+                            rows.map((r) => r.time), rows.map((r) => r.minutes), rows.map((r) => r.partId)]
+                    );
+                }
+                await client.query("UPDATE goals SET freed_minutes = 0 WHERE user_id = $1 AND status = 'active'", [userId]);
+                return { ok: true };
+            });
+        } catch (err) {
+            return planInputFailed(res, err);
+        }
+        if (outcome.stale) return res.status(409).json({ error: 'The plan has changed', code: 'plan_changed', preview: outcome.stale });
+        changed(userId);
+        res.json({ ok: true });
+    });
+
+    // "Jetzt lernen": a pinned session of this part for now (slots: now rounded down to 5 minutes;
+    // days: today without a time), as long as the session length.
+    router.post('/parts/:id/now', async (req, res) => {
+        const userId = req.user.userId;
+        const part = (await pool.query(
+            `SELECT goal_parts.id, goal_parts.name, goals.status, goals.plan_mode, subjects.color
+            FROM goal_parts
+            JOIN goals ON goals.id = goal_parts.goal_id
+            JOIN subjects ON subjects.id = goals.subject_id
+            WHERE goal_parts.id = $1 AND goals.user_id = $2`,
+            [idParam(req.params.id), userId]
+        )).rows[0];
+        if (!part) return notFound(res);
+        if (part.status !== 'active') return fail(res, 400, 'goal_not_active', 'The goal is not active');
+        const clock = await getClock(pool, userId);
+        const time = part.plan_mode === 'slots' ? toHHMM(Math.floor(clock.nowMinutes / 5) * 5) : null;
+        const id = (await pool.query(
+            `INSERT INTO tasks (kind, user_id, name, color, due, due_time, duration_minutes, goal_part_id, plan_pinned, reminders)
+            VALUES ('task', $1, $2, $3, $4, $5, $6, $7, true, '{}') RETURNING id`,
+            [userId, part.name, part.color, clock.today, time, clock.sessionMinutes, part.id]
+        )).rows[0].id;
+        changed(userId);
+        res.status(201).json({ task: await loadTask(id, userId) });
+    });
+
+    // Gives a session back to the planner.
+    router.post('/sessions/:taskId/unpin', async (req, res) => {
+        const userId = req.user.userId;
+        const { rowCount } = await pool.query(
+            `UPDATE tasks SET plan_pinned = false WHERE id = $1 AND user_id = $2 AND ${MY_SESSION}`,
+            [idParam(req.params.taskId), userId]
+        );
+        if (!rowCount) return notFound(res);
+        changed(userId);
+        res.json({ ok: true });
     });
 
     return router;

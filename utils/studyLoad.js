@@ -2,7 +2,11 @@
 // ('YYYY-MM-DD', 'HH:MM'): the status and planner modules need strings, pg would hand out Date objects.
 // `db` is a pool or a client.
 
-const { partProgress, goalStatus } = require('./studyStatus');
+const crypto = require('crypto');
+const { partProgress, goalStatus, isMissed, isReplaceable } = require('./studyStatus');
+const { projectRepeats } = require('./repeats');
+
+const BUSY_DEFAULT_MINUTES = 60; // a timed item without a length
 
 // The user's settings and "now" in their timezone.
 async function getClock(db, userId) {
@@ -111,4 +115,96 @@ function goalProgress({ goal, parts, sessions }, clock) {
     return { progress: total > 0 ? Math.round((covered / total) * 100) / 100 : 0, behindMinutes };
 }
 
-module.exports = { getClock, loadSessions, loadGoals, partView, goalView, goalProgress };
+// The user's timed calendar items from `today` to `until` (both included) as planner `busy`
+// [{ id, date, start, minutes }]: events (repeats projected) and open timed tasks that are not
+// sessions of an active goal (those are planner `kept`).
+async function loadBusy(db, userId, today, until, activePartIds) {
+    const { rows } = await db.query(
+        `SELECT id, kind, COALESCE(done, false) AS done, repeat, repeat_left,
+            ARRAY(SELECT to_char(day, 'YYYY-MM-DD') FROM unnest(repeat_skip) AS day) AS repeat_skip,
+            to_char(due, 'YYYY-MM-DD') AS due, to_char(due_time, 'HH24:MI') AS start, duration_minutes
+        FROM tasks
+        WHERE user_id = $1 AND due IS NOT NULL AND due_time IS NOT NULL AND due <= $3::date
+            AND (due >= $2::date OR repeat IS NOT NULL)
+            AND (kind = 'event' OR (NOT COALESCE(done, false)
+                AND (goal_part_id IS NULL OR NOT goal_part_id = ANY($4::int[]))))`,
+        [userId, today, until, activePartIds]
+    );
+    return [...rows, ...projectRepeats(rows, until)]
+        .filter((r) => r.due >= today && r.due <= until)
+        .map((r) => ({ id: String(r.id), date: r.due, start: r.start, minutes: r.duration_minutes ?? BUSY_DEFAULT_MINUTES }));
+}
+
+// Everything the planner needs for one user, read in their timezone (spec §2, §3):
+// { input, sessions, goals, clock }. `input` is plan()'s input; `sessions` are all sessions of the
+// active goals with goalId and status 'missed' | 'replaceable' | 'kept'; `goals` the active goals
+// as loadGoals gives them. Missed sessions are left out of the planner (their minutes are in
+// `remaining`), replaceable ones too (the planner plans their minutes again); everything else is
+// `kept`, pending when nothing is credited yet (controller ruling 12; the planner deducts it).
+async function loadPlanInput(db, userId) {
+    const clock = await getClock(db, userId);
+    const goals = (await loadGoals(db, userId)).filter((g) => g.goal.status === 'active');
+    const windows = (await db.query(
+        `SELECT weekday, to_char(start_time, 'HH24:MI') AS start, to_char(end_time, 'HH24:MI') AS "end"
+        FROM study_windows WHERE user_id = $1 ORDER BY weekday, start_time, end_time, id`,
+        [userId]
+    )).rows.map((w) => ({ weekday: w.weekday, start: w.start, end: w.end }));
+
+    const planGoals = [];
+    const kept = [];
+    const sessions = [];
+    for (const { goal, parts, sessions: own } of goals) {
+        const ctx = { today: clock.today, nowMinutes: clock.nowMinutes, planMode: goal.planMode };
+        planGoals.push({
+            id: goal.id, kind: goal.kind, due: goal.due, planMode: goal.planMode,
+            parts: parts.map((p) => ({
+                id: p.id, position: p.position, role: p.role,
+                remaining: partProgress(p, own.filter((s) => s.partId === p.id)).remaining,
+            })),
+        });
+        for (const s of own) {
+            const status = isMissed(s, ctx) ? 'missed' : isReplaceable(s, ctx) ? 'replaceable' : 'kept';
+            sessions.push({ ...s, goalId: goal.id, status });
+            if (status === 'kept') {
+                kept.push({
+                    taskId: s.taskId, goalId: goal.id, partId: s.partId, date: s.date, time: s.time,
+                    minutes: s.minutes, pending: !s.done && s.focusMs === 0,
+                });
+            }
+        }
+    }
+    const until = planGoals.reduce((latest, g) => (g.due > latest ? g.due : latest), '');
+    const partIds = planGoals.flatMap((g) => g.parts.map((p) => p.id));
+    const busy = until >= clock.today ? await loadBusy(db, userId, clock.today, until, partIds) : [];
+
+    const input = {
+        today: clock.today, nowMinutes: clock.nowMinutes,
+        sessionMinutes: clock.sessionMinutes, dailyMaxMinutes: clock.dailyMaxMinutes,
+        windows, goals: planGoals, busy, kept,
+    };
+    return { input, sessions, goals, clock };
+}
+
+// JSON with object keys sorted and every array sorted by its items' own canonical text, so the
+// same data gives the same text whatever order it was read in (no array in a plan input or
+// result carries meaning in its order: parts have positions, sessions dates and times).
+function canonical(value) {
+    if (Array.isArray(value)) return `[${value.map(canonical).sort().join(',')}]`;
+    if (value && typeof value === 'object') {
+        return `{${Object.keys(value).sort()
+            .filter((k) => value[k] !== undefined)
+            .map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
+    }
+    return JSON.stringify(value === undefined ? null : value);
+}
+
+// Fingerprint of a plan (sha256 hex): the planner input plus `extra` (the ids of the sessions an
+// apply would delete, and the planner's result). `nowMinutes` is left out on purpose: the clock
+// moves every minute, and what it changes (which sessions are replaceable or missed, today's
+// slots) is already in `extra`, so a preview only goes stale when the plan itself would change.
+function inputHash(input, extra = {}) {
+    const rest = { ...input, nowMinutes: undefined }; // undefined keys are left out by canonical()
+    return crypto.createHash('sha256').update(canonical({ input: rest, ...extra })).digest('hex');
+}
+
+module.exports = { getClock, loadSessions, loadGoals, partView, goalView, goalProgress, loadPlanInput, inputHash };

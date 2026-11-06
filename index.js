@@ -269,7 +269,7 @@ function requireTester(req, res, next) {
 }
 
 app.use("/api/tester", authenticateToken, requireTester);
-app.use("/api/tester/study", require("./study")({ pool, realtime }));
+app.use("/api/tester/study", require("./study")({ pool, realtime, loadTask }));
 
 // Overall limit per account (or per IP before signing in): plenty for the app, which polls
 // every few seconds, but stops scripts from hammering the API
@@ -476,7 +476,9 @@ const accessibleTaskIds = (param) =>
 // Tasks in the shape the app uses, for the user in $1: the task's columns (due_time as "HH:MM"),
 // group_ids (only that user's own groups), isOwner, owner (who shared it, for a task shared
 // with me), shareId (my share of somebody else's task, to leave it) and
-// sharedWith: [{ shareId, status: 'pending' | 'accepted', user }] (everybody it was sent to).
+// sharedWith: [{ shareId, status: 'pending' | 'accepted', user }] (everybody it was sent to),
+// and for a planned study session (goal_part_id) of the user's own goal: study_info
+// { goalId, goalName, partName, subjectName, subjectEmoji, subjectColor }, else null.
 // Add conditions with "AND ...".
 const TASK_SELECT = `
     SELECT tasks.id, tasks.name, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
@@ -488,6 +490,11 @@ const TASK_SELECT = `
         tasks.kind, tasks.event_type_id, event_types.name AS event_type_name, event_types.color AS event_type_color,
         owner.username AS owner_username, owner.display_name AS owner_display_name,
         my_share.id AS my_share_id,
+        tasks.goal_part_id, tasks.plan_pinned,
+        CASE WHEN study_goal.id IS NULL THEN NULL ELSE json_build_object(
+            'goalId', study_goal.id, 'goalName', study_goal.name, 'partName', study_part.name,
+            'subjectName', study_subject.name, 'subjectEmoji', study_subject.emoji, 'subjectColor', study_subject.color
+        ) END AS study_info,
         COALESCE((
             SELECT array_agg(task_groups.group_id ORDER BY task_groups.group_id)
             FROM task_groups
@@ -509,6 +516,9 @@ const TASK_SELECT = `
     LEFT JOIN event_types ON event_types.id = tasks.event_type_id
     LEFT JOIN task_shares AS my_share
         ON my_share.task_id = tasks.id AND my_share.user_id = $1 AND my_share.status = 'accepted'
+    LEFT JOIN goal_parts AS study_part ON study_part.id = tasks.goal_part_id
+    LEFT JOIN goals AS study_goal ON study_goal.id = study_part.goal_id AND study_goal.user_id = $1
+    LEFT JOIN subjects AS study_subject ON study_subject.id = study_goal.subject_id
     WHERE (tasks.user_id = $1 OR my_share.id IS NOT NULL)`;
 
 function toTaskResponse(row, userId) {
@@ -548,6 +558,10 @@ function toTaskResponse(row, userId) {
         owner: isOwner ? null : { id: row.user_id, username: row.owner_username, displayName: row.owner_display_name },
         shareId: row.my_share_id,
         sharedWith: row.shared_with,
+        // a planned study session; somebody it is shared with sees an ordinary task
+        goal_part_id: isOwner ? row.goal_part_id : null,
+        plan_pinned: isOwner ? row.plan_pinned : false,
+        study: row.study_info,
     };
 }
 
@@ -2478,8 +2492,10 @@ app.put("/api/tasks/:id", async (req, res) => {
         // completed_at: set when the task becomes done (SET sees the old row), cleared when reopened
         const sets = ["name = $1", "due = $2", "description = $3", "prio = $4", "done = $5",
             "completed_at = CASE WHEN NOT $5 THEN NULL WHEN tasks.done THEN tasks.completed_at ELSE now() END"];
+        const param = {}; // column -> its parameter number
         for (const [column, value] of Object.entries(extras.values)) {
             values.push(value);
+            param[column] = values.length;
             // e.g. mails go to the owner, so only the owner turns them on or off ($7: me)
             sets.push(OWNER_ONLY_FIELDS.includes(column)
                 ? `${column} = CASE WHEN tasks.user_id = $7 THEN $${values.length} ELSE tasks.${column} END`
@@ -2492,6 +2508,11 @@ app.put("/api/tasks/:id", async (req, res) => {
             values.push(extras.values.repeat);
             sets.push(`repeat_skip = CASE WHEN tasks.repeat IS DISTINCT FROM $${values.length} THEN '{}' ELSE tasks.repeat_skip END`);
         }
+        // a planned study session moved or resized by hand is the user's now: the planner keeps it
+        const newDueTime = param.due_time ? `$${param.due_time}::time` : due ? "tasks.due_time" : "NULL::time";
+        const newDuration = param.duration_minutes ? `$${param.duration_minutes}::integer` : "tasks.duration_minutes";
+        sets.push(`plan_pinned = tasks.plan_pinned OR (tasks.goal_part_id IS NOT NULL AND (tasks.due IS DISTINCT FROM $2::date
+            OR tasks.due_time IS DISTINCT FROM ${newDueTime} OR tasks.duration_minutes IS DISTINCT FROM ${newDuration}))`);
 
         await client.query(`UPDATE tasks SET ${sets.join(", ")} WHERE id = $6 AND id IN (${accessibleTaskIds("$7")})`, values);
         const [synced] = await syncEvents(client, "tasks.id = $1", [id]);

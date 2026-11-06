@@ -3641,3 +3641,326 @@ describe("study goals", () => {
         assert.equal(reopened.actual_minutes, null);
     });
 });
+
+describe("study plan", () => {
+    const S = "/api/tester/study";
+    let count = 0;
+    // a fresh tester for each test: all active goals of a user are planned together
+    const tester = async () => {
+        const user = await member(`planner${++count}`);
+        await sql("UPDATE users SET is_tester = true WHERE id = $1", [user.id]);
+        return user;
+    };
+    const subject = async (user, name = "Statistik", extra = {}) => {
+        const r = await call("POST", `${S}/subjects`, { name, color: "green", ...extra }, user.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        return r.data;
+    };
+    // an assignment (no review part), parts of 45, 90 and 135 min: six sessions of 45
+    const goal = async (user, subjectId, extra = {}) => {
+        const r = await call("POST", `${S}/goals`, {
+            subjectId, kind: "assignment", name: "Hausarbeit", due: daysFromToday(10), planMode: "days",
+            parts: [{ name: "A", estimateMinutes: 45 }, { name: "B", estimateMinutes: 90 }, { name: "C", estimateMinutes: 135 }],
+            ...extra,
+        }, user.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        return (await call("GET", `${S}/goals/${r.data.id}`, null, user.token)).data;
+    };
+    const preview = async (user) => {
+        const r = await call("GET", `${S}/plan`, null, user.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        return r.data;
+    };
+    const apply = async (user) => {
+        const p = await preview(user);
+        const r = await call("POST", `${S}/replan`, { inputHash: p.inputHash }, user.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        assert.deepEqual(r.data, { ok: true });
+        return p;
+    };
+    const sessionsOf = (user) => sql(
+        `SELECT id, name, color, kind, to_char(due, 'YYYY-MM-DD') AS due, to_char(due_time, 'HH24:MI') AS due_time,
+            duration_minutes, goal_part_id, plan_pinned, done, reminders
+        FROM tasks WHERE user_id = $1 AND goal_part_id IS NOT NULL ORDER BY due, due_time NULLS FIRST, id`,
+        [user.id]
+    );
+    const snapshot = (user) => sql("SELECT * FROM tasks WHERE user_id = $1 ORDER BY id", [user.id]);
+    // a planned session written straight to the database
+    const session = async (user, partId, due, extra = {}) => (await sql(
+        `INSERT INTO tasks (name, kind, user_id, due, duration_minutes, goal_part_id, done, plan_pinned)
+        VALUES ('S', 'task', $1, $2, 45, $3, $4, $5) RETURNING id`,
+        [user.id, due, partId, !!extra.done, !!extra.pinned]))[0].id;
+    // PUT /api/tasks/:id as the app sends it: the whole task with some fields changed
+    const putTask = async (user, id, changes) => {
+        const [t] = await sql(
+            `SELECT name, to_char(due, 'YYYY-MM-DD') AS due, to_char(due_time, 'HH24:MI') AS due_time,
+                duration_minutes, description, prio, COALESCE(done, false) AS done
+            FROM tasks WHERE id = $1`,
+            [id]
+        );
+        return call("PUT", `/api/tasks/${id}`, { ...t, ...changes }, user.token);
+    };
+    const countBy = (list, key) => list.reduce((acc, x) => ({ ...acc, [x[key]]: (acc[x[key]] || 0) + 1 }), {});
+
+    test("a new goal: the preview lists only new sessions, replan writes them and nothing else", async () => {
+        const me = await tester();
+        const them = await tester();
+        const sub = await subject(me);
+        const g = await goal(me, sub.id);
+        assert.equal((await call("POST", "/api/tasks", { name: "Einkaufen", due: daysFromToday(1) }, me.token)).status, 201);
+        assert.equal((await call("POST", "/api/tasks", { name: "Zahnarzt", due: daysFromToday(2), due_time: "10:00", duration_minutes: 30 }, me.token)).status, 201);
+        await goal(them, (await subject(them)).id);
+        await apply(them);
+        const theirs = await snapshot(them);
+        const mine = await snapshot(me);
+
+        const p = await preview(me);
+        assert.match(p.inputHash, /^[0-9a-f]{64}$/);
+        assert.deepEqual(p.shortfall, { [g.id]: 0 });
+        assert.equal(p.goals.length, 1);
+        const [pg] = p.goals;
+        assert.equal(pg.goalId, g.id);
+        assert.equal(pg.name, "Hausarbeit");
+        assert.deepEqual(pg.summary, { moved: 0, added: 6, dropped: 0, unchanged: 0 });
+        assert.ok(pg.changes.every(c => c.type === "new" && c.minutes === 45 && c.to.time === null && !c.from), JSON.stringify(pg.changes));
+        assert.ok(pg.changes.every(c => c.to.date >= daysFromToday(0) && c.to.date < g.due));
+        assert.deepEqual(countBy(pg.changes, "partName"), { A: 1, B: 2, C: 3 });
+
+        const r = await call("POST", `${S}/replan`, { inputHash: p.inputHash }, me.token);
+        assert.deepEqual([r.status, r.data], [200, { ok: true }]);
+        const planned = await sessionsOf(me);
+        assert.equal(planned.length, 6);
+        const partName = Object.fromEntries(g.parts.map(x => [x.id, x.name]));
+        for (const s of planned) {
+            assert.equal(s.kind, "task");
+            assert.equal(s.color, "green", "the subject's colour");
+            assert.equal(s.duration_minutes, 45);
+            assert.equal(s.due_time, null, "days mode has no time");
+            assert.equal(s.plan_pinned, false);
+            assert.equal(s.done, false);
+            assert.deepEqual(s.reminders, []);
+            assert.equal(s.name, partName[s.goal_part_id]);
+        }
+        assert.deepEqual((await snapshot(me)).filter(t => t.goal_part_id === null), mine, "my ordinary tasks are untouched");
+        assert.deepEqual(await snapshot(them), theirs, "somebody else's tasks are untouched");
+
+        const again = await preview(me);
+        assert.deepEqual(again.goals[0].summary, { moved: 0, added: 0, dropped: 0, unchanged: 6 });
+        assert.deepEqual(again.goals[0].changes, []);
+        assert.equal((await call("POST", `${S}/replan`, {}, me.token)).data.code, "invalid_input");
+        assert.equal((await call("POST", `${S}/replan`, { inputHash: "0".repeat(64) }, me.token)).status, 409);
+    });
+
+    test("an earlier goal moves the first goal's sessions in the preview", async () => {
+        const me = await tester();
+        const sub = await subject(me);
+        const first = await goal(me, sub.id);
+        await apply(me);
+        // 540 min due in 3 days fill the days before it (daily max 180)
+        const second = await goal(me, sub.id, {
+            name: "Referat", kind: "presentation", due: daysFromToday(3),
+            parts: [{ name: "X", estimateMinutes: 180 }, { name: "Y", estimateMinutes: 180 }, { name: "Z", estimateMinutes: 180 }],
+        });
+        const p = await preview(me);
+        const a = p.goals.find(x => x.goalId === first.id);
+        const b = p.goals.find(x => x.goalId === second.id);
+        assert.ok(b.changes.length > 0 && b.changes.every(c => c.type === "new"), JSON.stringify(b));
+        assert.ok(a.summary.moved > 0, JSON.stringify(a));
+        assert.equal(a.summary.added, 0);
+        assert.equal(a.summary.dropped, 0);
+        assert.equal(a.summary.moved + a.summary.unchanged, 6);
+        for (const c of a.changes) {
+            assert.equal(c.type, "moved");
+            assert.ok(c.from.date !== c.to.date || c.from.time !== c.to.time);
+            assert.ok(c.to.date >= daysFromToday(3), "out of the earlier goal's days");
+        }
+        const r = await call("POST", `${S}/replan`, { inputHash: p.inputHash }, me.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        const parts = new Set(first.parts.map(x => x.id));
+        const firsts = (await sessionsOf(me)).filter(s => parts.has(s.goal_part_id));
+        assert.equal(firsts.length, 6);
+        assert.ok(firsts.every(s => s.due >= daysFromToday(3)));
+    });
+
+    test("a session ticked off after the preview: replan answers 409 with a fresh preview and changes nothing", async () => {
+        const me = await tester();
+        const sub = await subject(me);
+        await goal(me, sub.id);
+        await apply(me);
+        await goal(me, sub.id, { name: "Referat", kind: "presentation", due: daysFromToday(3), parts: [{ name: "X", estimateMinutes: 360 }] });
+        const p = await preview(me);
+        // meanwhile, on the phone
+        const [s] = await sessionsOf(me);
+        assert.equal((await putTask(me, s.id, { done: true })).status, 200);
+        const before = await snapshot(me);
+        const goalsBefore = await sql("SELECT * FROM goals WHERE user_id = $1 ORDER BY id", [me.id]);
+
+        const r = await call("POST", `${S}/replan`, { inputHash: p.inputHash }, me.token);
+        assert.equal(r.status, 409);
+        assert.equal(r.data.code, "plan_changed");
+        assert.match(r.data.preview.inputHash, /^[0-9a-f]{64}$/);
+        assert.notEqual(r.data.preview.inputHash, p.inputHash);
+        assert.equal(r.data.preview.goals.length, 2);
+        assert.deepEqual(await snapshot(me), before, "no task changed");
+        assert.deepEqual(await sql("SELECT * FROM goals WHERE user_id = $1 ORDER BY id", [me.id]), goalsBefore, "no goal changed");
+
+        const ok = await call("POST", `${S}/replan`, { inputHash: r.data.preview.inputHash }, me.token);
+        assert.equal(ok.status, 200, JSON.stringify(ok.data));
+        const [ticked] = await sql("SELECT done FROM tasks WHERE id = $1", [s.id]);
+        assert.equal(ticked.done, true, "a done session is kept");
+    });
+
+    test("a session moved to another day is pinned and survives the next replan", async () => {
+        const me = await tester();
+        const sub = await subject(me);
+        await goal(me, sub.id);
+        await apply(me);
+        const [s] = await sessionsOf(me);
+        // renaming, with the same day, time and length, is no move
+        assert.equal((await putTask(me, s.id, { name: "Kapitel 1" })).status, 200);
+        assert.equal((await sql("SELECT plan_pinned FROM tasks WHERE id = $1", [s.id]))[0].plan_pinned, false);
+
+        const target = s.due === daysFromToday(8) ? daysFromToday(7) : daysFromToday(8);
+        const r = await putTask(me, s.id, { due: target });
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        assert.equal(r.data.plan_pinned, true);
+        assert.equal((await sql("SELECT plan_pinned FROM tasks WHERE id = $1", [s.id]))[0].plan_pinned, true);
+
+        // a new length or a time pins too
+        const [s2] = (await sessionsOf(me)).filter(x => !x.plan_pinned);
+        assert.equal((await putTask(me, s2.id, { duration_minutes: 30 })).data.plan_pinned, true);
+        const [s3] = (await sessionsOf(me)).filter(x => !x.plan_pinned);
+        assert.equal((await putTask(me, s3.id, { due_time: "15:00" })).data.plan_pinned, true);
+        // an ordinary task is never pinned
+        const plain = (await call("POST", "/api/tasks", { name: "Wäsche", due: daysFromToday(1) }, me.token)).data;
+        assert.equal((await putTask(me, plain.id, { due: daysFromToday(2) })).data.plan_pinned, false);
+
+        await goal(me, sub.id, { name: "Referat", kind: "presentation", due: daysFromToday(3), parts: [{ name: "X", estimateMinutes: 360 }] });
+        await apply(me);
+        const [after] = await sql("SELECT to_char(due, 'YYYY-MM-DD') AS due, plan_pinned FROM tasks WHERE id = $1", [s.id]);
+        assert.deepEqual(after, { due: target, plan_pinned: true }, "still on that day");
+        assert.equal((await sql("SELECT duration_minutes FROM tasks WHERE id = $1", [s2.id]))[0].duration_minutes, 30);
+    });
+
+    test("apply drops missed sessions, keeps done and pinned ones, resets freed minutes", async () => {
+        const me = await tester();
+        const sub = await subject(me);
+        const g = await goal(me, sub.id);
+        const [a, b] = g.parts;
+        const missed = await session(me, a.id, daysFromToday(-2));
+        const done = await session(me, a.id, daysFromToday(-1), { done: true }); // A (45) is covered
+        const pinned = await session(me, b.id, daysFromToday(4), { pinned: true }); // B needs one more
+        await sql("UPDATE goals SET freed_minutes = 30 WHERE id = $1", [g.id]);
+
+        const p = await preview(me);
+        const [pg] = p.goals;
+        assert.deepEqual(pg.summary, { moved: 0, added: 4, dropped: 1, unchanged: 0 });
+        const dropped = pg.changes.find(c => c.type === "dropped");
+        assert.deepEqual(dropped, { type: "dropped", partName: "A", from: { date: daysFromToday(-2), time: null }, minutes: 45 });
+        assert.deepEqual(countBy(pg.changes.filter(c => c.type === "new"), "partName"), { B: 1, C: 3 });
+
+        const r = await call("POST", `${S}/replan`, { inputHash: p.inputHash }, me.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        const ids = (await sessionsOf(me)).map(s => s.id);
+        assert.equal(ids.length, 6);
+        assert.ok(!ids.includes(missed), "missed session removed");
+        assert.ok(ids.includes(done) && ids.includes(pinned));
+        assert.equal((await sql("SELECT freed_minutes FROM goals WHERE id = $1", [g.id]))[0].freed_minutes, 0);
+    });
+
+    test("slots: timed events (with repeats) and timed tasks are busy", async () => {
+        const me = await tester();
+        const windows = [1, 2, 3, 4, 5, 6, 7].map(weekday => ({ weekday, start: "16:00", end: "18:00" }));
+        assert.equal((await call("PUT", `${S}/settings`, { windows }, me.token)).status, 200);
+        // every day 16:00-17:00 (+ 10 min buffer): only 17:10-18:00 is left
+        await sql(
+            "INSERT INTO tasks (name, kind, user_id, due, due_time, duration_minutes, repeat) VALUES ('Training', 'event', $1, $2, '16:00', 60, 'daily')",
+            [me.id, daysFromToday(0)]
+        );
+        // without a length it counts as 60 minutes: 16:50-18:10 is gone that day
+        assert.equal((await call("POST", "/api/tasks", { name: "Arzt", due: daysFromToday(2), due_time: "17:00" }, me.token)).status, 201);
+        const sub = await subject(me);
+        await goal(me, sub.id, { planMode: "slots" });
+        const p = await preview(me);
+        const news = p.goals[0].changes;
+        assert.equal(news.length, 6, JSON.stringify(p));
+        for (const c of news) {
+            assert.ok(c.to.time >= "17:10" && c.to.time <= "17:15", JSON.stringify(c));
+            assert.notEqual(c.to.date, daysFromToday(2));
+        }
+        const r = await call("POST", `${S}/replan`, { inputHash: p.inputHash }, me.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        assert.ok((await sessionsOf(me)).every(s => s.due_time >= "17:10"));
+    });
+
+    test("Jetzt lernen: a pinned session for now", async () => {
+        const me = await tester();
+        const them = await tester();
+        assert.equal((await call("PUT", `${S}/settings`, { sessionMinutes: 30 }, me.token)).status, 200);
+        const sub = await subject(me, "Bio", { color: "pink", emoji: "🧬" });
+        const slots = await goal(me, sub.id, { planMode: "slots" });
+        const r = await call("POST", `${S}/parts/${slots.parts[1].id}/now`, null, me.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        const { task } = r.data;
+        assert.equal(task.plan_pinned, true);
+        assert.equal(task.goal_part_id, slots.parts[1].id);
+        assert.equal(task.name, "B");
+        assert.equal(task.color, "pink");
+        assert.equal(task.duration_minutes, 30);
+        assert.equal(task.kind, "task");
+        assert.equal(task.study.goalId, slots.id);
+        const [row] = await sql("SELECT to_char(due, 'YYYY-MM-DD') AS due, to_char(due_time, 'HH24:MI') AS due_time FROM tasks WHERE id = $1", [task.id]);
+        const [{ now }] = await sql("SELECT to_char(now() AT TIME ZONE 'Europe/Berlin', 'HH24:MI') AS now");
+        const minutes = (hhmm) => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3));
+        assert.equal(row.due, daysFromToday(0));
+        assert.equal(minutes(row.due_time) % 5, 0);
+        assert.ok(minutes(now) - minutes(row.due_time) >= 0 && minutes(now) - minutes(row.due_time) < 10, `${row.due_time} vs ${now}`);
+
+        const days = await goal(me, sub.id, { name: "Tage" });
+        const d = await call("POST", `${S}/parts/${days.parts[0].id}/now`, null, me.token);
+        assert.equal(d.status, 201);
+        assert.equal(d.data.task.due_time, null);
+
+        await call("PATCH", `${S}/goals/${days.id}`, { status: "done" }, me.token);
+        assert.equal((await call("POST", `${S}/parts/${days.parts[0].id}/now`, null, me.token)).data.code, "goal_not_active");
+        assert.equal((await call("POST", `${S}/parts/${slots.parts[0].id}/now`, null, them.token)).status, 404);
+        assert.equal((await call("POST", `${S}/parts/abc/now`, null, me.token)).status, 404);
+    });
+
+    test("unpin: only my own planned sessions", async () => {
+        const me = await tester();
+        const them = await tester();
+        const g = await goal(me, (await subject(me)).id);
+        const pinned = await session(me, g.parts[0].id, daysFromToday(2), { pinned: true });
+        const plain = (await call("POST", "/api/tasks", { name: "Wäsche", due: daysFromToday(1) }, me.token)).data;
+        assert.equal((await call("POST", `${S}/sessions/${plain.id}/unpin`, null, me.token)).status, 404);
+        assert.equal((await call("POST", `${S}/sessions/${pinned}/unpin`, null, them.token)).status, 404);
+        assert.equal((await call("POST", `${S}/sessions/x/unpin`, null, me.token)).status, 404);
+        const r = await call("POST", `${S}/sessions/${pinned}/unpin`, null, me.token);
+        assert.equal(r.status, 200);
+        assert.deepEqual(r.data, { ok: true });
+        assert.equal((await sql("SELECT plan_pinned FROM tasks WHERE id = $1", [pinned]))[0].plan_pinned, false);
+    });
+
+    test("task rows of sessions know their goal", async () => {
+        const me = await tester();
+        const sub = await subject(me, "Statistik", { emoji: "📊" });
+        const g = await goal(me, sub.id);
+        await apply(me);
+        await call("POST", "/api/tasks", { name: "Einkaufen", due: daysFromToday(1) }, me.token);
+        const tasks = (await call("GET", "/api/tasks", null, me.token)).data;
+        const planned = tasks.filter(t => t.goal_part_id != null);
+        assert.equal(planned.length, 6);
+        for (const t of planned) {
+            assert.equal(t.plan_pinned, false);
+            assert.deepEqual(t.study, {
+                goalId: g.id, goalName: "Hausarbeit", partName: t.name,
+                subjectName: "Statistik", subjectEmoji: "📊", subjectColor: "green",
+            });
+        }
+        const plain = tasks.find(t => t.name === "Einkaufen");
+        assert.equal(plain.study, null);
+        assert.equal(plain.goal_part_id, null);
+        assert.equal(plain.plan_pinned, false);
+    });
+});
