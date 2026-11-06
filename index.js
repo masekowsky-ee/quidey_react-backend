@@ -269,7 +269,6 @@ function requireTester(req, res, next) {
 }
 
 app.use("/api/tester", authenticateToken, requireTester);
-app.use("/api/tester/study", require("./study")({ pool, realtime, loadTask }));
 
 // Overall limit per account (or per IP before signing in): plenty for the app, which polls
 // every few seconds, but stops scripts from hammering the API
@@ -282,6 +281,9 @@ app.use("/api", rateLimit({
     legacyHeaders: false,
     message: { error: "Too many requests, please slow down", code: "RATE_LIMITED" },
 }));
+
+// Study goals (testers): below the overall limit, behind /api/tester's authenticateToken + requireTester above
+app.use("/api/tester/study", require("./study")({ pool, realtime, loadTask }));
 
 app.use("/api/notebook", express.json({ limit: "4mb" }));
 
