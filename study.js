@@ -3,8 +3,11 @@
 // against the caller (user_id); somebody else's id answers 404.
 
 const express = require('express');
-const { sessionCredit, isPending, isReplaceable } = require('./utils/studyStatus');
-const { reviewMinutes, makeAiClient } = require('./utils/studyEstimate');
+const { rateLimit } = require('express-rate-limit');
+const { sessionCredit, isPending, isReplaceable, goalStatus } = require('./utils/studyStatus');
+const {
+    reviewMinutes, makeAiClient, estimateParts, askAi, aiModel, pageCount,
+} = require('./utils/studyEstimate');
 const { plan } = require('./utils/studyPlanner');
 const {
     getClock, loadSessions, loadGoals, goalView, goalProgress, loadPlanInput, inputHash, ACTIVE_GOAL_SQL,
@@ -780,6 +783,139 @@ module.exports = ({ pool, realtime, loadTask }) => {
         if (!rowCount) return notFound(res);
         changed(userId);
         res.json({ ok: true });
+    });
+
+    // ---------- status and estimates ----------
+    // Parts that reached their estimate (credit) but are not ticked off: their replaceable sessions
+    // go and count as freed time. One goal per transaction, the goal locked first (lock order goal -> tasks).
+    async function releaseAhead(userId, goalIds) {
+        let deleted = 0;
+        for (const id of goalIds) {
+            deleted += await inTransaction(async (client) => {
+                await client.query('SELECT id FROM goals WHERE id = $1 AND user_id = $2 FOR UPDATE', [id, userId]);
+                const [fresh] = await loadGoals(client, userId, { id });
+                if (!fresh || fresh.goal.status !== 'active') return 0;
+                const clock = await getClock(client, userId);
+                const { aheadPartIds } = goalStatus({ ...fresh, busy: [] }, clock);
+                const open = new Set(fresh.parts.filter((p) => !p.doneAt).map((p) => p.id));
+                const gone = fresh.sessions.filter((s) => aheadPartIds.includes(s.partId) && open.has(s.partId) && isReplaceable(s, clock));
+                if (!gone.length) return 0;
+                await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [gone.map((s) => s.taskId), userId]);
+                await client.query('UPDATE goals SET freed_minutes = freed_minutes + $2 WHERE id = $1', [id, gone.reduce((sum, s) => sum + s.minutes, 0)]);
+                return gone.length;
+            });
+        }
+        return deleted;
+    }
+
+    function statusOf({ goals, clock, input }) {
+        return goals.map((g) => ({ g, status: goalStatus({ ...g, busy: input.busy }, clock) }));
+    }
+
+    router.get('/status', async (req, res) => {
+        const userId = req.user.userId;
+        let loaded = await loadPlanInput(pool, userId);
+        const ahead = statusOf(loaded).filter(({ g, status }) => status.aheadPartIds.some((pid) => g.parts.find((p) => p.id === pid && !p.doneAt)));
+        if (ahead.length && await releaseAhead(userId, ahead.map(({ g }) => g.goal.id))) {
+            changed(userId);
+            loaded = await loadPlanInput(pool, userId);
+        }
+        const notified = new Map((await pool.query(
+            'SELECT id, behind_notified_minutes FROM goals WHERE user_id = $1', [userId]
+        )).rows.map((r) => [r.id, r.behind_notified_minutes]));
+        const rows = statusOf(loaded);
+        res.json({
+            goals: rows.map(({ g, status }) => ({
+                goalId: g.goal.id, name: g.goal.name, behindMinutes: status.behindMinutes,
+                conflictTaskIds: status.conflictTaskIds, freedMinutes: g.goal.freedMinutes,
+            })),
+            notifiedMinutes: Object.fromEntries(rows.map(({ g }) => [g.goal.id, notified.get(g.goal.id) ?? 0])),
+            aiAvailable: makeAiClient() !== null,
+        });
+    });
+
+    // "So lassen": the current deficit counts as seen.
+    router.post('/goals/:id/dismiss', async (req, res) => {
+        const userId = req.user.userId;
+        const id = idParam(req.params.id);
+        if (!(await ownedGoal(pool, userId, id))) return notFound(res);
+        const mine = statusOf(await loadPlanInput(pool, userId)).find(({ g }) => g.goal.id === id);
+        const behind = mine ? mine.status.behindMinutes : 0;
+        await pool.query('UPDATE goals SET behind_notified_minutes = $3 WHERE id = $1 AND user_id = $2', [id, userId, behind]);
+        res.json({ ok: true, notifiedMinutes: behind });
+    });
+
+    // 20 requests that really call the AI per user and day (in memory, spec §4). Called by hand: over the
+    // cap the handler only flags the request, so the estimates are answered without AI.
+    const aiLimiter = rateLimit({
+        windowMs: 24 * 60 * 60 * 1000,
+        limit: 20,
+        keyGenerator: (req) => String(req.user.userId),
+        standardHeaders: false,
+        legacyHeaders: false,
+        handler: (req, res, next) => { req.aiOverLimit = true; next(); },
+    });
+    const takeAiSlot = (req, res) => new Promise((resolve, reject) => {
+        aiLimiter(req, res, (err) => (err ? reject(err) : resolve(!req.aiOverLimit)));
+    });
+
+    router.post('/estimate', async (req, res) => {
+        const userId = req.user.userId;
+        const body = req.body || {};
+        const subjectName = cleanName(body.subjectName, 60);
+        if (!subjectName) return invalid(res, 'subjectName');
+        if (!KINDS.includes(body.kind)) return invalid(res, 'kind');
+        const due = cleanDate(body.due);
+        if (!due) return invalid(res, 'due');
+        if (!Array.isArray(body.parts) || body.parts.length < 1 || body.parts.length > MAX_PARTS) return invalid(res, 'parts');
+        const parts = body.parts.map((p) => cleanName(p, 200));
+        if (parts.includes(null)) return invalid(res, 'parts');
+        let subjectId = null;
+        if (body.subjectId != null) {
+            subjectId = idParam(body.subjectId);
+            if (!(await ownedSubject(pool, userId, subjectId))) return notFound(res);
+        }
+
+        const rows = (await pool.query(
+            `SELECT goals.subject_id, goals.kind, goal_parts.name, goal_parts.actual_minutes
+            FROM goal_parts JOIN goals ON goals.id = goal_parts.goal_id
+            WHERE goals.user_id = $1 AND goal_parts.role = 'part' AND goal_parts.done_at IS NOT NULL
+                AND goal_parts.actual_minutes > 0`,
+            [userId]
+        )).rows;
+        const sameKind = rows.filter((r) => r.kind === body.kind);
+        const history = {
+            sameSubjectKind: sameKind.filter((r) => r.subject_id === subjectId).map((r) => r.actual_minutes),
+            sameKind: sameKind.map((r) => r.actual_minutes),
+            minutesPerPage: rows.flatMap((r) => {
+                const pages = pageCount(r.name);
+                return pages ? [r.actual_minutes / pages] : [];
+            }),
+        };
+        const named = parts.map((name) => ({ name }));
+        let estimates = estimateParts({ parts: named, kind: body.kind, history });
+
+        const clock = await getClock(pool, userId);
+        const client = body.ai === true || clock.aiAuto ? makeAiClient() : null;
+        const open = estimates.flatMap((e, i) => (e.source === 'default' ? [i] : [])); // only what nothing else could estimate
+        let aiUsed = false;
+        let aiFailed = false;
+        if (client && open.length) {
+            if (!(await takeAiSlot(req, res))) {
+                aiFailed = true;
+            } else {
+                const days = Math.max(0, Math.round((Date.parse(`${due}T00:00:00Z`) - Date.parse(`${clock.today}T00:00:00Z`)) / 86400000));
+                const answers = await askAi({
+                    client, model: aiModel(), subjectName, kind: body.kind, daysUntilDue: days, parts: open.map((i) => parts[i]),
+                });
+                const ai = parts.map(() => null);
+                open.forEach((i, k) => { ai[i] = answers[k]; });
+                aiFailed = answers.every((a) => a == null);
+                estimates = estimateParts({ parts: named, kind: body.kind, history, ai });
+                aiUsed = estimates.some((e) => e.source === 'ai');
+            }
+        }
+        res.json({ estimates, aiUsed, aiFailed });
     });
 
     return router;

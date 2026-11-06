@@ -4105,3 +4105,116 @@ describe("study plan", () => {
         assert.equal((await sessionsOf(me)).length, 12);
     });
 });
+
+describe("study status and estimates", () => {
+    const S = "/api/tester/study";
+    let count = 0;
+    const tester = async () => {
+        const user = await member(`statuser${++count}`);
+        await sql("UPDATE users SET is_tester = true WHERE id = $1", [user.id]);
+        return user;
+    };
+    const subject = async (user, name = "Mathe") => (await call("POST", `${S}/subjects`, { name, color: "blue" }, user.token)).data;
+    const goal = async (user, subjectId, extra = {}) => {
+        const r = await call("POST", `${S}/goals`, {
+            subjectId, kind: "assignment", name: "Hausarbeit", due: daysFromToday(10), planMode: "days",
+            parts: [{ name: "A", estimateMinutes: 45 }, { name: "B", estimateMinutes: 90 }, { name: "C", estimateMinutes: 135 }],
+            ...extra,
+        }, user.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        return (await call("GET", `${S}/goals/${r.data.id}`, null, user.token)).data;
+    };
+    const apply = async (user) => {
+        const p = (await call("GET", `${S}/plan`, null, user.token)).data;
+        const r = await call("POST", `${S}/replan`, { inputHash: p.inputHash }, user.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+    };
+    const session = async (user, partId, due, extra = {}) => (await sql(
+        `INSERT INTO tasks (name, kind, user_id, due, duration_minutes, goal_part_id, done, plan_pinned)
+        VALUES ('S', 'task', $1, $2, 45, $3, $4, false) RETURNING id`,
+        [user.id, due, partId, !!extra.done]))[0].id;
+    const status = async (user) => {
+        const r = await call("GET", `${S}/status`, null, user.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        return r.data;
+    };
+    // a finished part of an existing goal: `actual` minutes
+    const finished = async (user, goalId, name, actual) => sql(
+        `INSERT INTO goal_parts (goal_id, name, position, estimate_minutes, done_at, actual_minutes)
+        VALUES ($1, $2, 50, 60, now(), $3)`,
+        [goalId, name, actual]
+    );
+    const estimate = (user, body) => call("POST", `${S}/estimate`, { subjectName: "Mathe", kind: "exam", due: daysFromToday(20), parts: ["Analysis"], ...body }, user.token);
+
+    test("a part that reached its estimate loses its future sessions on GET /status, replan resets the freed time", async () => {
+        const me = await tester();
+        const g = await goal(me, (await subject(me)).id);
+        await apply(me);
+        const a = g.parts[0].id;
+        const before = await sql("SELECT id FROM tasks WHERE goal_part_id = $1", [a]);
+        assert.equal(before.length, 1);
+        await session(me, a, daysFromToday(0), { done: true });
+        const s = await status(me);
+        assert.equal(s.aiAvailable, false);
+        assert.deepEqual(s.goals, [{ goalId: g.id, name: "Hausarbeit", behindMinutes: 0, conflictTaskIds: [], freedMinutes: 45 }]);
+        assert.deepEqual(s.notifiedMinutes, { [g.id]: 0 });
+        assert.equal((await sql("SELECT id FROM tasks WHERE goal_part_id = $1 AND NOT done", [a])).length, 0);
+        assert.equal((await status(me)).goals[0].freedMinutes, 45, "not counted twice");
+        await apply(me);
+        assert.equal((await status(me)).goals[0].freedMinutes, 0);
+    });
+
+    test("behind after a missed session, 'So lassen' hides it until it grows", async () => {
+        const me = await tester();
+        const them = await tester();
+        const g = await goal(me, (await subject(me)).id);
+        const yesterday = daysFromToday(-1);
+        await session(me, g.parts[1].id, yesterday);
+        assert.equal((await status(me)).goals[0].behindMinutes, 45);
+        assert.equal((await call("POST", `${S}/goals/${g.id}/dismiss`, null, them.token)).status, 404);
+        const d = await call("POST", `${S}/goals/${g.id}/dismiss`, null, me.token);
+        assert.deepEqual([d.status, d.data], [200, { ok: true, notifiedMinutes: 45 }]);
+        const s = await status(me);
+        assert.deepEqual(s.notifiedMinutes, { [g.id]: 45 });
+        assert.equal(s.goals[0].behindMinutes, 45, "the deficit is still reported; the app compares it with notifiedMinutes");
+        await session(me, g.parts[2].id, yesterday);
+        const grown = await status(me);
+        assert.equal(grown.goals[0].behindMinutes, 90);
+        assert.equal(grown.notifiedMinutes[g.id], 45);
+    });
+
+    test("estimate: history, pages, default", async () => {
+        const me = await tester();
+        const sub = await subject(me);
+        const g = await goal(me, sub.id, { kind: "exam" });
+        for (const m of [90, 100, 200]) await finished(me, g.id, "Thema", m);
+        let r = await estimate(me, { subjectId: sub.id });
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        assert.deepEqual(r.data, { estimates: [{ minutes: 100, source: "history" }], aiUsed: false, aiFailed: false });
+        assert.equal((await estimate(me, { subjectId: 2147483000 })).status, 404);
+
+        const pager = await tester();
+        const pg = await goal(pager, (await subject(pager)).id, { kind: "presentation" });
+        for (const n of [1, 2, 3]) await finished(pager, pg.id, `Kapitel ${n}, S. 10–30`, 40);
+        r = await estimate(pager, { parts: ["Kapitel 4, S. 120–160", "Rest"] });
+        assert.deepEqual(r.data.estimates, [{ minutes: 80, source: "pages" }, { minutes: 120, source: "default" }]);
+
+        const fresh = await tester();
+        r = await estimate(fresh, { parts: ["x"], kind: "presentation", ai: true });
+        assert.deepEqual(r.data, { estimates: [{ minutes: 90, source: "default" }], aiUsed: false, aiFailed: false }, "no key: no AI, not a failure");
+    });
+
+    test("estimate: input checks", async () => {
+        const me = await tester();
+        const ok = (await estimate(me, { parts: Array.from({ length: 40 }, (_, i) => `P${i}`) }));
+        assert.equal(ok.status, 200);
+        assert.equal(ok.data.estimates.length, 40);
+        for (const body of [
+            { parts: Array.from({ length: 41 }, (_, i) => `P${i}`) }, { parts: [] }, { parts: ["  "] }, { parts: [3] },
+            { parts: ["x".repeat(201)] }, { kind: "party" }, { subjectName: "" },
+        ]) {
+            const r = await estimate(me, body);
+            assert.deepEqual([r.status, r.data.code], [400, "invalid_input"], JSON.stringify(body));
+        }
+    });
+});
