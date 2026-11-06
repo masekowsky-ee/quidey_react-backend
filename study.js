@@ -235,6 +235,8 @@ module.exports = ({ pool, realtime, loadTask }) => {
         let removed = 0;
         try {
             await client.query('BEGIN');
+            // goals before tasks, by id, like POST /replan (no deadlock between them)
+            await client.query('SELECT id FROM goals WHERE subject_id = $1 AND user_id = $2 ORDER BY id FOR UPDATE', [id, userId]);
             const partIds = (await client.query(
                 'SELECT goal_parts.id FROM goal_parts JOIN goals ON goals.id = goal_parts.goal_id WHERE goals.subject_id = $1 AND goals.user_id = $2',
                 [id, userId]
@@ -467,6 +469,15 @@ module.exports = ({ pool, realtime, loadTask }) => {
         res.status(201).json(await partDetail(userId, goalId, partId));
     });
 
+    // Locks the goal of one of my parts: goal before parts and tasks, the order POST /replan uses.
+    async function lockGoalOfPart(client, userId, partId) {
+        await client.query(
+            `SELECT goals.id FROM goals JOIN goal_parts ON goal_parts.goal_id = goals.id
+            WHERE goal_parts.id = $1 AND goals.user_id = $2 FOR UPDATE OF goals`,
+            [partId, userId]
+        );
+    }
+
     // Finishing a part (inside the caller's transaction): its credit is kept, its replaceable sessions go,
     // their minutes count as freed. Returns how many tasks were deleted.
     async function finishPart(client, userId, part) {
@@ -504,6 +515,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         let removed = 0;
         let goalId;
         const found = await inTransaction(async (client) => {
+            await lockGoalOfPart(client, userId, partId);
             const part = (await client.query(
                 `SELECT goal_parts.id, goal_parts.goal_id, goal_parts.done_at FROM goal_parts
                 JOIN goals ON goals.id = goal_parts.goal_id WHERE goal_parts.id = $1 AND goals.user_id = $2 FOR UPDATE OF goal_parts`,
@@ -528,6 +540,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         const partId = idParam(req.params.id);
         let removed = 0;
         const found = await inTransaction(async (client) => {
+            await lockGoalOfPart(client, userId, partId);
             const part = (await client.query(
                 `SELECT goal_parts.id FROM goal_parts JOIN goals ON goals.id = goal_parts.goal_id
                 WHERE goal_parts.id = $1 AND goals.user_id = $2 FOR UPDATE OF goal_parts`,

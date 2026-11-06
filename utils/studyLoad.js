@@ -28,12 +28,20 @@ async function getClock(db, userId) {
 }
 
 // Planned sessions of the given parts, in the shape of utils/studyStatus.js (plus dueTime-less date/time).
+// `pinned`: pinned by the user, or with a note, group, collection or share attached.
 async function loadSessions(db, userId, partIds) {
     if (partIds.length === 0) return [];
     const { rows } = await db.query(
         `SELECT tasks.id, tasks.goal_part_id, to_char(tasks.due, 'YYYY-MM-DD') AS date,
             to_char(tasks.due_time, 'HH24:MI') AS time, COALESCE(tasks.duration_minutes, 0) AS minutes,
-            COALESCE(tasks.done, false) AS done, tasks.plan_pinned,
+            COALESCE(tasks.done, false) AS done,
+            -- something of the user's hangs on it (a note, a group, a collection, a share): the planner
+            -- keeps it like a pinned one, a replan would delete it with all that (controller ruling 19)
+            (tasks.plan_pinned
+                OR EXISTS (SELECT 1 FROM notes WHERE notes.task_id = tasks.id)
+                OR EXISTS (SELECT 1 FROM task_groups WHERE task_groups.task_id = tasks.id)
+                OR EXISTS (SELECT 1 FROM collection_items WHERE collection_items.task_id = tasks.id)
+                OR EXISTS (SELECT 1 FROM task_shares WHERE task_shares.task_id = tasks.id)) AS plan_pinned,
             COALESCE((SELECT sum(time_ms) FROM session_tasks WHERE session_tasks.task_id = tasks.id), 0)::float8 AS focus_ms
         FROM tasks
         WHERE tasks.user_id = $1 AND tasks.goal_part_id = ANY($2::int[]) AND tasks.due IS NOT NULL

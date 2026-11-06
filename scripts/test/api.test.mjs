@@ -3855,6 +3855,36 @@ describe("study plan", () => {
         assert.equal(rows[resized.id].duration_minutes, 30);
     });
 
+    test("a session with a note, a group, a collection or a share is kept as it is by a replan", async () => {
+        const me = await tester();
+        const friend = await tester();
+        await befriend(me, friend, `planner${count}`);
+        const sub = await subject(me);
+        await goal(me, sub.id);
+        await apply(me);
+        const [noted, grouped, collected, shared, plain] = await sessionsOf(me);
+        assert.equal((await call("POST", `/api/tasks/${noted.id}/notes`, { content: "Formeln S. 12" }, me.token)).status, 201);
+        const group = (await call("POST", "/api/groups", { name: "Uni", description: "" }, me.token)).data;
+        assert.ok([200, 201].includes((await call("POST", `/api/tasks/${grouped.id}/groups/${group.id}`, null, me.token)).status));
+        assert.equal((await call("POST", "/api/tester/collections", { name: "Lernen", items: [{ kind: "task", id: collected.id }] }, me.token)).status, 201);
+        const share = await call("POST", `/api/tasks/${shared.id}/shares`, { userIds: [friend.id] }, me.token);
+        assert.ok([200, 201].includes(share.status), JSON.stringify(share.data));
+        const kept = [noted.id, grouped.id, collected.id, shared.id];
+        const rows = () => sql("SELECT * FROM tasks WHERE id = ANY($1) ORDER BY id", [kept]);
+        const before = await rows();
+        assert.ok(before.every(r => r.plan_pinned === false), "none was moved or edited");
+
+        // a new earlier goal moves everything that is still the planner's
+        await goal(me, sub.id, { name: "Referat", kind: "presentation", due: daysFromToday(3), parts: [{ name: "X", estimateMinutes: 360 }] });
+        await apply(me);
+        assert.deepEqual(await rows(), before, "kept with the row intact");
+        assert.equal((await sql("SELECT count(*)::int AS n FROM notes WHERE task_id = $1", [noted.id]))[0].n, 1);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM task_groups WHERE task_id = $1", [grouped.id]))[0].n, 1);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM collection_items WHERE task_id = $1", [collected.id]))[0].n, 1);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM task_shares WHERE task_id = $1", [shared.id]))[0].n, 1);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE id = $1", [plain.id]))[0].n, 0, "a session without anything attached is replaced");
+    });
+
     test("a new session length shows as moved in the preview, also on the same day", async () => {
         const me = await tester();
         await goal(me, (await subject(me)).id);
@@ -3989,6 +4019,27 @@ describe("study plan", () => {
             assert.ok([200, 409].includes(replan.status), JSON.stringify(replan));
             assert.equal(removal.status, 200, JSON.stringify(removal.data));
             assert.equal((await sql("SELECT count(*)::int AS n FROM goals WHERE id = $1", [doomed.id]))[0].n, 0);
+        }
+    });
+
+    test("finishing or deleting a part, or deleting a subject, while a plan is applied: no deadlock", async () => {
+        const me = await tester();
+        const actions = [
+            (g) => call("PATCH", `${S}/parts/${g.parts[1].id}`, { doneAt: true }, me.token),
+            (g) => call("DELETE", `${S}/parts/${g.parts[2].id}`, null, me.token),
+            (g) => call("DELETE", `${S}/subjects/${g.subjectId}`, null, me.token),
+        ];
+        for (let round = 0; round < 9; round++) {
+            const target = await goal(me, (await subject(me, `Fach ${round}`)).id, { name: `Ziel ${round}`, due: daysFromToday(6) });
+            await apply(me);
+            await goal(me, (await subject(me, `Neu ${round}`)).id, { name: `Neu ${round}`, due: daysFromToday(4) });
+            const p = await preview(me);
+            const [replan, other] = await Promise.all([
+                call("POST", `${S}/replan`, { inputHash: p.inputHash }, me.token),
+                actions[round % 3](target),
+            ]);
+            assert.ok([200, 409].includes(replan.status), JSON.stringify(replan));
+            assert.equal(other.status, 200, JSON.stringify(other.data));
         }
     });
 
