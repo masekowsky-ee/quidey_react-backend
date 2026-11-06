@@ -3963,4 +3963,29 @@ describe("study plan", () => {
         assert.equal(plain.goal_part_id, null);
         assert.equal(plain.plan_pinned, false);
     });
+
+    test("a goal of an archived subject is not planned and its sessions stay as they are", async () => {
+        const me = await tester();
+        const hidden = await subject(me, "Latein");
+        const kept = await goal(me, hidden.id, { name: "Vokabeln" });
+        await apply(me);
+        const shown = await subject(me, "Mathe");
+        const planned = await goal(me, shown.id);
+        await sql("UPDATE goals SET freed_minutes = 30 WHERE id = $1", [kept.id]);
+        assert.equal((await call("PATCH", `${S}/subjects/${hidden.id}`, { archived: true }, me.token)).status, 200);
+        const parts = kept.parts.map(x => x.id);
+        const hiddenRows = () => sql("SELECT * FROM tasks WHERE goal_part_id = ANY($1) ORDER BY id", [parts]);
+        const before = await hiddenRows();
+        assert.equal(before.length, 6, "replaceable sessions of the archived subject's goal");
+
+        const p = await preview(me);
+        assert.deepEqual(p.goals.map(x => x.goalId), [planned.id], "only the goal of the subject that is shown");
+        assert.deepEqual(Object.keys(p.shortfall), [String(planned.id)]);
+        assert.deepEqual(p.goals[0].summary, { moved: 0, added: 6, dropped: 0, unchanged: 0 });
+        const r = await call("POST", `${S}/replan`, { inputHash: p.inputHash }, me.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        assert.deepEqual(await hiddenRows(), before, "not touched");
+        assert.equal((await sql("SELECT freed_minutes FROM goals WHERE id = $1", [kept.id]))[0].freed_minutes, 30);
+        assert.equal((await sessionsOf(me)).length, 12);
+    });
 });

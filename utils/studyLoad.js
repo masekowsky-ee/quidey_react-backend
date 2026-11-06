@@ -54,7 +54,8 @@ async function loadGoals(db, userId, { id = null, subjectId = null } = {}) {
     if (subjectId != null) { params.push(subjectId); where.push(`subject_id = $${params.length}`); }
     const goals = (await db.query(
         `SELECT id, subject_id, kind, name, to_char(due, 'YYYY-MM-DD') AS due, to_char(due_time, 'HH24:MI') AS due_time,
-            plan_mode, status, freed_minutes
+            plan_mode, status, freed_minutes,
+            (SELECT archived FROM subjects WHERE subjects.id = goals.subject_id) AS subject_archived
         FROM goals WHERE ${where.join(' AND ')} ORDER BY due, id`,
         params
     )).rows;
@@ -72,6 +73,7 @@ async function loadGoals(db, userId, { id = null, subjectId = null } = {}) {
             goal: {
                 id: g.id, subjectId: g.subject_id, kind: g.kind, name: g.name, due: g.due, dueTime: g.due_time,
                 planMode: g.plan_mode, status: g.status, freedMinutes: g.freed_minutes,
+                subjectArchived: g.subject_archived,
             },
             parts: own.map((p) => ({
                 id: p.id, name: p.name, position: p.position, estimate: p.estimate_minutes,
@@ -135,6 +137,15 @@ async function loadBusy(db, userId, today, until, activePartIds) {
         .map((r) => ({ id: String(r.id), date: r.due, start: r.start, minutes: r.duration_minutes ?? BUSY_DEFAULT_MINUTES }));
 }
 
+// The goals that are planned (and watched for push/status): status 'active' in a subject that is not
+// archived (spec §1: archiving hides a subject and everything in it; controller ruling 17).
+// ACTIVE_GOAL_SQL is the same rule for queries on `goals` with the user in $1.
+const ACTIVE_GOAL_SQL = `goals.status = 'active'
+    AND goals.subject_id IN (SELECT id FROM subjects WHERE subjects.user_id = $1 AND NOT subjects.archived)`;
+async function loadActiveGoals(db, userId) {
+    return (await loadGoals(db, userId)).filter((g) => g.goal.status === 'active' && !g.goal.subjectArchived);
+}
+
 // Everything the planner needs for one user, read in their timezone (spec §2, §3):
 // { input, sessions, goals, clock }. `input` is plan()'s input; `sessions` are all sessions of the
 // active goals with goalId and status 'missed' | 'replaceable' | 'kept'; `goals` the active goals
@@ -143,7 +154,7 @@ async function loadBusy(db, userId, today, until, activePartIds) {
 // `kept`, pending when nothing is credited yet (controller ruling 12; the planner deducts it).
 async function loadPlanInput(db, userId) {
     const clock = await getClock(db, userId);
-    const goals = (await loadGoals(db, userId)).filter((g) => g.goal.status === 'active');
+    const goals = await loadActiveGoals(db, userId);
     const windows = (await db.query(
         `SELECT weekday, to_char(start_time, 'HH24:MI') AS start, to_char(end_time, 'HH24:MI') AS "end"
         FROM study_windows WHERE user_id = $1 ORDER BY weekday, start_time, end_time, id`,
@@ -207,4 +218,7 @@ function inputHash(input, extra = {}) {
     return crypto.createHash('sha256').update(canonical({ input: rest, ...extra })).digest('hex');
 }
 
-module.exports = { getClock, loadSessions, loadGoals, partView, goalView, goalProgress, loadPlanInput, inputHash };
+module.exports = {
+    getClock, loadSessions, loadGoals, partView, goalView, goalProgress,
+    ACTIVE_GOAL_SQL, loadActiveGoals, loadPlanInput, inputHash,
+};

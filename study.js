@@ -7,7 +7,7 @@ const { sessionCredit, isPending, isReplaceable } = require('./utils/studyStatus
 const { reviewMinutes, makeAiClient } = require('./utils/studyEstimate');
 const { plan } = require('./utils/studyPlanner');
 const {
-    getClock, loadSessions, loadGoals, goalView, goalProgress, loadPlanInput, inputHash,
+    getClock, loadSessions, loadGoals, goalView, goalProgress, loadPlanInput, inputHash, ACTIVE_GOAL_SQL,
 } = require('./utils/studyLoad');
 
 const COLORS = ['red', 'orange', 'yellow', 'green', 'teal', 'blue', 'violet', 'pink'];
@@ -684,12 +684,12 @@ module.exports = ({ pool, realtime, loadTask }) => {
         try {
             outcome = await inTransaction(async (client) => {
                 // two applies (or an apply and a goal edit) take turns; the sessions can't change under us
-                await client.query("SELECT id FROM goals WHERE user_id = $1 AND status = 'active' ORDER BY id FOR UPDATE", [userId]);
+                await client.query(`SELECT id FROM goals WHERE user_id = $1 AND ${ACTIVE_GOAL_SQL} ORDER BY id FOR UPDATE OF goals`, [userId]);
                 await client.query(
                     `SELECT tasks.id FROM tasks
                     JOIN goal_parts ON goal_parts.id = tasks.goal_part_id
                     JOIN goals ON goals.id = goal_parts.goal_id
-                    WHERE tasks.user_id = $1 AND goals.user_id = $1 AND goals.status = 'active'
+                    WHERE tasks.user_id = $1 AND goals.user_id = $1 AND ${ACTIVE_GOAL_SQL}
                     ORDER BY tasks.id FOR UPDATE OF tasks`,
                     [userId]
                 );
@@ -715,7 +715,8 @@ module.exports = ({ pool, realtime, loadTask }) => {
                             rows.map((r) => r.time), rows.map((r) => r.minutes), rows.map((r) => r.partId)]
                     );
                 }
-                await client.query("UPDATE goals SET freed_minutes = 0 WHERE user_id = $1 AND status = 'active'", [userId]);
+                // only the goals just planned (goals of an archived subject keep theirs)
+                await client.query('UPDATE goals SET freed_minutes = 0 WHERE user_id = $1 AND id = ANY($2::int[])', [userId, current.goals.map((g) => g.goal.id)]);
                 return { ok: true };
             });
         } catch (err) {
