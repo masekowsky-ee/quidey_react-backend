@@ -3815,31 +3815,60 @@ describe("study plan", () => {
         const sub = await subject(me);
         await goal(me, sub.id);
         await apply(me);
-        const [s] = await sessionsOf(me);
-        // renaming, with the same day, time and length, is no move
-        assert.equal((await putTask(me, s.id, { name: "Kapitel 1" })).status, 200);
-        assert.equal((await sql("SELECT plan_pinned FROM tasks WHERE id = $1", [s.id]))[0].plan_pinned, false);
+        const pinnedOf = async (id) => (await sql("SELECT plan_pinned FROM tasks WHERE id = $1", [id]))[0].plan_pinned;
+        const [ticked, moved, renamed, reminded, timed, resized] = await sessionsOf(me);
 
-        const target = s.due === daysFromToday(8) ? daysFromToday(7) : daysFromToday(8);
-        const r = await putTask(me, s.id, { due: target });
+        // sending it back unchanged, or only ticking it off, is no edit
+        assert.equal((await putTask(me, ticked.id, {})).status, 200);
+        assert.equal(await pinnedOf(ticked.id), false);
+        const tick = await putTask(me, ticked.id, { done: true });
+        assert.equal(tick.status, 200, JSON.stringify(tick.data));
+        assert.equal(tick.data.plan_pinned, false, "ticking done alone does not pin");
+
+        const target = moved.due === daysFromToday(8) ? daysFromToday(7) : daysFromToday(8);
+        const r = await putTask(me, moved.id, { due: target });
         assert.equal(r.status, 200, JSON.stringify(r.data));
         assert.equal(r.data.plan_pinned, true);
-        assert.equal((await sql("SELECT plan_pinned FROM tasks WHERE id = $1", [s.id]))[0].plan_pinned, true);
+        assert.equal(await pinnedOf(moved.id), true);
 
-        // a new length or a time pins too
-        const [s2] = (await sessionsOf(me)).filter(x => !x.plan_pinned);
-        assert.equal((await putTask(me, s2.id, { duration_minutes: 30 })).data.plan_pinned, true);
-        const [s3] = (await sessionsOf(me)).filter(x => !x.plan_pinned);
-        assert.equal((await putTask(me, s3.id, { due_time: "15:00" })).data.plan_pinned, true);
+        // every other edit pins too (ruling 18): a replan would otherwise delete it, notes and all
+        assert.equal((await putTask(me, renamed.id, { name: "Kapitel 1" })).data.plan_pinned, true);
+        assert.equal((await putTask(me, reminded.id, { reminders: [10] })).data.plan_pinned, true);
+        assert.equal((await putTask(me, timed.id, { due_time: "15:00" })).data.plan_pinned, true);
+        assert.equal((await putTask(me, resized.id, { duration_minutes: 30 })).data.plan_pinned, true);
         // an ordinary task is never pinned
         const plain = (await call("POST", "/api/tasks", { name: "Wäsche", due: daysFromToday(1) }, me.token)).data;
         assert.equal((await putTask(me, plain.id, { due: daysFromToday(2) })).data.plan_pinned, false);
 
         await goal(me, sub.id, { name: "Referat", kind: "presentation", due: daysFromToday(3), parts: [{ name: "X", estimateMinutes: 360 }] });
         await apply(me);
-        const [after] = await sql("SELECT to_char(due, 'YYYY-MM-DD') AS due, plan_pinned FROM tasks WHERE id = $1", [s.id]);
+        const [after] = await sql("SELECT to_char(due, 'YYYY-MM-DD') AS due, plan_pinned FROM tasks WHERE id = $1", [moved.id]);
         assert.deepEqual(after, { due: target, plan_pinned: true }, "still on that day");
-        assert.equal((await sql("SELECT duration_minutes FROM tasks WHERE id = $1", [s2.id]))[0].duration_minutes, 30);
+        const rows = Object.fromEntries((await sql(
+            "SELECT id, name, reminders, to_char(due_time, 'HH24:MI') AS due_time, duration_minutes, done FROM tasks WHERE id = ANY($1)",
+            [[ticked.id, renamed.id, reminded.id, timed.id, resized.id]]
+        )).map(x => [x.id, x]));
+        assert.equal(rows[ticked.id].done, true);
+        assert.equal(rows[renamed.id].name, "Kapitel 1");
+        assert.deepEqual(rows[reminded.id].reminders, [10]);
+        assert.equal(rows[timed.id].due_time, "15:00");
+        assert.equal(rows[resized.id].duration_minutes, 30);
+    });
+
+    test("a new session length shows as moved in the preview, also on the same day", async () => {
+        const me = await tester();
+        await goal(me, (await subject(me)).id);
+        await apply(me);
+        // 45 / 90 / 135 in sessions of 50: A 45, B 50+40, C 50+50+35, on the same days as before
+        assert.equal((await call("PUT", `${S}/settings`, { sessionMinutes: 50 }, me.token)).status, 200);
+        const [pg] = (await preview(me)).goals;
+        assert.deepEqual(pg.summary, { moved: 5, added: 0, dropped: 0, unchanged: 1 }, JSON.stringify(pg));
+        for (const c of pg.changes) {
+            assert.equal(c.type, "moved");
+            assert.notEqual(c.partName, "A");
+            assert.deepEqual(c.to, c.from, "same day, new length");
+        }
+        assert.deepEqual(pg.changes.map(c => c.minutes).sort(), [35, 40, 50, 50, 50]);
     });
 
     test("apply drops missed sessions, keeps done and pinned ones, resets freed minutes", async () => {
@@ -3921,10 +3950,46 @@ describe("study plan", () => {
         assert.equal(d.status, 201);
         assert.equal(d.data.task.due_time, null);
 
+        // on the day itself it still works (an exam in the afternoon); once the day is over it doesn't
+        await sql("UPDATE goals SET due = $2 WHERE id = $1", [days.id, daysFromToday(0)]);
+        assert.equal((await call("POST", `${S}/parts/${days.parts[0].id}/now`, null, me.token)).status, 201);
+        await sql("UPDATE goals SET due = $2 WHERE id = $1", [days.id, daysFromToday(-1)]);
+        const late = await call("POST", `${S}/parts/${days.parts[0].id}/now`, null, me.token);
+        assert.equal(late.status, 400);
+        assert.equal(late.data.code, "due_in_past");
+
         await call("PATCH", `${S}/goals/${days.id}`, { status: "done" }, me.token);
         assert.equal((await call("POST", `${S}/parts/${days.parts[0].id}/now`, null, me.token)).data.code, "goal_not_active");
         assert.equal((await call("POST", `${S}/parts/${slots.parts[0].id}/now`, null, them.token)).status, 404);
         assert.equal((await call("POST", `${S}/parts/abc/now`, null, me.token)).status, 404);
+
+        // an archived subject hides its goals: no "Jetzt lernen" there
+        const hidden = await subject(me, "Archiv");
+        const archivedGoal = await goal(me, hidden.id);
+        assert.equal((await call("PATCH", `${S}/subjects/${hidden.id}`, { archived: true }, me.token)).status, 200);
+        const archived = await call("POST", `${S}/parts/${archivedGoal.parts[0].id}/now`, null, me.token);
+        assert.equal(archived.status, 400);
+        assert.equal(archived.data.code, "goal_not_active");
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE goal_part_id = $1", [archivedGoal.parts[0].id]))[0].n, 0);
+    });
+
+    test("deleting a goal while a plan is applied: both finish, no deadlock", async () => {
+        const me = await tester();
+        const sub = await subject(me);
+        for (let round = 0; round < 5; round++) {
+            await goal(me, sub.id, { name: `Bleibt ${round}` });
+            const doomed = await goal(me, sub.id, { name: `Weg ${round}`, due: daysFromToday(6) });
+            await apply(me);
+            await goal(me, sub.id, { name: `Neu ${round}`, due: daysFromToday(4) });
+            const p = await preview(me);
+            const [replan, removal] = await Promise.all([
+                call("POST", `${S}/replan`, { inputHash: p.inputHash }, me.token),
+                call("DELETE", `${S}/goals/${doomed.id}?sessions=delete`, null, me.token),
+            ]);
+            assert.ok([200, 409].includes(replan.status), JSON.stringify(replan));
+            assert.equal(removal.status, 200, JSON.stringify(removal.data));
+            assert.equal((await sql("SELECT count(*)::int AS n FROM goals WHERE id = $1", [doomed.id]))[0].n, 0);
+        }
     });
 
     test("unpin: only my own planned sessions", async () => {

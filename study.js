@@ -67,7 +67,7 @@ const slot = (s) => ({ date: s.date, time: s.time ?? null });
 const toHHMM = (minutes) => `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
 
 // What applying would change, per goal (spec §3): each part's replaceable sessions are matched with
-// its new ones in date order. Same day and time: unchanged; otherwise moved; new ones left over are
+// its new ones in date order. Same day, time and length: unchanged; otherwise moved; new ones left over are
 // new, old ones left over dropped. Missed sessions are dropped too.
 function previewOf(goals, sessions, result, hash) {
     return {
@@ -84,7 +84,7 @@ function previewOf(goals, sessions, result, hash) {
                     const from = old[i];
                     const to = next[i];
                     if (from && to) {
-                        if (from.date === to.date && (from.time ?? null) === (to.time ?? null)) {
+                        if (from.date === to.date && (from.time ?? null) === (to.time ?? null) && from.minutes === to.minutes) {
                             summary.unchanged++;
                         } else {
                             summary.moved++;
@@ -398,6 +398,8 @@ module.exports = ({ pool, realtime, loadTask }) => {
         if (!(await ownedGoal(pool, userId, id))) return notFound(res);
         let removed = 0;
         await inTransaction(async (client) => {
+            // the goal before its tasks, in the same order as POST /replan (no deadlock between them)
+            await client.query('SELECT id FROM goals WHERE id = $1 AND user_id = $2 FOR UPDATE', [id, userId]);
             if (mode === 'delete') {
                 const partIds = (await client.query('SELECT id FROM goal_parts WHERE goal_id = $1', [id])).rows.map((r) => r.id);
                 const doomed = await pendingTaskIds(client, userId, partIds, await getClock(client, userId));
@@ -728,20 +730,23 @@ module.exports = ({ pool, realtime, loadTask }) => {
     });
 
     // "Jetzt lernen": a pinned session of this part for now (slots: now rounded down to 5 minutes;
-    // days: today without a time), as long as the session length.
+    // days: today without a time), as long as the session length. Only for a goal that is planned
+    // (active, subject not archived) and whose day isn't over.
     router.post('/parts/:id/now', async (req, res) => {
         const userId = req.user.userId;
         const part = (await pool.query(
-            `SELECT goal_parts.id, goal_parts.name, goals.status, goals.plan_mode, subjects.color
+            `SELECT goal_parts.id, goal_parts.name, goals.plan_mode, to_char(goals.due, 'YYYY-MM-DD') AS due,
+                subjects.color, (${ACTIVE_GOAL_SQL}) AS active
             FROM goal_parts
             JOIN goals ON goals.id = goal_parts.goal_id
             JOIN subjects ON subjects.id = goals.subject_id
-            WHERE goal_parts.id = $1 AND goals.user_id = $2`,
-            [idParam(req.params.id), userId]
+            WHERE goal_parts.id = $2 AND goals.user_id = $1`,
+            [userId, idParam(req.params.id)]
         )).rows[0];
         if (!part) return notFound(res);
-        if (part.status !== 'active') return fail(res, 400, 'goal_not_active', 'The goal is not active');
+        if (!part.active) return fail(res, 400, 'goal_not_active', 'The goal is not active');
         const clock = await getClock(pool, userId);
+        if (part.due < clock.today) return fail(res, 400, 'due_in_past', 'The due date is in the past');
         const time = part.plan_mode === 'slots' ? toHHMM(Math.floor(clock.nowMinutes / 5) * 5) : null;
         const id = (await pool.query(
             `INSERT INTO tasks (kind, user_id, name, color, due, due_time, duration_minutes, goal_part_id, plan_pinned, reminders)

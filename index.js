@@ -429,6 +429,8 @@ const TASK_EXTRAS = {
 };
 // the fields only a task's owner can change (the others' values are ignored)
 const OWNER_ONLY_FIELDS = ["reminder_email", "kind", "event_type_id"];
+// the columns that may change without pinning a planned study session: ticking it off (SQL text[])
+const PIN_IGNORED = "'{done,completed_at,plan_pinned}'::text[]";
 function readTaskExtras(body, fields = TASK_EXTRAS) {
     // an app from before several reminders sends one as reminder_minutes (null: none)
     if (fields.reminders && body?.reminders === undefined && body?.reminder_minutes !== undefined) {
@@ -2464,7 +2466,8 @@ app.put("/api/tasks/:id", async (req, res) => {
     try {
         await client.query("BEGIN");
         const before = await client.query(
-            `SELECT done, kind, user_id FROM tasks WHERE id = $1 AND id IN (${accessibleTaskIds("$2")}) FOR UPDATE`,
+            `SELECT done, kind, user_id, to_jsonb(tasks) - ${PIN_IGNORED} AS fields
+            FROM tasks WHERE id = $1 AND id IN (${accessibleTaskIds("$2")}) FOR UPDATE`,
             [id, userId]
         );
         if (before.rows.length === 0) {
@@ -2492,10 +2495,8 @@ app.put("/api/tasks/:id", async (req, res) => {
         // completed_at: set when the task becomes done (SET sees the old row), cleared when reopened
         const sets = ["name = $1", "due = $2", "description = $3", "prio = $4", "done = $5",
             "completed_at = CASE WHEN NOT $5 THEN NULL WHEN tasks.done THEN tasks.completed_at ELSE now() END"];
-        const param = {}; // column -> its parameter number
         for (const [column, value] of Object.entries(extras.values)) {
             values.push(value);
-            param[column] = values.length;
             // e.g. mails go to the owner, so only the owner turns them on or off ($7: me)
             sets.push(OWNER_ONLY_FIELDS.includes(column)
                 ? `${column} = CASE WHEN tasks.user_id = $7 THEN $${values.length} ELSE tasks.${column} END`
@@ -2508,13 +2509,15 @@ app.put("/api/tasks/:id", async (req, res) => {
             values.push(extras.values.repeat);
             sets.push(`repeat_skip = CASE WHEN tasks.repeat IS DISTINCT FROM $${values.length} THEN '{}' ELSE tasks.repeat_skip END`);
         }
-        // a planned study session moved or resized by hand is the user's now: the planner keeps it
-        const newDueTime = param.due_time ? `$${param.due_time}::time` : due ? "tasks.due_time" : "NULL::time";
-        const newDuration = param.duration_minutes ? `$${param.duration_minutes}::integer` : "tasks.duration_minutes";
-        sets.push(`plan_pinned = tasks.plan_pinned OR (tasks.goal_part_id IS NOT NULL AND (tasks.due IS DISTINCT FROM $2::date
-            OR tasks.due_time IS DISTINCT FROM ${newDueTime} OR tasks.duration_minutes IS DISTINCT FROM ${newDuration}))`);
-
         await client.query(`UPDATE tasks SET ${sets.join(", ")} WHERE id = $6 AND id IN (${accessibleTaskIds("$7")})`, values);
+        // a planned study session the user changed in any way but ticking it off is theirs now:
+        // a re-plan keeps it (with its notes) instead of replacing it (controller ruling 18)
+        await client.query(
+            `UPDATE tasks SET plan_pinned = true
+            WHERE id = $1 AND goal_part_id IS NOT NULL AND NOT plan_pinned
+                AND to_jsonb(tasks) - ${PIN_IGNORED} IS DISTINCT FROM $2::jsonb`,
+            [id, old.fields]
+        );
         const [synced] = await syncEvents(client, "tasks.id = $1", [id]);
         const nextId = kind === "event" ? synced?.nextId ?? null
             : old.done || !done ? null : await createNextRepeat(client, id);
