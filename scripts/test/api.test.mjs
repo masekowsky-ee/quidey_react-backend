@@ -105,7 +105,7 @@ before(async () => {
         cwd: ROOT,
         env: {
             ...process.env, DB_NAME: DB, PORT: String(port), SMTP_HOST: "", CONTACT_TO: "owner@example.com",
-            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_FRIEND_REQUESTS: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", FOCUS_CHECK_MS: "200", NOTEBOOK_STORAGE_MAX: "4000", PRESENCE_GRACE_MS: "200",
+            RATE_LIMIT_REGISTER: "1000", RATE_LIMIT_AUTH: "1000", RATE_LIMIT_FRIEND_REQUESTS: "1000", RATE_LIMIT_VERIFICATION_MAIL: "1000", RATE_LIMIT_API: "10000", REMINDER_CHECK_MS: "200", EVENT_CHECK_MS: "200", FOCUS_CHECK_MS: "200", NOTEBOOK_STORAGE_MAX: "4000", PRESENCE_GRACE_MS: "200", USAGE_RAW_MAX: "50",
             // pushes are only logged ("[DEV] Push to user …"), like mails without SMTP_HOST
             VAPID_PUBLIC_KEY: "", VAPID_PRIVATE_KEY: "",
             // the Android app's pushes are only logged too; Pro on sale, but no payments set up
@@ -4739,5 +4739,129 @@ describe("usage statistics", () => {
         assert.equal((await call("DELETE", "/api/users", { password: PW }, u.token)).status, 200);
         assert.equal((await marks(u)).length, 0);
         assert.deepEqual((await hourly("app_open")).map((r) => r.events), [1]);
+    });
+});
+
+describe("admin usage", () => {
+    let pool, countUsage, localParts;
+    let boss, ann, ben;
+    let day1, day2, hour1, weekday1;
+    const stamp = (daysAgo, hour = 12) => { const d = new Date(); d.setUTCDate(d.getUTCDate() - daysAgo); d.setUTCHours(hour, 30, 0, 0); return d; };
+    const get = (path, who = boss) => call("GET", `/api/admin/usage${path}`, null, who.token);
+    const dayRow = (data, date) => data.daily.find((d) => d.date === date);
+
+    before(async () => {
+        ({ countUsage, localParts } = createRequire(import.meta.url)("../../utils/usage.js"));
+        pool = new pg.Pool(conn(DB));
+        boss = await member("uadmin", { admin: true });
+        ann = await member("uann");
+        ben = await member("uben");
+        for (const u of [ann, ben]) await call("PUT", "/api/profile/usage-consent", { granted: true }, u.token);
+        const nope = await member("unope");
+        await call("PUT", "/api/profile/usage-consent", { granted: false }, nope.token);
+        await sql("TRUNCATE usage_hourly, usage_people");
+        const t1 = stamp(3), t2 = stamp(2);
+        ({ day: day1, localHour: hour1, weekday: weekday1 } = localParts(t1, "Europe/Berlin"));
+        day2 = localParts(t2, "Europe/Berlin").day;
+        // day 1: both people, ann on android, ben on web; day 2: ann only
+        await countUsage(pool, ann.id, "task_done", { platform: "android", at: t1 });
+        await countUsage(pool, ben.id, "task_done", { platform: "web", at: t1 });
+        await countUsage(pool, ann.id, "task_created", { platform: "android", at: t1 });
+        await countUsage(pool, ann.id, "focus_done", { value: 1800, platform: "android", at: t1 });
+        await countUsage(pool, ben.id, "focus_done", { value: 1800, platform: "web", at: t1 });
+        await countUsage(pool, ann.id, "active_minute", { value: 1, platform: "android", at: t1 });
+        await countUsage(pool, ben.id, "active_minute", { value: 1, platform: "web", at: t1 });
+        await countUsage(pool, ben.id, "active_minute", { value: 1, platform: "web", at: t1 });
+        await countUsage(pool, ann.id, "task_done", { platform: "android", at: t2 });
+        await countUsage(pool, ann.id, "view:calendar", { platform: "android", at: t2 });
+    });
+    after(async () => { await pool?.end(); await sql("TRUNCATE usage_hourly, usage_people"); });
+
+    test("admins only", async () => {
+        const r = await get("", ann);
+        assert.equal(r.status, 403);
+        assert.equal(r.data.code, "ADMIN_REQUIRED");
+        assert.equal((await get("/raw", ann)).data.code, "ADMIN_REQUIRED");
+    });
+
+    test("report: summary, consent counts, daily, heatmap", async () => {
+        const r = await get(`?from=${day1}&to=${day2}`);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        assert.deepEqual(r.data.range, { from: day1, to: day2 });
+        const users = (await sql("SELECT usage_consent AS c, count(*)::int AS n FROM users GROUP BY 1")).reduce((o, x) => ({ ...o, [x.c ?? "none"]: x.n }), {});
+        assert.deepEqual(r.data.summary.consent, { granted: users.granted, denied: users.denied, notAsked: users.none });
+        assert.equal(r.data.daily.length, 2);
+        const d1 = dayRow(r.data, day1);
+        assert.deepEqual([d1.active, d1.tasksDone, d1.tasksCreated, d1.focusMinutes], [2, 2, 1, 60]);
+        assert.equal(d1.activeMinutesPerPerson, 1.5);
+        const d2 = dayRow(r.data, day2);
+        assert.deepEqual([d2.active, d2.tasksDone, d2.focusMinutes], [1, 1, 0]);
+        assert.equal(r.data.summary.avgActivePerDay, 1.5);
+        assert.deepEqual(r.data.summary.busiestDay, { date: day1, people: 2 });
+        assert.equal(r.data.summary.focusHours, 1);
+        const cell = r.data.heatmap.task_done.find((c) => c.hour === hour1 && c.weekday === weekday1);
+        assert.equal(cell.people, 2);
+        assert.equal(cell.events, 2);
+        assert.deepEqual(Object.keys(r.data.heatmap).sort(), ["active", "focus_start", "task_done"]);
+        assert.ok(r.data.weekly.length >= 1);
+        assert.ok(r.data.weekly[0].weekStart <= day1);
+    });
+
+    test("report: features and splits", async () => {
+        const r = await get(`?from=${day1}&to=${day2}`);
+        const done = r.data.features.find((f) => f.metric === "task_done");
+        assert.deepEqual([done.personDays, done.events, done.perPersonDay, done.spark.length], [3, 3, 1, 14]);
+        assert.ok(!r.data.features.some((f) => f.metric === "active"));
+        assert.ok(r.data.features.some((f) => f.metric === "view:calendar"));
+        const personDays = r.data.features.map((f) => f.personDays);
+        assert.deepEqual(personDays, [...personDays].sort((a, b) => b - a));
+        const byKey = Object.fromEntries(r.data.splits.platform.map((p) => [p.key, p.personDays]));
+        assert.deepEqual(byKey, { android: 2, web: 1 });
+        assert.ok(r.data.splits.language.length >= 1 && r.data.splits.plan.length >= 1);
+    });
+
+    test("platform filter narrows the numbers", async () => {
+        const r = await get(`?from=${day1}&to=${day2}&platform=android`);
+        assert.equal(dayRow(r.data, day1).active, 1);
+        assert.equal(dayRow(r.data, day1).tasksDone, 1);
+        assert.equal(r.data.heatmap.task_done.reduce((a, c) => a + c.people, 0), 2);
+        assert.equal(r.data.summary.focusHours, 0.5);
+    });
+
+    test("default range is the last 30 days, zeros are filled", async () => {
+        const r = await get("");
+        assert.equal(r.data.daily.length, 30);
+        assert.equal(r.data.daily[29].date, localParts(new Date(), "Europe/Berlin").day);
+        assert.equal(dayRow(r.data, day1).active, 2);
+        assert.equal(r.data.daily.filter((d) => d.active === 0).length, 28);
+    });
+
+    test("bad ranges and filters are refused", async () => {
+        for (const q of [`?from=${day2}&to=${day1}`, "?from=2000-01-01&to=2010-01-01", "?from=nope", "?from=2026-02-31&to=2026-03-01"]) {
+            const r = await get(q);
+            assert.equal(r.status, 400, q);
+            assert.equal(r.data.code, "INVALID_RANGE", q);
+        }
+        for (const q of ["?platform=ios", "?language=fr", "?plan=gold"]) {
+            const r = await get(q);
+            assert.equal(r.status, 400, q);
+            assert.equal(r.data.code, "INVALID_INPUT", q);
+        }
+    });
+
+    test("raw rows, and a range over the cap is refused", async () => {
+        const r = await call("GET", `/api/admin/usage/raw?from=${day1}&to=${day2}&platform=web`, null, boss.token);
+        assert.equal(r.status, 200);
+        const focus = r.data.rows.find((x) => x.metric === "focus_done");
+        assert.deepEqual([focus.platform, focus.valueSum, focus.events, focus.people, focus.localHour], ["web", 1800, 1, 1, hour1]);
+        assert.deepEqual(Object.keys(focus).sort(), ["events", "hour", "language", "localHour", "metric", "people", "plan", "platform", "valueSum", "weekday"]);
+        // more than USAGE_RAW_MAX (50) rows: 4 metrics (with active) over 15 hours
+        for (let h = 0; h < 15; h++) {
+            const at = stamp(1, h);
+            for (const m of ["task_done", "task_created", "app_open"]) await countUsage(pool, ann.id, m, { at });
+        }
+        const big = await call("GET", "/api/admin/usage/raw", null, boss.token);
+        assert.equal(big.status, 400);
+        assert.equal(big.data.code, "USAGE_RANGE_TOO_BIG");
     });
 });

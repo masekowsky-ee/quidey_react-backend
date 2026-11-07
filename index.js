@@ -21,6 +21,7 @@ const { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasAppAccess, hasTe
 const { FREE_LIMITS, FREE_STATS_DAYS, limited, usage, refuseOverLimit } = require("./utils/limits");
 const { FCM_ENDPOINT, isFcmEndpoint } = require("./utils/fcm");
 const progress = require("./utils/progress");
+const { resolveRange, usageReport, usageRaw } = require("./utils/usageReport");
 const { CLIENT_METRICS, cleanPlatform, countUsage, forgetUsageAccount, cleanupUsage, withdrawUsage } = require("./utils/usage");
 const { PROFILE_COLORS, PROFILE_BANNERS, PROFILE_EMOJIS, AVATAR_FRAMES, PROFILE_TITLES, SHOWCASE_MAX, BADGES } = progress;
 
@@ -2214,6 +2215,43 @@ app.get("/api/admin/overview", async (req, res) => {
                 id: a.id, admin: a.admin_username, target: a.target_username, action: a.action, createdAt: a.created_at,
             })),
         });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Anonymous usage report (utils/usageReport.js): ?from=&to= (Berlin dates, default last 30 days) &platform=&language=&plan=
+const USAGE_FILTERS = { platform: ["web", "pwa", "android"], language: ["de", "en"], plan: ["free", "tester", "pro"] };
+function usageParams(req, res) {
+    const params = {};
+    for (const [name, allowed] of Object.entries(USAGE_FILTERS)) {
+        const v = req.query[name];
+        if (v === undefined || v === "") continue;
+        if (typeof v !== "string" || !allowed.includes(v)) { adminFail(res, 400, "INVALID_INPUT", `Invalid ${name}`); return null; }
+        params[name] = v;
+    }
+    const range = resolveRange(req.query.from, req.query.to);
+    if (range.error) { adminFail(res, 400, "INVALID_RANGE", range.error); return null; }
+    return { ...params, from: range.from, to: range.to };
+}
+
+app.get("/api/admin/usage", async (req, res) => {
+    const params = usageParams(req, res);
+    if (!params) return;
+    try {
+        res.json(await usageReport(pool, params));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.get("/api/admin/usage/raw", async (req, res) => {
+    const params = usageParams(req, res);
+    if (!params) return;
+    try {
+        const rows = await usageRaw(pool, params, limitFromEnv("USAGE_RAW_MAX", 200000));
+        if (!rows) return adminFail(res, 400, "USAGE_RANGE_TOO_BIG", "Too many rows, narrow the range");
+        res.json({ rows });
     } catch (err) {
         serverError(res, err);
     }
