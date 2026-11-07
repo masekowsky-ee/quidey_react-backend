@@ -2732,6 +2732,47 @@ describe("Fokusraum: alarm, routines, notebook", () => {
         assert.equal((await call("DELETE", `/api/notebook/${note.id}`, null, fa.token)).status, 200);
     });
 
+    test("a task's notes are notebook notes about it (migration 043): the old routes read and write the notebook", async () => {
+        const created = (await call("POST", "/api/tasks", { name: "Referat Bio" }, fa.token)).data;
+        const taskId = created.id ?? created.task?.id;
+        let r = await call("POST", `/api/tasks/${taskId}/notes`, { content: "Folien bis Freitag" }, fa.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        const quick = r.data;
+        assert.equal(quick.task_id, taskId);
+        assert.equal(quick.content, "Folien bis Freitag");
+
+        // the notebook (Fokusraum, Notizen) has it, about that task
+        const inNotebook = (await call("GET", `/api/notebook/${quick.id}`, null, fa.token)).data;
+        assert.equal(inNotebook.taskId, taskId);
+        assert.equal(inNotebook.body, "Folien bis Freitag");
+
+        // a notebook note about the task shows on the task, its title as the first line
+        const titled = (await call("POST", "/api/notebook", { title: "Gliederung", body: "1. Zelle", taskId }, fa.token)).data;
+        await call("POST", "/api/notebook", { body: "ohne Aufgabe" }, fa.token);
+        let list = (await call("GET", "/api/notes", null, fa.token)).data;
+        assert.deepEqual(list.map(n => n.content), ["Folien bis Freitag", "Gliederung\n1. Zelle"]);
+        assert.deepEqual((await call("GET", `/api/tasks/${taskId}/notes`, null, fa.token)).data.map(n => n.id), [quick.id, titled.id]);
+
+        // editing on the task keeps the title while the first line still is it
+        r = await call("PUT", `/api/notes/${titled.id}`, { content: "Gliederung\n1. Zelle\n2. Kern" }, fa.token);
+        assert.equal(r.status, 200);
+        let row = (await call("GET", `/api/notebook/${titled.id}`, null, fa.token)).data;
+        assert.deepEqual([row.title, row.body], ["Gliederung", "1. Zelle\n2. Kern"]);
+        await call("PUT", `/api/notes/${titled.id}`, { content: "Neu" }, fa.token);
+        row = (await call("GET", `/api/notebook/${titled.id}`, null, fa.token)).data;
+        assert.deepEqual([row.title, row.body], ["", "Neu"]);
+
+        // only my own; the trash leaves the task's list
+        assert.equal((await call("PUT", `/api/notes/${quick.id}`, { content: "x" }, fb.token)).status, 404);
+        assert.equal((await call("DELETE", `/api/notes/${quick.id}`, null, fb.token)).status, 404);
+        await sql("UPDATE notebook_notes SET trashed_at = now() WHERE id = $1", [titled.id]);
+        list = (await call("GET", "/api/notes", null, fa.token)).data;
+        assert.deepEqual(list.map(n => n.id), [quick.id]);
+        assert.equal((await call("DELETE", `/api/notes/${quick.id}`, null, fa.token)).status, 200);
+        assert.equal((await call("GET", `/api/notebook/${quick.id}`, null, fa.token)).status, 404);
+        await sql("DELETE FROM notebook_notes WHERE user_id = $1", [fa.id]);
+    });
+
     test("everything goes with the account", async () => {
         const gone = await member("focusgone");
         await call("POST", "/api/routines", { name: "R", steps: [{ title: "a", minutes: 1 }] }, gone.token);
@@ -3894,7 +3935,7 @@ describe("study plan", () => {
         await goal(me, sub.id, { name: "Referat", kind: "presentation", due: daysFromToday(3), parts: [{ name: "X", estimateMinutes: 360 }] });
         await apply(me);
         assert.deepEqual(await rows(), before, "kept with the row intact");
-        assert.equal((await sql("SELECT count(*)::int AS n FROM notes WHERE task_id = $1", [noted.id]))[0].n, 1);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM notebook_notes WHERE task_id = $1", [noted.id]))[0].n, 1);
         assert.equal((await sql("SELECT count(*)::int AS n FROM task_groups WHERE task_id = $1", [grouped.id]))[0].n, 1);
         assert.equal((await sql("SELECT count(*)::int AS n FROM collection_items WHERE task_id = $1", [collected.id]))[0].n, 1);
         assert.equal((await sql("SELECT count(*)::int AS n FROM task_shares WHERE task_id = $1", [shared.id]))[0].n, 1);
@@ -3947,12 +3988,12 @@ describe("study plan", () => {
         const me = await tester();
         const g = await goal(me, (await subject(me)).id);
         const noted = await session(me, g.parts[0].id, daysFromToday(-2), { pinned: true });
-        await sql("INSERT INTO notes (task_id, content) VALUES ($1, 'Formeln')", [noted]);
+        await sql("INSERT INTO notebook_notes (user_id, task_id, body) VALUES ($1, $2, 'Formeln')", [me.id, noted]);
         const plain = await session(me, g.parts[1].id, daysFromToday(-2));
         await apply(me);
         const [row] = await sql("SELECT goal_part_id, plan_pinned FROM tasks WHERE id = $1", [noted]);
         assert.deepEqual(row, { goal_part_id: null, plan_pinned: false }, "kept as a plain task");
-        assert.equal((await sql("SELECT count(*)::int AS n FROM notes WHERE task_id = $1", [noted]))[0].n, 1, "the note survives");
+        assert.equal((await sql("SELECT count(*)::int AS n FROM notebook_notes WHERE task_id = $1", [noted]))[0].n, 1, "the note survives");
         assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE id = $1", [plain]))[0].n, 0, "a plain missed session goes");
     });
 
@@ -4131,6 +4172,39 @@ describe("study plan", () => {
         assert.equal((await sql("SELECT plan_pinned FROM tasks WHERE id = $1", [pinned]))[0].plan_pinned, false);
     });
 
+    test("own colours and goal shapes: every subject a colour, every goal a shape", async () => {
+        const me = await tester();
+        // without a colour a new subject takes the first of the eight not in use
+        const red = (await call("POST", `${S}/subjects`, { name: "Erstes" }, me.token)).data;
+        const orange = (await call("POST", `${S}/subjects`, { name: "Zweites" }, me.token)).data;
+        assert.equal(red.color, "red");
+        assert.equal(orange.color, "orange");
+        // an own colour from the wheel is kept (lower case); anything else is refused
+        const own = await call("PATCH", `${S}/subjects/${red.id}`, { color: "#2A9D8F" }, me.token);
+        assert.equal(own.status, 200, JSON.stringify(own.data));
+        assert.equal(own.data.color, "#2a9d8f");
+        assert.equal((await call("PATCH", `${S}/subjects/${red.id}`, { color: "#12345" }, me.token)).status, 400);
+        assert.equal((await call("PATCH", `${S}/subjects/${red.id}`, { color: "purple" }, me.token)).status, 400);
+        // goals: a free shape each unless one is picked; a wrong one is refused
+        const first = await goal(me, red.id);
+        const second = await goal(me, red.id, { name: "Zweites Ziel" });
+        const third = await goal(me, red.id, { name: "Drittes Ziel", shape: "star" });
+        assert.deepEqual([first.shape, second.shape, third.shape], ["circle", "square", "star"]);
+        const bad = await call("POST", `${S}/goals`, {
+            subjectId: red.id, kind: "other", name: "X", due: daysFromToday(5), planMode: "days", shape: "moon",
+            parts: [{ name: "A", estimateMinutes: 30 }],
+        }, me.token);
+        assert.equal(bad.status, 400);
+        const changed = await call("PATCH", `${S}/goals/${first.id}`, { shape: "heart" }, me.token);
+        assert.equal(changed.status, 200, JSON.stringify(changed.data));
+        assert.equal((await call("GET", `${S}/goals/${first.id}`, null, me.token)).data.shape, "heart");
+        // a task takes an own colour too, and only a well-formed one
+        const task = await call("POST", "/api/tasks", { name: "Farbig", color: "#FFAA00" }, me.token);
+        assert.equal(task.status, 201, JSON.stringify(task.data));
+        assert.equal(task.data.color, "#ffaa00");
+        assert.equal((await call("POST", "/api/tasks", { name: "Falsch", color: "#ffaa0" }, me.token)).status, 400);
+    });
+
     test("task rows of sessions know their goal", async () => {
         const me = await tester();
         const sub = await subject(me, "Statistik", { emoji: "📊" });
@@ -4144,7 +4218,7 @@ describe("study plan", () => {
             assert.equal(t.plan_pinned, false);
             assert.deepEqual(t.study, {
                 goalId: g.id, goalName: "Hausarbeit", partName: t.name,
-                subjectName: "Statistik", subjectEmoji: "📊", subjectColor: "green",
+                subjectName: "Statistik", subjectEmoji: "📊", subjectColor: "green", goalShape: "circle",
             });
         }
         const plain = tasks.find(t => t.name === "Einkaufen");
@@ -4248,14 +4322,14 @@ describe("study status and estimates", () => {
         const pinnedId = await session(me, a, daysFromToday(2));
         await sql("UPDATE tasks SET plan_pinned = true WHERE id = $1", [pinnedId]);
         const notedId = await session(me, a, daysFromToday(3));
-        await sql("INSERT INTO notes (task_id, content) VALUES ($1, 'wichtig')", [notedId]);
+        await sql("INSERT INTO notebook_notes (user_id, task_id, body) VALUES ($1, $2, 'wichtig')", [me.id, notedId]);
         await session(me, a, daysFromToday(0), { done: true });
         const s = await status(me);
         assert.equal(s.goals[0].freedMinutes, 45, "only the plain session counts");
         const left = (await sql("SELECT id FROM tasks WHERE goal_part_id = $1 AND NOT done ORDER BY id", [a])).map(r => r.id);
         assert.deepEqual(left, [pinnedId, notedId]);
         assert.ok(!left.includes(plainId));
-        assert.equal((await sql("SELECT count(*)::int AS n FROM notes WHERE task_id = $1", [notedId]))[0].n, 1);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM notebook_notes WHERE task_id = $1", [notedId]))[0].n, 1);
     });
 
     test("GET /status does not delete a session that was ticked off after it was read", async () => {

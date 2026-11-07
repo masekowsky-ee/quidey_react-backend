@@ -396,8 +396,17 @@ function cleanLink(value) {
 
 const TASK_KINDS = ["task", "event"];
 
-// The colours a task can have (the app draws them); null is the default look
+// The colours a task can have (the app draws them); null is the default look. Beside the eight
+// names a colour of one's own, picked on the app's colour wheel: "#rrggbb" (stored lower case).
 const TASK_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
+const HEX_COLOR = /^#[0-9a-f]{6}$/;
+// the colour as it is stored, or undefined when it is none of these
+const cleanColor = (value) => {
+    if (typeof value !== "string") return undefined;
+    if (TASK_COLORS.includes(value)) return value;
+    const hex = value.toLowerCase();
+    return HEX_COLOR.test(hex) ? hex : undefined;
+};
 
 // How far the next one of a repeating task is from the last (Postgres intervals)
 const REPEAT_INTERVALS = { daily: "1 day", weekly: "7 days", monthly: "1 month", yearly: "1 year" };
@@ -421,7 +430,7 @@ const TASK_EXTRAS = {
     repeat: (value) => (value === null || value === "" ? null : Object.hasOwn(REPEAT_INTERVALS, value) ? value : undefined),
     // how many more times it comes back after this one (null = no end)
     repeat_left: (value) => cleanMinutes(value, 0, REPEAT_LEFT_MAX),
-    color: (value) => (value === null || value === "" ? null : TASK_COLORS.includes(value) ? value : undefined),
+    color: (value) => (value === null || value === "" ? null : cleanColor(value)),
     // also remind by mail (only the owner can change it, see PUT /api/tasks/:id)
     reminder_email: (value) => (typeof value === "boolean" ? value : undefined),
     // 'task' (ticked off by hand) or 'event' (done once it is over); only the owner changes it
@@ -497,7 +506,8 @@ const TASK_SELECT = `
         tasks.goal_part_id, tasks.plan_pinned,
         CASE WHEN study_goal.id IS NULL THEN NULL ELSE json_build_object(
             'goalId', study_goal.id, 'goalName', study_goal.name, 'partName', study_part.name,
-            'subjectName', study_subject.name, 'subjectEmoji', study_subject.emoji, 'subjectColor', study_subject.color
+            'subjectName', study_subject.name, 'subjectEmoji', study_subject.emoji, 'subjectColor', study_subject.color,
+            'goalShape', study_goal.shape
         ) END AS study_info,
         COALESCE((
             SELECT array_agg(task_groups.group_id ORDER BY task_groups.group_id)
@@ -670,36 +680,34 @@ app.get("/api/groups", async (req, res) => {
     }
 });
 
+// A task's notes are my notebook notes about it (notebook_notes.task_id, migration 043). These
+// routes keep the old shape { id, task_id, content, created_at } for the task cards and older apps;
+// content is the title line (if the note has one) and the text.
+const taskNoteJson = (row) => ({
+    id: row.id,
+    task_id: row.task_id,
+    content: row.title ? `${row.title}
+${row.body}`.trimEnd() : row.body,
+    created_at: row.created_at,
+});
+const TASK_NOTES_OF = `SELECT * FROM notebook_notes WHERE user_id = $1 AND task_id IS NOT NULL AND trashed_at IS NULL
+    AND task_id IN (${accessibleTaskIds("$1")})`;
+
 app.get("/api/tasks/:taskId/notes", async (req, res) => {
     const taskId = idParam(req.params.taskId);
-    const userId = req.user.userId;
     if (!taskId) return notFound(res, "Task");
-
     try {
-       const result = await pool.query(
-       `SELECT notes.* FROM notes
-       WHERE notes.task_id = $1 AND notes.task_id IN (${accessibleTaskIds("$2")})
-       ORDER BY notes.id`,
-        [taskId, userId]
-    );
-    res.json(result.rows);
+        const result = await pool.query(`${TASK_NOTES_OF} AND task_id = $2 ORDER BY created_at, id`, [req.user.userId, taskId]);
+        res.json(result.rows.map(taskNoteJson));
     } catch (err) {
         serverError(res, err);
     }
 });
 
 app.get("/api/notes", async (req, res) => {
-    const userId = req.user.userId;
-
     try {
-        const result = await pool.query(
-            `SELECT notes.*
-            FROM notes
-            WHERE notes.task_id IN (${accessibleTaskIds("$1")})
-            ORDER BY notes.id`,
-            [userId]
-        );
-        res.json(result.rows);
+        const result = await pool.query(`${TASK_NOTES_OF} ORDER BY created_at, id`, [req.user.userId]);
+        res.json(result.rows.map(taskNoteJson));
     } catch (err) {
         serverError(res, err);
     }
@@ -1115,13 +1123,15 @@ app.post("/api/tasks/:taskId/notes", async (req, res) => {
             return res.status(404).json({ error: "Task not found" });
         }
 
+        const count = await pool.query("SELECT count(*)::int AS n FROM notebook_notes WHERE user_id = $1", [userId]);
+        if (count.rows[0].n >= NOTEBOOK_MAX) return res.status(409).json({ error: "Too many notes", code: "NOTEBOOK_LIMIT" });
         const result = await pool.query(
-            `INSERT INTO notes (task_id, content)
-            VALUES ($1, $2)
+            `INSERT INTO notebook_notes (user_id, task_id, title, body)
+            VALUES ($1, $2, '', $3)
             RETURNING *`,
-            [taskId, content]
+            [userId, taskId, content]
         );
-        res.status(201).json(result.rows[0]);
+        res.status(201).json(taskNoteJson(result.rows[0]));
     } catch (err) {
         serverError(res, err);
     }
@@ -2620,20 +2630,27 @@ app.put("/api/notes/:id", async (req, res) => {
     if (content === undefined) return invalidInput(res, "content");
 
     try {
+        // a note with a title keeps it while its first line still is that title
         const result = await pool.query(
-            `UPDATE notes
-            SET content = $1
-            WHERE id = $2
-            AND task_id IN (${accessibleTaskIds("$3")})
+            `UPDATE notebook_notes
+            SET title = CASE WHEN title <> '' AND split_part($1, E'
+', 1) = title THEN title ELSE '' END,
+                body = CASE WHEN title <> '' AND split_part($1, E'
+', 1) = title
+                    THEN btrim(substr($1, length(title) + 2), E'
+') ELSE $1 END,
+                updated_at = now()
+            WHERE id = $2 AND user_id = $3 AND task_id IS NOT NULL
             RETURNING *`,
-            [content, id, userId]
+            [content ?? "", id, userId]
         )
 
         if (result.rows.length === 0) {
             return res.status(404).json({ error: "Note not found" });
         }
 
-        res.json(result.rows[0]);
+        res.json(taskNoteJson(result.rows[0]));
+        notifyBoardsOfNote(id).catch(() => {});
     } catch (err) {
         serverError(res, err);
     }
@@ -2796,10 +2813,10 @@ app.delete("/api/notes/:id", async (req, res) => {
     if (!id) return notFound(res, "Note");
 
     try {
+        const boards = await boardsOfNote(id);
         const result = await pool.query(
-            `DELETE FROM notes
-             WHERE id = $1
-            AND task_id IN (${accessibleTaskIds("$2")})
+            `DELETE FROM notebook_notes
+             WHERE id = $1 AND user_id = $2 AND task_id IS NOT NULL
             RETURNING *`,
             [id, userId]
         );
@@ -2808,7 +2825,8 @@ app.delete("/api/notes/:id", async (req, res) => {
             return res.status(404).json({ error: "Note not found" });
         }
 
-        res.json({ message: "Note deleted", note: result.rows[0] });
+        res.json({ message: "Note deleted", note: taskNoteJson(result.rows[0]) });
+        for (const board of boards) notifyBoard(board.kind, board.id).catch(() => {});
     } catch (err) {
         serverError(res, err);
     }
@@ -6698,7 +6716,7 @@ function cleanNote(body, partial) {
         out.tags = tags;
     }
     if (body.color !== undefined) {
-        if (body.color !== null && !TASK_COLORS.includes(body.color)) return { field: "color" };
+        if (body.color !== null && cleanColor(body.color) === undefined) return { field: "color" };
         out.color = body.color;
     }
     if (body.archived !== undefined) {
@@ -7163,7 +7181,7 @@ function cleanCollection(body, partial) {
         out.emoji = emoji;
     }
     if (body.color !== undefined) {
-        if (body.color !== null && !TASK_COLORS.includes(body.color)) return { field: "color" };
+        if (body.color !== null && cleanColor(body.color) === undefined) return { field: "color" };
         out.color = body.color;
     }
     if (body.description !== undefined) {
@@ -7247,7 +7265,7 @@ async function importGroupsOnce(userId) {
             const description = cleanText((group.description ?? "").trim().slice(0, COLLECTION_DESCRIPTION_MAX), COLLECTION_DESCRIPTION_MAX) ?? "";
             const saved = await client.query(
                 "INSERT INTO collections (user_id, name, color, description) VALUES ($1, $2, $3, $4) RETURNING id",
-                [userId, name, TASK_COLORS.includes(group.color) ? group.color : null, description]
+                [userId, name, cleanColor(group.color) ?? null, description]
             );
             await client.query(
                 `INSERT INTO collection_items (collection_id, task_id)

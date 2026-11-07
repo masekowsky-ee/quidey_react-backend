@@ -2528,6 +2528,47 @@ ALTER TABLE public.users ADD CONSTRAINT users_study_daily_max_minutes_check CHEC
 
 ALTER TABLE public.push_subscriptions ADD COLUMN IF NOT EXISTS study boolean NOT NULL DEFAULT true;
 
+-- 042: own colours and a shape per study goal.
+-- A colour is still one of the eight names, or now a colour of one's own as "#rrggbb" (picked on
+-- the colour wheel in the app). Applies to everything the app lets one colour with the same picker:
+-- tasks, groups, event types, the tasks of shared sessions and families, and study subjects.
+-- Study goals get an optional shape (shown in the subject's colour), so the goals of one subject
+-- can be told apart at a glance.
+
+DO $$
+DECLARE
+    t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['tasks', 'groups', 'event_types', 'shared_session_tasks', 'family_tasks', 'subjects'] LOOP
+        EXECUTE format('ALTER TABLE public.%I DROP CONSTRAINT IF EXISTS %I', t, t || '_color_check');
+        EXECUTE format(
+            'ALTER TABLE public.%I ADD CONSTRAINT %I CHECK (color IS NULL OR color IN '
+            '(''red'', ''orange'', ''yellow'', ''green'', ''teal'', ''blue'', ''violet'', ''pink'') '
+            'OR color ~ ''^#[0-9a-f]{6}$'')',
+            t, t || '_color_check');
+    END LOOP;
+END $$;
+
+ALTER TABLE public.goals ADD COLUMN IF NOT EXISTS shape text;
+ALTER TABLE public.goals DROP CONSTRAINT IF EXISTS goals_shape_check;
+ALTER TABLE public.goals ADD CONSTRAINT goals_shape_check
+    CHECK (shape IS NULL OR shape IN ('circle', 'square', 'triangle', 'diamond', 'star', 'hexagon', 'heart'));
+
+--
+-- 043: a task's notes live in the notebook (see migrations/043_task_notes_into_notebook.sql):
+-- the rows of `notes` moved into notebook_notes (task_id); `notes` stays, empty.
+--
+
+INSERT INTO public.notebook_notes (user_id, task_id, title, body, created_at, updated_at)
+SELECT tasks.user_id, notes.task_id, '', btrim(notes.content),
+       COALESCE(notes.created_at, now()), COALESCE(notes.created_at, now())
+FROM public.notes
+JOIN public.tasks ON tasks.id = notes.task_id
+WHERE tasks.user_id IS NOT NULL AND btrim(COALESCE(notes.content, '')) <> ''
+ORDER BY notes.id;
+
+DELETE FROM public.notes;
+
 --
 -- PostgreSQL database dump complete
 --

@@ -38,7 +38,7 @@ async function loadSessions(db, userId, partIds) {
             -- something of the user's hangs on it (a note, a group, a collection, a share): the planner
             -- keeps it like a pinned one, a replan would delete it with all that (controller ruling 19)
             (tasks.plan_pinned
-                OR EXISTS (SELECT 1 FROM notes WHERE notes.task_id = tasks.id)
+                OR EXISTS (SELECT 1 FROM notebook_notes WHERE notebook_notes.task_id = tasks.id AND notebook_notes.trashed_at IS NULL)
                 OR EXISTS (SELECT 1 FROM task_groups WHERE task_groups.task_id = tasks.id)
                 OR EXISTS (SELECT 1 FROM collection_items WHERE collection_items.task_id = tasks.id)
                 OR EXISTS (SELECT 1 FROM task_shares WHERE task_shares.task_id = tasks.id)) AS plan_pinned,
@@ -62,7 +62,7 @@ async function loadGoals(db, userId, { id = null, subjectId = null } = {}) {
     if (subjectId != null) { params.push(subjectId); where.push(`subject_id = $${params.length}`); }
     const goals = (await db.query(
         `SELECT id, subject_id, kind, name, to_char(due, 'YYYY-MM-DD') AS due, to_char(due_time, 'HH24:MI') AS due_time,
-            plan_mode, status, freed_minutes,
+            plan_mode, status, freed_minutes, shape,
             (SELECT archived FROM subjects WHERE subjects.id = goals.subject_id) AS subject_archived
         FROM goals WHERE ${where.join(' AND ')} ORDER BY due, id`,
         params
@@ -80,7 +80,7 @@ async function loadGoals(db, userId, { id = null, subjectId = null } = {}) {
         return {
             goal: {
                 id: g.id, subjectId: g.subject_id, kind: g.kind, name: g.name, due: g.due, dueTime: g.due_time,
-                planMode: g.plan_mode, status: g.status, freedMinutes: g.freed_minutes,
+                planMode: g.plan_mode, status: g.status, freedMinutes: g.freed_minutes, shape: g.shape ?? null,
                 subjectArchived: g.subject_archived,
             },
             parts: own.map((p) => ({
@@ -108,7 +108,7 @@ function partView(part, sessions) {
 function goalView({ goal, parts, sessions }) {
     return {
         id: goal.id, subjectId: goal.subjectId, kind: goal.kind, name: goal.name, due: goal.due,
-        dueTime: goal.dueTime, planMode: goal.planMode, status: goal.status,
+        dueTime: goal.dueTime, planMode: goal.planMode, status: goal.status, shape: goal.shape ?? null,
         parts: parts.map((p) => partView(p, sessions)),
         sessions: sessions.map((s) => ({
             taskId: s.taskId, partId: s.partId, due: s.date, dueTime: s.time,

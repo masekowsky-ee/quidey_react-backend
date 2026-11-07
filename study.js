@@ -14,6 +14,13 @@ const {
 } = require('./utils/studyLoad');
 
 const COLORS = ['red', 'orange', 'yellow', 'green', 'teal', 'blue', 'violet', 'pink'];
+// a colour of one's own from the app's colour wheel, stored lower case
+const HEX_COLOR = /^#[0-9a-f]{6}$/;
+const cleanColor = (value) => (typeof value !== 'string' ? undefined
+    : COLORS.includes(value) ? value : HEX_COLOR.test(value.toLowerCase()) ? value.toLowerCase() : undefined);
+// a goal's shape (drawn in its subject's colour); null: the default dot
+const SHAPES = ['circle', 'square', 'triangle', 'diamond', 'star', 'hexagon', 'heart'];
+const cleanShape = (value) => (value === null ? null : SHAPES.includes(value) ? value : undefined);
 const KINDS = ['exam', 'assignment', 'presentation', 'other'];
 const MODES = ['slots', 'days'];
 const STATUSES = ['active', 'done', 'archived'];
@@ -55,7 +62,7 @@ function cleanEmoji(value) {
 
 // Something of the user's hangs on the task (a note, a group, a collection, a share): a replan never
 // deletes such a session, it is kept (rulings 19, 28). For queries on `tasks`.
-const ATTACHED = `(EXISTS (SELECT 1 FROM notes WHERE notes.task_id = tasks.id)
+const ATTACHED = `(EXISTS (SELECT 1 FROM notebook_notes WHERE notebook_notes.task_id = tasks.id AND notebook_notes.trashed_at IS NULL)
     OR EXISTS (SELECT 1 FROM task_groups WHERE task_groups.task_id = tasks.id)
     OR EXISTS (SELECT 1 FROM collection_items WHERE collection_items.task_id = tasks.id)
     OR EXISTS (SELECT 1 FROM task_shares WHERE task_shares.task_id = tasks.id))`;
@@ -180,7 +187,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         res.json(subjects.map((s) => {
             const next = goals.find((g) => g.goal.subjectId === s.id);
             return subjectView(s, next ? {
-                id: next.goal.id, name: next.goal.name, kind: next.goal.kind, due: next.goal.due,
+                id: next.goal.id, name: next.goal.name, kind: next.goal.kind, due: next.goal.due, shape: next.goal.shape,
                 ...goalProgress(next, clock),
             } : null);
         }));
@@ -199,8 +206,9 @@ module.exports = ({ pool, realtime, loadTask }) => {
             out.emoji = emoji;
         }
         if (body.color !== undefined) {
-            if (body.color !== null && !COLORS.includes(body.color)) return { field: 'color' };
-            out.color = body.color;
+            const color = body.color === null ? null : cleanColor(body.color);
+            if (color === undefined) return { field: 'color' };
+            out.color = color;
         }
         if (body.archived !== undefined) {
             if (typeof body.archived !== 'boolean') return { field: 'archived' };
@@ -212,10 +220,15 @@ module.exports = ({ pool, realtime, loadTask }) => {
     router.post('/subjects', async (req, res) => {
         const { field, values } = cleanSubject(req.body || {}, false);
         if (field) return invalid(res, field);
+        let color = values.color ?? null;
+        if (values.color === undefined) {
+            const used = new Set((await pool.query('SELECT color FROM subjects WHERE user_id = $1 AND NOT archived', [req.user.userId])).rows.map((r) => r.color));
+            color = COLORS.find((c) => !used.has(c)) ?? COLORS[0];
+        }
         try {
             const row = (await pool.query(
                 'INSERT INTO subjects (user_id, name, emoji, color) VALUES ($1, $2, $3, $4) RETURNING *',
-                [req.user.userId, values.name, values.emoji ?? null, values.color ?? null]
+                [req.user.userId, values.name, values.emoji ?? null, color]
             )).rows[0];
             res.status(201).json(subjectView(row));
         } catch (err) {
@@ -335,8 +348,16 @@ module.exports = ({ pool, realtime, loadTask }) => {
             if (typeof body.dueTime !== 'string' || !TIME.test(body.dueTime)) return invalid(res, 'dueTime');
             dueTime = body.dueTime;
         }
+        let shape = body.shape === undefined ? null : cleanShape(body.shape);
+        if (shape === undefined) return invalid(res, 'shape');
         const subjectId = idParam(body.subjectId);
         if (!(await ownedSubject(pool, userId, subjectId))) return notFound(res);
+        if (body.shape === undefined) {
+            const used = new Set((await pool.query(
+                "SELECT shape FROM goals WHERE subject_id = $1 AND user_id = $2 AND status = 'active'", [subjectId, userId]
+            )).rows.map((r) => r.shape));
+            shape = SHAPES.find((s) => !used.has(s)) ?? SHAPES[0];
+        }
         if (!Array.isArray(body.parts)) return invalid(res, 'parts');
         if (body.parts.length === 0) return fail(res, 400, 'no_parts', 'A goal needs at least one part');
         const parts = cleanParts(body.parts);
@@ -357,9 +378,9 @@ module.exports = ({ pool, realtime, loadTask }) => {
         try {
             await client.query('BEGIN');
             goalId = (await client.query(
-                `INSERT INTO goals (user_id, subject_id, kind, name, due, due_time, plan_mode)
-                VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-                [userId, subjectId, body.kind, name, due, dueTime, body.planMode]
+                `INSERT INTO goals (user_id, subject_id, kind, name, due, due_time, plan_mode, shape)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+                [userId, subjectId, body.kind, name, due, dueTime, body.planMode, shape]
             )).rows[0].id;
             for (const [i, p] of parts.entries()) {
                 await client.query(
@@ -401,6 +422,11 @@ module.exports = ({ pool, realtime, loadTask }) => {
         if (body.planMode !== undefined) {
             if (!MODES.includes(body.planMode)) return invalid(res, 'planMode');
             set('plan_mode', body.planMode);
+        }
+        if (body.shape !== undefined) {
+            const shape = cleanShape(body.shape);
+            if (shape === undefined) return invalid(res, 'shape');
+            set('shape', shape);
         }
         if (body.status !== undefined) {
             if (!STATUSES.includes(body.status)) return invalid(res, 'status');
