@@ -146,14 +146,15 @@ describe("usage counting core", () => {
         const u = await user();
         // marks whose period started this long ago (inserted directly: a week mark's start depends on the weekday)
         const mark = (scope, ms) => sql("INSERT INTO usage_seen (scope, period, metric, user_id) VALUES ($1, $2, 'app_open', $3)", [scope, new Date(now.getTime() - ms), u]);
-        await mark("hour", 3 * 3600e3); await mark("hour", 0);
+        // hour marks live 26 h (the beacon takes events up to 24 h late), day marks 2 days, week marks 8 days
+        await mark("hour", 27 * 3600e3); await mark("hour", 3 * 3600e3);
         await mark("day", 3 * 86400e3); await mark("day", 86400e3);
         await mark("week", 9 * 86400e3); await mark("week", 6 * 86400e3);
         await countUsage(pool, u, "task_done", { at: now });
         assert.equal(await cleanupUsage(pool, now), 3);
         const left = async (scope, ms) => (await sql("SELECT 1 FROM usage_seen WHERE scope = $1 AND period = $2 AND metric = 'app_open'", [scope, new Date(now.getTime() - ms)])).length;
-        assert.equal(await left("hour", 3 * 3600e3), 0);
-        assert.equal(await left("hour", 0), 1);
+        assert.equal(await left("hour", 27 * 3600e3), 0);
+        assert.equal(await left("hour", 3 * 3600e3), 1);
         assert.equal(await left("day", 3 * 86400e3), 0);
         assert.equal(await left("day", 86400e3), 1);
         assert.equal(await left("week", 9 * 86400e3), 0);
@@ -161,6 +162,29 @@ describe("usage counting core", () => {
         // marks of the current moment and the totals stay
         assert.ok((await sql("SELECT 1 FROM usage_seen WHERE metric = 'task_done'")).length > 0);
         assert.ok((await sql("SELECT 1 FROM usage_hourly")).length > 0);
+    });
+
+    test("one person, two metrics in one hour: active counts them once", async () => {
+        const u = await user();
+        await countUsage(pool, u, "app_open", { at: T0 });
+        await countUsage(pool, u, "task_done", { at: hours(T0, 0.1) });
+        const [h] = await sql("SELECT people FROM usage_hourly WHERE metric = 'active'");
+        assert.equal(h.people, 1);
+        const [d] = await sql("SELECT people FROM usage_people WHERE scope = 'day' AND metric = 'active'");
+        assert.equal(d.people, 1);
+    });
+
+    test("a count racing a withdrawal writes nothing", async () => {
+        const u = await user();
+        assert.equal(await countUsage(pool, u, "app_open", { at: T0 }), true); // the account (granted) is cached now
+        // withdrawn in the database, the cache hasn't heard of it yet
+        await sql("UPDATE users SET usage_consent = 'denied' WHERE id = $1", [u]);
+        await sql("DELETE FROM usage_seen WHERE user_id = $1", [u]);
+        await sql("TRUNCATE usage_hourly, usage_people");
+        assert.equal(await countUsage(pool, u, "task_done", { at: T0 }), false);
+        assert.equal((await sql("SELECT * FROM usage_seen WHERE user_id = $1", [u])).length, 0);
+        assert.equal((await sql("SELECT * FROM usage_hourly")).length, 0);
+        assert.equal((await sql("SELECT * FROM usage_people")).length, 0);
     });
 
     test("withdraw", async () => {

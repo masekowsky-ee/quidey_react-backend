@@ -8,8 +8,12 @@
 // Periods: hour marks are the UTC hour. Day and week marks (usage_seen.period) are the UTC instant of
 // the start of the person's LOCAL day / ISO week (Monday 00:00 local, timestamptz). usage_people.period
 // is the same local date (day) / local Monday date (week) as a plain date.
-// cleanupUsage deletes marks that ended: hour marks 2 h after the hour starts, day marks 2 days after
+// cleanupUsage deletes marks that ended: hour marks 26 h after the hour starts (the beacon takes events
+// up to 24 h late, a mark that went earlier would count the same person twice), day marks 2 days after
 // the local day starts, week marks 8 days after the week starts.
+//
+// The 60 s account cache is only a cheap pre-check: inside the transaction the consent is read again
+// (FOR SHARE), so a count racing a withdrawal writes nothing.
 //
 // Nothing here may break the app: countUsage swallows and logs every error and returns false.
 const { hasPro } = require("./access");
@@ -95,18 +99,25 @@ async function countUsage(db, userId, metric, { value = 0, platform = "web", at 
 
         client = await db.connect();
         await client.query("BEGIN");
+        // the cache may be up to a minute old: the consent as it is now, held until the commit
+        const { rows: current } = await client.query("SELECT usage_consent FROM users WHERE id = $1 FOR SHARE", [userId]);
+        if (current[0]?.usage_consent !== "granted") {
+            await client.query("ROLLBACK");
+            forgetUsageAccount(userId);
+            return false;
+        }
         // marks: [scope, period, metric]; the period of day / week is local midnight as an instant
         const wanted = [];
         for (const m of [metric, "*"]) {
             wanted.push(["hour", m], ["day", m], ["week", m]);
         }
         const periodSql = (scope, i) => (scope === "hour" ? `$${i}::timestamptz` : `($${i}::date::timestamp AT TIME ZONE $1::text)`);
-        const params = [zone];
+        const params = [zone, userId];
         const values = wanted.map(([scope, m], k) => {
             const periodValue = scope === "hour" ? hour.toISOString() : scope === "day" ? day : weekStart;
             params.push(scope, periodValue, m);
-            const base = 2 + k * 3;
-            return `($${base}::text, ${periodSql(scope, base + 1)}, $${base + 2}::text, ${userId})`;
+            const base = 3 + k * 3;
+            return `($${base}::text, ${periodSql(scope, base + 1)}, $${base + 2}::text, $2::integer)`;
         });
         const { rows: fresh } = await client.query(
             `INSERT INTO usage_seen (scope, period, metric, user_id) VALUES ${values.join(", ")}
@@ -132,7 +143,11 @@ async function countUsage(db, userId, metric, { value = 0, platform = "web", at 
         await client.query("COMMIT");
         return true;
     } catch (err) {
-        if (client) await client.query("ROLLBACK").catch(() => {});
+        if (client) {
+            await client.query("ROLLBACK").catch(() => {});
+            client.release(err); // a connection that failed mid-transaction isn't given back to the pool
+            client = null;
+        }
         console.error("Counting usage failed:", err.message);
         return false;
     } finally {
@@ -144,7 +159,7 @@ async function countUsage(db, userId, metric, { value = 0, platform = "web", at 
 async function cleanupUsage(db, now = new Date()) {
     const { rowCount } = await db.query(
         `DELETE FROM usage_seen WHERE
-            (scope = 'hour' AND period < $1::timestamptz - interval '2 hours') OR
+            (scope = 'hour' AND period < $1::timestamptz - interval '26 hours') OR
             (scope = 'day'  AND period < $1::timestamptz - interval '2 days') OR
             (scope = 'week' AND period < $1::timestamptz - interval '8 days')`, [now.toISOString()]);
     return rowCount;
