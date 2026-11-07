@@ -4649,6 +4649,24 @@ describe("usage statistics", () => {
         assert.equal((await hourly("task_done"))[0].events, 2);
     });
 
+    test("calendar events are not created tasks (they are never ticked off by hand)", async () => {
+        const u = await person();
+        await consent(u);
+        await reset();
+        const day = daysFromToday(1);
+        assert.equal((await call("POST", "/api/tasks", { name: "Arzt", kind: "event", due: day }, u.token)).status, 201);
+        const sessionId = (await call("POST", "/api/shared-sessions", { name: "Termine" }, u.token)).data.id;
+        assert.equal((await call("POST", `/api/shared-sessions/${sessionId}/tasks`, { name: "Treffen", kind: "event", due: day }, u.token)).status, 201);
+        const familyId = (await call("POST", "/api/families", { name: "Kalender" }, u.token)).data.id;
+        assert.equal((await call("POST", `/api/families/${familyId}/tasks`, { name: "Elternabend", kind: "event", due: day }, u.token)).status, 201);
+        // a task afterwards is counted: once it is there, the events before it would be too
+        await call("POST", "/api/tasks", { name: "Packen" }, u.token);
+        const rows = await until(() => hourly("task_created"));
+        await sleep(200);
+        assert.deepEqual((await hourly("task_created")).map((r) => r.events), [1]);
+        assert.deepEqual(rows.map((r) => r.events), [1]);
+    });
+
     test("shared session and family entries are counted too", async () => {
         const u = await person();
         await consent(u);

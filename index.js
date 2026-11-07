@@ -1026,7 +1026,8 @@ app.post("/api/tasks", async (req, res) => {
         // an event entered afterwards (e.g. yesterday's work) is over right away
         const [synced] = await syncEvents(client, "tasks.id = $1", [id]);
         await client.query("COMMIT");
-        countLater(req, "task_created");
+        // tasks only: events are never ticked off by hand, so "created vs. done" leaves them out
+        if (extras.values.kind !== "event") countLater(req, "task_created");
         const task = await loadTask(id, userId);
         res.status(201).json(synced?.nextId ? { ...task, nextTask: await loadTask(synced.nextId, userId) } : task);
     } catch (err) {
@@ -4535,8 +4536,8 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
             VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING id`,
             values
         );
-        // a new entry (one of my own tasks shared into the session isn't a new task)
-        if (!task.sourceTaskId) countLater(req, "task_created");
+        // a new task (one of my own shared into the session isn't new; events aren't tasks)
+        if (!task.sourceTaskId && task.fields.kind !== "event") countLater(req, "task_created");
         // an event entered afterwards is over right away
         await syncSessionEvents("shared_session_tasks.id = $1", [created.rows[0].id], false);
         await logEvent(pool, session.sessionId, userId, "task_added", { taskId: created.rows[0].id, taskName: task.name });
@@ -5410,7 +5411,8 @@ app.post(`${familyBase}/:id/tasks`, async (req, res) => {
             `INSERT INTO family_tasks (${columns.join(", ")}) VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING id, kind`,
             values
         );
-        countLater(req, "task_created");
+        // tasks only, not events (never ticked off by hand)
+        if (created.rows[0].kind !== "event") countLater(req, "task_created");
         // an event entered afterwards is over right away
         if (created.rows[0].kind === "event") await syncFamilyEvents("family_tasks.id = $1", [created.rows[0].id], false);
         await sendFamily(res, family.familyId, userId, 201);
