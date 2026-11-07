@@ -2094,6 +2094,10 @@ async function logAdminAction(db, admin, target, action) {
 const ADMIN_USER_SELECT = `
     SELECT users.id, users.username, users.display_name, users.email, users.created_at,
         users.is_pro, users.pro_until, users.is_admin, users.is_tester,
+        to_char(users.birth_date, 'YYYY-MM-DD') AS birth_date, users.email_verified,
+        users.terms_accepted_at, users.privacy_accepted_at, users.language, users.timezone,
+        users.has_password, (users.google_sub IS NOT NULL) AS has_google, users.level, users.is_owner,
+        users.usage_consent, users.usage_consent_at, users.usage_consent_version,
         EXISTS (SELECT 1 FROM user_avatars WHERE user_avatars.user_id = users.id) AS has_avatar,
         beta_access_requests.status AS request_status, beta_access_requests.reason AS request_reason,
         beta_access_requests.created_at AS request_created_at, beta_access_requests.decided_at AS request_decided_at
@@ -2112,6 +2116,16 @@ const toAdminUser = (row) => ({
     proUntil: row.pro_until,
     isAdmin: row.is_admin,
     isTester: row.is_tester,
+    birthDate: row.birth_date,
+    emailVerified: row.email_verified,
+    termsAcceptedAt: row.terms_accepted_at,
+    privacyAcceptedAt: row.privacy_accepted_at,
+    language: row.language,
+    timezone: row.timezone,
+    signIn: row.has_google ? (row.has_password ? "both" : "google") : "password",
+    level: row.level,
+    isOwner: row.is_owner,
+    usageConsent: toUsageConsent(row),
     // a profile picture admins may take down
     hasAvatar: Boolean(row.has_avatar),
     request: row.request_status ? {
@@ -2321,18 +2335,47 @@ app.delete("/api/admin/requests/:userId", async (req, res) => {
     }
 });
 
-// All users, newest first; ?q= searches username, display name and email
+// All users; ?q= searches username, display name and email. Without ?page: the newest 200 as an array
+// (older apps). With ?page=&pageSize= (1-100, default 50) and ?sort=newest|oldest|name: { users, total }.
+const ADMIN_USER_ORDER = {
+    newest: "users.created_at DESC, users.id DESC",
+    oldest: "users.created_at, users.id",
+    name: "lower(coalesce(users.display_name, users.username)), users.id",
+};
 app.get("/api/admin/users", async (req, res) => {
     const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 100) : "";
+    const like = `%${q.replace(/[\\%_]/g, "\\$&")}%`;
+    const where = "WHERE $1 = '' OR users.username ILIKE $2 OR users.display_name ILIKE $2 OR users.email ILIKE $2";
     try {
-        const result = await pool.query(
-            `${ADMIN_USER_SELECT}
-            WHERE $1 = '' OR users.username ILIKE $2 OR users.display_name ILIKE $2 OR users.email ILIKE $2
-            ORDER BY users.created_at DESC, users.id DESC
-            LIMIT 200`,
-            [q, `%${q.replace(/[\\%_]/g, "\\$&")}%`]
-        );
-        res.json(result.rows.map(toAdminUser));
+        if (req.query.page === undefined) {
+            const result = await pool.query(
+                `${ADMIN_USER_SELECT} ${where} ORDER BY ${ADMIN_USER_ORDER.newest} LIMIT 200`,
+                [q, like]
+            );
+            return res.json(result.rows.map(toAdminUser));
+        }
+        const page = Number(req.query.page);
+        const pageSize = req.query.pageSize === undefined ? 50 : Number(req.query.pageSize);
+        if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) {
+            return adminFail(res, 400, "INVALID_PAGE", "page must be 1 or more and pageSize 1 to 100");
+        }
+        const order = ADMIN_USER_ORDER[req.query.sort] ?? ADMIN_USER_ORDER.newest;
+        const [result, count] = await Promise.all([
+            pool.query(`${ADMIN_USER_SELECT} ${where} ORDER BY ${order} LIMIT $3 OFFSET $4`, [q, like, pageSize, (page - 1) * pageSize]),
+            pool.query(`SELECT count(*)::int AS n FROM users ${where}`, [q, like]),
+        ]);
+        res.json({ users: result.rows.map(toAdminUser), total: count.rows[0].n });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Every account, newest first, for the admin's download; logged
+app.get("/api/admin/users/export", async (req, res) => {
+    try {
+        const result = await pool.query(`${ADMIN_USER_SELECT} ORDER BY ${ADMIN_USER_ORDER.newest}`);
+        await logAdminAction(pool, req.admin, req.admin, "export_users");
+        res.json({ users: result.rows.map(toAdminUser) });
     } catch (err) {
         serverError(res, err);
     }

@@ -1243,10 +1243,12 @@ describe("owners", () => {
 
         const responses = JSON.stringify([
             me,
-            (await call("GET", "/api/admin/users", null, other.token)).data,
             (await call("GET", "/api/users", null, boss.token)).data,
         ]);
         assert.ok(!/is_owner|isOwner/.test(responses));
+        // only the admin panel sees who is an owner
+        const listed = (await call("GET", "/api/admin/users?q=ownerboss", null, other.token)).data;
+        assert.equal(listed.find(u => u.username === "ownerboss").isOwner, true);
 
         await sql("UPDATE users SET is_owner = false WHERE username = 'ownerboss'");
     });
@@ -1254,6 +1256,73 @@ describe("owners", () => {
     test("every account has an email address", async () => {
         await member("mailless");
         await assert.rejects(sql("UPDATE users SET email = NULL WHERE username = 'mailless'"));
+    });
+});
+
+describe("admin users: every field, paging, export", () => {
+    const KEYS = ["birthDate", "emailVerified", "termsAcceptedAt", "privacyAcceptedAt", "language", "timezone", "signIn", "level", "isOwner", "usageConsent"];
+
+    test("a user row has every account field and no secrets", async () => {
+        const boss = await member("auboss", { admin: true });
+        await member("aupass");
+        const n = (await call("GET", "/api/auth/google/nonce")).data.nonce;
+        const first = await call("POST", "/api/auth/google", { idToken: googleToken({ sub: "g-au-1", email: "augoo@example.com", name: "Au Goo", nonce: n }) });
+        const made = await call("POST", "/api/auth/google/register", {
+            signupToken: first.data.signup.token, username: "augoo", display_name: "Au Goo", birth_date: "2000-01-01",
+            accept_terms: true, accept_privacy: true, confirm_age: true,
+        });
+        assert.equal(made.status, 201);
+        const list = (await call("GET", "/api/admin/users?q=au", null, boss.token)).data;
+        assert.ok(Array.isArray(list));
+        const pass = list.find(u => u.username === "aupass");
+        const goo = list.find(u => u.username === "augoo");
+        for (const k of KEYS) assert.ok(k in pass, `missing ${k}`);
+        assert.equal(pass.signIn, "password");
+        assert.equal(goo.signIn, "google");
+        assert.equal(pass.birthDate, "1995-05-05");
+        assert.equal(pass.isOwner, false);
+        assert.equal(pass.level, 1);
+        assert.ok(pass.termsAcceptedAt && pass.privacyAcceptedAt);
+        assert.deepEqual(pass.usageConsent, { choice: null, at: null, version: null });
+        await sql("UPDATE users SET has_password = true WHERE username = 'augoo'");
+        assert.equal((await call("GET", "/api/admin/users?q=augoo", null, boss.token)).data[0].signIn, "both");
+        const exp = (await call("GET", "/api/admin/users/export", null, boss.token)).data;
+        assert.ok(!/hash|token|google_sub/i.test(JSON.stringify([list, exp])));
+    });
+
+    test("paging, sorting, and the old array without page", async () => {
+        const boss = await member("pgboss", { admin: true });
+        for (const name of ["pgcc", "pgaa", "pgbb"]) await member(name);
+        await sql("UPDATE users SET display_name = NULL WHERE username = 'pgbb'");
+        const one = await call("GET", "/api/admin/users?q=pg&page=1&pageSize=2", null, boss.token);
+        assert.equal(one.status, 200);
+        assert.equal(one.data.total, 4);
+        assert.equal(one.data.users.length, 2);
+        const two = (await call("GET", "/api/admin/users?q=pg&page=2&pageSize=2", null, boss.token)).data;
+        assert.equal(two.users.length, 2);
+        const p3 = (await call("GET", "/api/admin/users?q=pgc&page=1&pageSize=2", null, boss.token)).data;
+        assert.equal(p3.total, 1);
+        const newest = (await call("GET", "/api/admin/users?q=pg&page=1&pageSize=100&sort=newest", null, boss.token)).data.users.map(u => u.username);
+        const oldest = (await call("GET", "/api/admin/users?q=pg&page=1&pageSize=100&sort=oldest", null, boss.token)).data.users.map(u => u.username);
+        assert.deepEqual(oldest, [...newest].reverse());
+        const byName = (await call("GET", "/api/admin/users?q=pg&page=1&pageSize=100&sort=name", null, boss.token)).data.users.map(u => u.username);
+        assert.deepEqual(byName, ["pgaa", "pgbb", "pgboss", "pgcc"]);
+        const old = await call("GET", "/api/admin/users?q=pg", null, boss.token);
+        assert.ok(Array.isArray(old.data));
+        assert.equal((await call("GET", "/api/admin/users?page=1&pageSize=101", null, boss.token)).status, 400);
+    });
+
+    test("export lists everybody and is logged", async () => {
+        const boss = await member("exboss", { admin: true });
+        const pal = await member("expal");
+        assert.equal((await call("GET", "/api/admin/users/export", null, pal.token)).status, 403);
+        const exp = await call("GET", "/api/admin/users/export", null, boss.token);
+        assert.equal(exp.status, 200);
+        assert.ok(exp.data.users.some(u => u.username === "expal"));
+        for (const k of KEYS) assert.ok(k in exp.data.users[0]);
+        const rows = await sql("SELECT target_id, target_username FROM admin_actions WHERE action = 'export_users' AND admin_id = $1", [boss.id]);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].target_id, boss.id);
     });
 });
 
