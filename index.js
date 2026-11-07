@@ -21,6 +21,7 @@ const { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasAppAccess, hasTe
 const { FREE_LIMITS, FREE_STATS_DAYS, limited, usage, refuseOverLimit } = require("./utils/limits");
 const { FCM_ENDPOINT, isFcmEndpoint } = require("./utils/fcm");
 const progress = require("./utils/progress");
+const { CLIENT_METRICS, cleanPlatform, countUsage, forgetUsageAccount, cleanupUsage, withdrawUsage } = require("./utils/usage");
 const { PROFILE_COLORS, PROFILE_BANNERS, PROFILE_EMOJIS, AVATAR_FRAMES, PROFILE_TITLES, SHOWCASE_MAX, BADGES } = progress;
 
 const app = express();
@@ -240,6 +241,8 @@ app.use("/api/avatars", authenticateToken);
 app.use("/api/focus", authenticateToken);
 app.use("/api/routines", authenticateToken);
 app.use("/api/notebook", authenticateToken);
+// usage statistics: every signed-in account, also while waiting for beta access (not behind requirePro)
+app.use("/api/usage", authenticateToken);
 
 // Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
 // Checked against the account on every request (not stored in the token; see loadAccount), so
@@ -253,9 +256,12 @@ function requirePro(req, res, next) {
     next();
 }
 
+// The consent to the usage statistics is asked of everybody signed in (the beta screen too), like
+// the beacon (/api/usage) it allows
+const OPEN_WITHOUT_ACCESS = new Set(["/api/profile/usage-consent"]);
 app.use(
     ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families", "/api/push", "/api/focus", "/api/routines", "/api/notebook", "/api/avatars"],
-    requirePro
+    (req, res, next) => (OPEN_WITHOUT_ACCESS.has((req.baseUrl + req.path).replace(/\/+$/, "")) ? next() : requirePro(req, res, next))
 );
 
 // Features not released to everyone yet: only testers (and admins). Every route under
@@ -806,6 +812,7 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
                 users.google_sub IS NOT NULL AS google_linked,
                 to_char(users.allday_reminder_time, 'HH24:MI') AS allday_reminder_time,
                 users.tour_seen_at IS NOT NULL AS tour_seen,
+                users.usage_consent, users.usage_consent_at, users.usage_consent_version,
                 beta_access_requests.status, beta_access_requests.reason, beta_access_requests.created_at,
                 CASE WHEN users.is_admin
                     THEN (SELECT count(*) FROM beta_access_requests WHERE status = 'pending')::int END AS pending_count
@@ -837,6 +844,8 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
             usage: limited(row) ? await usage(pool, row.id) : null,
             hasPassword: row.has_password,
             googleLinked: row.google_linked,
+            // the anonymous usage statistics: choice null = not asked yet (see PUT /api/profile/usage-consent)
+            usageConsent: toUsageConsent(row),
         });
     } catch (err) {
         serverError(res, err);
@@ -867,6 +876,110 @@ app.post("/api/beta-requests", authenticateToken, async (req, res) => {
         const row = result.rows[0];
         res.status(201).json({ status: row.status, reason: row.reason, createdAt: row.created_at });
         pushBetaRequest(userId, row.reason);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- anonymous usage statistics (utils/usage.js) ----------
+// Only counted for accounts that agreed (users.usage_consent = 'granted'); the text they agreed to is version 1.
+const USAGE_CONSENT_VERSION = 1;
+const toUsageConsent = (row) => ({ choice: row.usage_consent ?? null, at: row.usage_consent_at ?? null, version: row.usage_consent_version ?? null });
+
+// The app names its platform (web / pwa / android) in this header; anything else counts as web
+const usagePlatform = (req) => cleanPlatform(req.get("X-Quidey-Platform"));
+
+// A count by the server (task_created, task_done, focus_done) after the route's commit: not awaited,
+// never fails the request (countUsage logs and swallows its errors)
+function countLater(req, metric, value = 0) {
+    countUsage(pool, req.user.userId, metric, { value, platform: usagePlatform(req) }).catch(() => {});
+}
+
+// Yes or no to the statistics: { granted: boolean }. No also drops the person's "already counted"
+// marks at once (the totals have no user id and stay). Answers { choice, at, version }.
+app.put("/api/profile/usage-consent", async (req, res) => {
+    const userId = req.user.userId;
+    const granted = req.body?.granted;
+    if (typeof granted !== "boolean") return invalidInput(res, "granted");
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const result = await client.query(
+            `UPDATE users SET usage_consent = $2, usage_consent_at = now(), usage_consent_version = $3 WHERE id = $1
+            RETURNING usage_consent, usage_consent_at, usage_consent_version`,
+            [userId, granted ? "granted" : "denied", USAGE_CONSENT_VERSION]
+        );
+        if (result.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return res.status(401).json({ error: "User not found" });
+        }
+        if (!granted) await withdrawUsage(client, userId);
+        await client.query("COMMIT");
+        forgetUsageAccount(userId);
+        res.json(toUsageConsent(result.rows[0]));
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        serverError(res, err);
+    } finally {
+        client.release();
+    }
+});
+
+// The app's own events: { platform, events: [{ metric, at?, value? }] }, at most USAGE_EVENTS_MAX.
+// Always 204 for that shape, also without consent (the app needn't know). Dropped: unknown metrics and
+// the ones the server counts itself, events more than a day old or later than a minute from now, and a
+// second active_minute of the same minute. Only active_minute has a value (one minute).
+const USAGE_EVENTS_MAX = 200;
+const USAGE_LATE_MS = 24 * 60 * 60 * 1000;
+const USAGE_EARLY_MS = 60 * 1000;
+// the last active minute per user (minutes since 1970), a bounded map like accountCache
+const lastActiveMinute = new Map();
+const LAST_ACTIVE_MINUTE_MAX = 10000;
+
+const usageLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_USAGE", 30),
+    skip: (req) => req.method === "OPTIONS",
+    keyGenerator: (req) => `usage:${req.user.userId}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many requests, please slow down", code: "RATE_LIMITED" },
+});
+
+// When an event happened: missing = now; a date string or milliseconds; null when unusable
+function usageTime(value) {
+    if (value === undefined || value === null) return new Date();
+    if (typeof value !== "string" && typeof value !== "number") return null;
+    const at = new Date(value);
+    return Number.isNaN(at.getTime()) ? null : at;
+}
+
+function isRepeatedMinute(userId, at) {
+    const minute = Math.floor(at.getTime() / 60000);
+    if (lastActiveMinute.get(userId) === minute) return true;
+    lastActiveMinute.delete(userId);
+    if (lastActiveMinute.size >= LAST_ACTIVE_MINUTE_MAX) lastActiveMinute.delete(lastActiveMinute.keys().next().value);
+    lastActiveMinute.set(userId, minute);
+    return false;
+}
+
+app.post("/api/usage", usageLimiter, async (req, res) => {
+    const userId = req.user.userId;
+    const events = req.body?.events;
+    if (!Array.isArray(events) || events.length > USAGE_EVENTS_MAX) return invalidInput(res, "events");
+    const platform = cleanPlatform(req.body?.platform ?? req.get("X-Quidey-Platform"));
+    try {
+        const now = Date.now();
+        // one after the other: counting the same person's marks in parallel would only wait on itself
+        for (const event of events) {
+            const metric = event?.metric;
+            if (typeof metric !== "string" || !CLIENT_METRICS.has(metric)) continue;
+            const at = usageTime(event.at);
+            if (!at || at.getTime() < now - USAGE_LATE_MS || at.getTime() > now + USAGE_EARLY_MS) continue;
+            if (metric === "active_minute" && isRepeatedMinute(userId, at)) continue;
+            await countUsage(pool, userId, metric, { value: metric === "active_minute" ? 1 : 0, platform, at });
+        }
+        res.status(204).end();
     } catch (err) {
         serverError(res, err);
     }
@@ -913,6 +1026,7 @@ app.post("/api/tasks", async (req, res) => {
         // an event entered afterwards (e.g. yesterday's work) is over right away
         const [synced] = await syncEvents(client, "tasks.id = $1", [id]);
         await client.query("COMMIT");
+        countLater(req, "task_created");
         const task = await loadTask(id, userId);
         res.status(201).json(synced?.nextId ? { ...task, nextTask: await loadTask(synced.nextId, userId) } : task);
     } catch (err) {
@@ -1224,6 +1338,7 @@ app.post("/api/sessions", async (req, res) => {
         }
 
         await client.query("COMMIT");
+        if (totalTime > 0) countLater(req, "focus_done", totalTime);
 
         const result = await pool.query(
             `${SESSION_SELECT}
@@ -2441,9 +2556,11 @@ app.delete("/api/users", authLimiter, async (req, res) => {
             WHERE families.id = heir.family_id AND families.owner_id = $1`,
             [userId]
         );
+        // (its usage_seen marks go with it, FK cascade; the anonymous usage totals stay)
         await client.query("DELETE FROM users WHERE id = $1", [userId]);
         await client.query("COMMIT");
         forgetAccount(userId);
+        forgetUsageAccount(userId);
         realtime.disconnectUser(userId);
         res.json({ message: "Account deleted" });
     } catch (err) {
@@ -2534,6 +2651,8 @@ app.put("/api/tasks/:id", async (req, res) => {
         const nextId = kind === "event" ? synced?.nextId ?? null
             : old.done || !done ? null : await createNextRepeat(client, id);
         await client.query("COMMIT");
+        // ticked off just now (events are done once they are over, not by anybody)
+        if (kind !== "event" && done && !old.done) countLater(req, "task_done");
 
         const task = await loadTask(id, userId);
         // a repeating task that was just done comes back with the next one
@@ -4416,6 +4535,8 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
             VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING id`,
             values
         );
+        // a new entry (one of my own tasks shared into the session isn't a new task)
+        if (!task.sourceTaskId) countLater(req, "task_created");
         // an event entered afterwards is over right away
         await syncSessionEvents("shared_session_tasks.id = $1", [created.rows[0].id], false);
         await logEvent(pool, session.sessionId, userId, "task_added", { taskId: created.rows[0].id, taskName: task.name });
@@ -4507,6 +4628,7 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
                 );
             }
             await logEvent(pool, session.sessionId, userId, done ? "task_done" : "task_reopened", { taskId, taskName: task.name });
+            if (done) countLater(req, "task_done");
         }
         const assignedToOther = changesAssignee && assigneeId !== task.assignee_id && assigneeId && assigneeId !== userId;
         if (changesAssignee && assigneeId !== task.assignee_id) {
@@ -5288,6 +5410,7 @@ app.post(`${familyBase}/:id/tasks`, async (req, res) => {
             `INSERT INTO family_tasks (${columns.join(", ")}) VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING id, kind`,
             values
         );
+        countLater(req, "task_created");
         // an event entered afterwards is over right away
         if (created.rows[0].kind === "event") await syncFamilyEvents("family_tasks.id = $1", [created.rows[0].id], false);
         await sendFamily(res, family.familyId, userId, 201);
@@ -5328,7 +5451,7 @@ app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
         const subGroup = await readSubGroup(req, "family", family.familyId);
         if (subGroup.error) return invalidInput(res, subGroup.error);
         if ("value" in subGroup) fields.values.group_id = subGroup.value;
-        const before = await pool.query("SELECT name, due, kind, assignee_id FROM family_tasks WHERE id = $1 AND family_id = $2", [taskId, family.familyId]);
+        const before = await pool.query("SELECT name, due, kind, assignee_id, done FROM family_tasks WHERE id = $1 AND family_id = $2", [taskId, family.familyId]);
         if (before.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
         const entry = before.rows[0];
         // a time of day needs a day; taking the day away takes the time and the reminders along
@@ -5354,6 +5477,7 @@ app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
             sets.push(`${column} = $${values.length}`);
         }
         await pool.query(`UPDATE family_tasks SET ${sets.join(", ")} WHERE id = $1`, values);
+        if (setDone === true && !entry.done) countLater(req, "task_done");
         // a moved event can be over (or open again)
         if (kind === "event") await syncFamilyEvents("family_tasks.id = $1", [taskId], false);
         await sendFamily(res, family.familyId, userId);
@@ -7639,6 +7763,10 @@ startFocusSchedule(pool, limitFromEnv("FOCUS_CHECK_MS", 5 * 1000));
 // events that are over are ticked off, also checked once a minute (first right away)
 closePastEvents();
 setInterval(closePastEvents, limitFromEnv("EVENT_CHECK_MS", 60 * 1000)).unref();
+// the usage statistics' "already counted" marks of periods that are over, once an hour (the totals stay)
+setInterval(() => {
+    cleanupUsage(pool).catch((err) => console.error("Cleaning up usage marks failed:", err.message));
+}, limitFromEnv("USAGE_CLEANUP_MS", 60 * 60 * 1000)).unref();
 server.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
 });

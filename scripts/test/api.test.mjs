@@ -46,10 +46,10 @@ const freePort = () => new Promise((resolve) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sql = async (text, params) => (await db.query(text, params)).rows;
 
-async function call(method, path, body, token) {
+async function call(method, path, body, token, headers = {}) {
     const res = await fetch(API + path, {
         method,
-        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
         body: body ? JSON.stringify(body) : undefined,
     });
     let data = null;
@@ -4533,5 +4533,193 @@ describe("study push (kind study)", () => {
         assert.equal(pushes(off).length, 0);
         assert.equal(pushes(plain).length, 0);
         assert.equal((await sql("SELECT behind_notified_minutes FROM goals WHERE id = $1", [goalOff.id]))[0].behind_notified_minutes, 0, "not marked: nothing was delivered");
+    });
+});
+
+describe("usage statistics", () => {
+    // counts after the answer are written a moment later: read until `ok` holds (or time is up)
+    async function until(read, ok = (rows) => rows.length > 0, ms = 3000) {
+        let rows;
+        for (let i = 0; i < ms / 50; i++) {
+            rows = await read();
+            if (ok(rows)) return rows;
+            await sleep(50);
+        }
+        return rows;
+    }
+    const hourly = (metric) => sql("SELECT platform, plan, events, people, value_sum::int AS value_sum FROM usage_hourly WHERE metric = $1", [metric]);
+    const marks = (who) => sql("SELECT * FROM usage_seen WHERE user_id = $1", [who.id]);
+    const reset = () => sql("TRUNCATE usage_hourly, usage_people");
+    const consent = (who, granted = true) => call("PUT", "/api/profile/usage-consent", { granted }, who.token);
+    const beacon = (who, events, headers) => call("POST", "/api/usage", { platform: "web", events }, who.token, headers);
+    let n = 0;
+    const person = (options) => member(`ustat${++n}`, options);
+
+    test("consent: unanswered at first, then stored with its time and version", async () => {
+        const u = await person();
+        assert.deepEqual((await call("GET", "/api/me", null, u.token)).data.usageConsent, { choice: null, at: null, version: null });
+        const r = await consent(u);
+        assert.equal(r.status, 200);
+        assert.equal(r.data.choice, "granted");
+        assert.equal(r.data.version, 1);
+        assert.ok(Date.now() - new Date(r.data.at).getTime() < 60e3);
+        const me = (await call("GET", "/api/me", null, u.token)).data.usageConsent;
+        assert.deepEqual([me.choice, me.version], ["granted", 1]);
+        for (const body of [{ granted: "yes" }, {}, { granted: null }]) {
+            const bad = await call("PUT", "/api/profile/usage-consent", body, u.token);
+            assert.equal(bad.status, 400);
+            assert.equal(bad.data.code, "INVALID_INPUT");
+        }
+        assert.equal((await call("PUT", "/api/profile/usage-consent", { granted: true })).status, 401);
+    });
+
+    test("accounts waiting for beta access may consent and send the beacon too", async () => {
+        const u = await person({ pro: false });
+        assert.equal((await call("GET", "/api/tasks", null, u.token)).status, 403, "no app access");
+        assert.equal((await consent(u)).status, 200);
+        await reset();
+        assert.equal((await beacon(u, [{ metric: "app_open" }])).status, 204);
+        const rows = await hourly("app_open");
+        assert.deepEqual(rows.map((r) => [r.events, r.plan]), [[1, "free"]]);
+    });
+
+    test("beacon without consent: 204, nothing stored", async () => {
+        const u = await person();
+        await reset();
+        assert.equal((await beacon(u, [{ metric: "app_open" }, { metric: "view:calendar" }])).status, 204);
+        assert.equal((await sql("SELECT * FROM usage_hourly")).length, 0);
+        assert.equal((await marks(u)).length, 0);
+    });
+
+    test("beacon keeps known client metrics only", async () => {
+        const u = await person();
+        await consent(u);
+        await reset();
+        const r = await beacon(u, [{ metric: "view:calendar" }, { metric: "task_done" }, { metric: "nope" }]);
+        assert.equal(r.status, 204);
+        const metrics = (await sql("SELECT DISTINCT metric FROM usage_hourly ORDER BY metric")).map((row) => row.metric);
+        assert.deepEqual(metrics, ["active", "view:calendar"]);
+    });
+
+    test("active_minute: once per minute, worth one", async () => {
+        const u = await person();
+        await consent(u);
+        await reset();
+        const at = new Date().toISOString();
+        await beacon(u, [{ metric: "active_minute", at, value: 99 }, { metric: "active_minute", at }]);
+        await beacon(u, [{ metric: "active_minute", at }]);
+        const rows = await hourly("active_minute");
+        assert.deepEqual(rows.map((row) => [row.events, row.value_sum]), [[1, 1]]);
+        // other metrics carry no value
+        await beacon(u, [{ metric: "app_open", value: 50 }]);
+        assert.equal((await hourly("app_open"))[0].value_sum, 0);
+    });
+
+    test("events too old or in the future are dropped; too many is a bad request", async () => {
+        const u = await person();
+        await consent(u);
+        await reset();
+        const twoDaysAgo = new Date(Date.now() - 2 * 86400e3).toISOString();
+        const later = new Date(Date.now() + 5 * 60e3).toISOString();
+        assert.equal((await beacon(u, [{ metric: "app_open", at: twoDaysAgo }, { metric: "app_open", at: later }, { metric: "app_open", at: "soon" }])).status, 204);
+        assert.equal((await sql("SELECT * FROM usage_hourly")).length, 0);
+        const many = Array.from({ length: 201 }, () => ({ metric: "app_open" }));
+        const r = await beacon(u, many);
+        assert.equal(r.status, 400);
+        assert.equal(r.data.code, "INVALID_INPUT");
+        assert.equal((await call("POST", "/api/usage", { events: "app_open" }, u.token)).status, 400);
+        assert.equal((await sql("SELECT * FROM usage_hourly")).length, 0);
+    });
+
+    test("tasks: created and done are counted by the server", async () => {
+        const u = await person();
+        await consent(u);
+        await reset();
+        const task = (await call("POST", "/api/tasks", { name: "Lesen" }, u.token)).data;
+        assert.deepEqual((await until(() => hourly("task_created"))).map((r) => r.events), [1]);
+        assert.equal((await call("PUT", `/api/tasks/${task.id}`, { name: "Lesen", done: true }, u.token)).status, 200);
+        assert.deepEqual((await until(() => hourly("task_done"))).map((r) => r.events), [1]);
+        // changing something else doesn't count again; undone and done again does
+        await call("PUT", `/api/tasks/${task.id}`, { name: "Lesen!", done: true }, u.token);
+        await call("PUT", `/api/tasks/${task.id}`, { name: "Lesen", done: false }, u.token);
+        await call("PUT", `/api/tasks/${task.id}`, { name: "Lesen", done: true }, u.token);
+        const rows = await until(() => hourly("task_done"), (r) => r[0]?.events === 2);
+        assert.deepEqual(rows.map((r) => [r.events, r.people]), [[2, 1]]);
+        await sleep(200);
+        assert.equal((await hourly("task_done"))[0].events, 2);
+    });
+
+    test("shared session and family entries are counted too", async () => {
+        const u = await person();
+        await consent(u);
+        await reset();
+        const sessionId = (await call("POST", "/api/shared-sessions", { name: "Allein" }, u.token)).data.id;
+        const session = (await call("POST", `/api/shared-sessions/${sessionId}/tasks`, { name: "Folien" }, u.token)).data;
+        await call("PATCH", `/api/shared-sessions/${sessionId}/tasks/${session.tasks[0].id}`, { done: true }, u.token);
+        const familyId = (await call("POST", "/api/families", { name: "Daheim" }, u.token)).data.id;
+        const family = (await call("POST", `/api/families/${familyId}/tasks`, { name: "Milch" }, u.token)).data;
+        await call("PATCH", `/api/families/${familyId}/tasks/${family.tasks[0].id}`, { done: true }, u.token);
+        await call("PATCH", `/api/families/${familyId}/tasks/${family.tasks[0].id}`, { done: true }, u.token);
+        assert.deepEqual((await until(() => hourly("task_created"), (r) => r[0]?.events === 2)).map((r) => r.events), [2]);
+        assert.deepEqual((await until(() => hourly("task_done"), (r) => r[0]?.events === 2)).map((r) => r.events), [2]);
+        await sleep(200);
+        assert.equal((await hourly("task_done"))[0].events, 2, "done twice in a row counts once");
+    });
+
+    test("focus_done: the seconds, and the platform from the header", async () => {
+        const u = await person();
+        await consent(u);
+        await reset();
+        assert.equal((await call("POST", "/api/sessions", { totalTime: 1500, workedTasks: [] }, u.token, { "X-Quidey-Platform": "android" })).status, 201);
+        const rows = await until(() => hourly("focus_done"));
+        assert.deepEqual(rows.map((r) => [r.platform, r.value_sum]), [["android", 1500]]);
+        await call("POST", "/api/sessions", { totalTime: 60, workedTasks: [] }, u.token, { "X-Quidey-Platform": "evil" });
+        const web = await until(() => sql("SELECT value_sum::int AS value_sum FROM usage_hourly WHERE metric = 'focus_done' AND platform = 'web'"));
+        assert.deepEqual(web.map((r) => r.value_sum), [60]);
+    });
+
+    test("withdrawing the consent drops the marks at once and stops counting", async () => {
+        const u = await person();
+        await consent(u);
+        await beacon(u, [{ metric: "app_open" }]);
+        assert.ok((await marks(u)).length > 0);
+        const r = await consent(u, false);
+        assert.equal(r.status, 200);
+        assert.deepEqual([r.data.choice, r.data.version], ["denied", 1]);
+        assert.equal((await marks(u)).length, 0);
+        await reset();
+        assert.equal((await beacon(u, [{ metric: "view:home" }])).status, 204);
+        await call("POST", "/api/tasks", { name: "Nach dem Nein" }, u.token);
+        await sleep(300);
+        assert.equal((await sql("SELECT * FROM usage_hourly")).length, 0);
+        assert.equal((await marks(u)).length, 0);
+    });
+
+    test("a failing count doesn't break the request", async () => {
+        const u = await person();
+        await consent(u);
+        const task = (await call("POST", "/api/tasks", { name: "Trotzdem" }, u.token)).data;
+        await until(() => hourly("task_created"));
+        await sql("ALTER TABLE usage_hourly RENAME TO usage_hourly_x");
+        try {
+            const r = await call("PUT", `/api/tasks/${task.id}`, { name: "Trotzdem", done: true }, u.token);
+            assert.equal(r.status, 200);
+            assert.equal(r.data.done, true);
+            for (let i = 0; i < 60 && !log.includes("Counting usage failed"); i++) await sleep(50);
+            assert.ok(log.includes("Counting usage failed"));
+        } finally {
+            await sql("ALTER TABLE usage_hourly_x RENAME TO usage_hourly");
+        }
+    });
+
+    test("deleting the account removes its marks, the totals stay", async () => {
+        const u = await person();
+        await consent(u);
+        await reset();
+        await beacon(u, [{ metric: "app_open" }]);
+        assert.ok((await marks(u)).length > 0);
+        assert.equal((await call("DELETE", "/api/users", { password: PW }, u.token)).status, 200);
+        assert.equal((await marks(u)).length, 0);
+        assert.deepEqual((await hourly("app_open")).map((r) => r.events), [1]);
     });
 });
