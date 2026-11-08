@@ -172,16 +172,17 @@ async function usageReport(db, p) {
     };
 }
 
-// The usage_hourly rows of the range as they are; null when there are more than `max`
+// The usage_hourly rows of the range, with the day (Berlin, like the report's days) instead of the
+// exact UTC hour; null when there are more than `max`
 async function usageRaw(db, p, max) {
     const a = args(p);
     const { rows: [{ n }] } = await db.query(`SELECT count(*)::int AS n FROM usage_hourly WHERE ${HOURLY_WHERE}`, a);
     if (n > max) return null;
     const { rows } = await db.query(
-        `SELECT hour, local_hour, weekday, metric, platform, language, plan, events, people, value_sum FROM usage_hourly
+        `SELECT ${BERLIN_DAY} AS date, local_hour, weekday, metric, platform, language, plan, events, people, value_sum FROM usage_hourly
          WHERE ${HOURLY_WHERE} ORDER BY hour, metric, platform, language, plan`, a);
     return rows.map((r) => ({
-        hour: r.hour.toISOString(), localHour: r.local_hour, weekday: r.weekday, metric: r.metric, platform: r.platform,
+        date: r.date, localHour: r.local_hour, weekday: r.weekday, metric: r.metric, platform: r.platform,
         language: r.language, plan: r.plan, events: r.events, people: r.people, valueSum: Number(r.value_sum),
     }));
 }

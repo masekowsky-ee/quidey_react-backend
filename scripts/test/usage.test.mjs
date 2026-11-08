@@ -12,7 +12,7 @@ import dotenv from "dotenv";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 dotenv.config({ path: join(ROOT, ".env"), quiet: true });
 const require = createRequire(import.meta.url);
-const { countUsage, planOf, isMetric, cleanupUsage, withdrawUsage, forgetUsageAccount, localParts, cleanPlatform } = require("../../utils/usage.js");
+const { countUsage, planOf, isMetric, cleanupUsage, startUsageCleanup, withdrawUsage, forgetUsageAccount, localParts, cleanPlatform } = require("../../utils/usage.js");
 
 const DB = `quidey_test_usage_${process.pid}`;
 const conn = (database) => ({
@@ -162,6 +162,30 @@ describe("usage counting core", () => {
         // marks of the current moment and the totals stay
         assert.ok((await sql("SELECT 1 FROM usage_seen WHERE metric = 'task_done'")).length > 0);
         assert.ok((await sql("SELECT 1 FROM usage_hourly")).length > 0);
+    });
+
+    test("the cleanup runs once at start, then on its interval; a failure is only logged", async () => {
+        const u = await user();
+        await sql("INSERT INTO usage_seen (scope, period, metric, user_id) VALUES ('hour', $1, 'app_open', $2)", [new Date(Date.now() - 30 * 3600e3), u]);
+        const timer = startUsageCleanup(pool, 60 * 60 * 1000);
+        try {
+            for (let i = 0; i < 50 && (await sql("SELECT 1 FROM usage_seen WHERE user_id = $1", [u])).length; i++) await new Promise((r) => setTimeout(r, 20));
+            assert.equal((await sql("SELECT 1 FROM usage_seen WHERE user_id = $1", [u])).length, 0);
+        } finally {
+            clearInterval(timer);
+        }
+        const logged = [];
+        const original = console.error;
+        console.error = (...args) => logged.push(args.join(" "));
+        const broken = { query: async () => { throw new Error("db down"); } };
+        const second = startUsageCleanup(broken, 60 * 60 * 1000);
+        try {
+            await new Promise((r) => setTimeout(r, 20));
+            assert.deepEqual(logged, ["Cleaning up usage marks failed: db down"]);
+        } finally {
+            clearInterval(second);
+            console.error = original;
+        }
     });
 
     test("one person, two metrics in one hour: active counts them once", async () => {

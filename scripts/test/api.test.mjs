@@ -1310,6 +1310,15 @@ describe("admin users: every field, paging, export", () => {
         const old = await call("GET", "/api/admin/users?q=pg", null, boss.token);
         assert.ok(Array.isArray(old.data));
         assert.equal((await call("GET", "/api/admin/users?page=1&pageSize=101", null, boss.token)).status, 400);
+        // a sort that names something every object inherits is unknown too: the default order
+        for (const sort of ["constructor", "toString", "__proto__"]) {
+            const odd = await call("GET", `/api/admin/users?q=pg&page=1&pageSize=100&sort=${sort}`, null, boss.token);
+            assert.equal(odd.status, 200, sort);
+            assert.deepEqual(odd.data.users.map(u => u.username), newest, sort);
+        }
+        const zero = await call("GET", "/api/admin/users?page=0", null, boss.token);
+        assert.equal(zero.status, 400);
+        assert.equal(zero.data.code, "INVALID_PAGE");
     });
 
     test("export lists everybody and is logged", async () => {
@@ -4923,7 +4932,9 @@ describe("admin usage", () => {
         assert.equal(r.status, 200);
         const focus = r.data.rows.find((x) => x.metric === "focus_done");
         assert.deepEqual([focus.platform, focus.valueSum, focus.events, focus.people, focus.localHour], ["web", 1800, 1, 1, hour1]);
-        assert.deepEqual(Object.keys(focus).sort(), ["events", "hour", "language", "localHour", "metric", "people", "plan", "platform", "valueSum", "weekday"]);
+        // the day, not the exact UTC hour
+        assert.deepEqual(Object.keys(focus).sort(), ["date", "events", "language", "localHour", "metric", "people", "plan", "platform", "valueSum", "weekday"]);
+        assert.equal(focus.date, day1);
         // more than USAGE_RAW_MAX (50) rows: 4 metrics (with active) over 15 hours
         for (let h = 0; h < 15; h++) {
             const at = stamp(1, h);

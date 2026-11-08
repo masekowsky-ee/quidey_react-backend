@@ -1,5 +1,6 @@
-// Checks the migration files themselves (no database needed): scripts/migrate.sh refuses to run
-// when these rules are broken, so catch it here before it reaches the server.
+// Checks the migration files themselves: scripts/migrate.sh refuses to run when these rules are
+// broken, so catch it here before it reaches the server. The file checks need no database; the 044
+// test needs PostgreSQL (connection from .env like api.test.mjs) and is skipped without DB_USER.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
@@ -9,6 +10,9 @@ import pg from "pg";
 import dotenv from "dotenv";
 
 const DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "migrations");
+const ROOT = join(DIR, "..");
+dotenv.config({ path: join(ROOT, ".env"), quiet: true });
+const NO_DB = !process.env.DB_USER && "no database configured (DB_* in .env)";
 const files = readdirSync(DIR).filter((f) => f.endsWith(".sql")).sort();
 
 test("migration file names are NNN_lower_case_name.sql", () => {
@@ -42,9 +46,7 @@ test("no migration needs to run outside a transaction", () => {
 });
 
 // 044 needs a real database: a throwaway one built from schema.sql (connection from .env, DB_NAME is ignored)
-test("044 adds the consent columns and the usage tables, runs twice without harm, checks the consent value", async () => {
-    const ROOT = join(DIR, "..");
-    dotenv.config({ path: join(ROOT, ".env"), quiet: true });
+test("044 adds the consent columns and the usage tables, runs twice without harm, checks the consent value", { skip: NO_DB }, async () => {
     const conn = (database) => ({
         user: process.env.DB_USER, password: process.env.DB_PASSWORD,
         host: process.env.DB_HOST, port: Number(process.env.DB_PORT) || 5432, database,

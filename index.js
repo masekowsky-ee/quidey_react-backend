@@ -22,7 +22,7 @@ const { FREE_LIMITS, FREE_STATS_DAYS, limited, usage, refuseOverLimit } = requir
 const { FCM_ENDPOINT, isFcmEndpoint } = require("./utils/fcm");
 const progress = require("./utils/progress");
 const { resolveRange, usageReport, usageRaw } = require("./utils/usageReport");
-const { CLIENT_METRICS, cleanPlatform, countUsage, forgetUsageAccount, cleanupUsage, withdrawUsage } = require("./utils/usage");
+const { CLIENT_METRICS, cleanPlatform, countUsage, forgetUsageAccount, startUsageCleanup, withdrawUsage } = require("./utils/usage");
 const { PROFILE_COLORS, PROFILE_BANNERS, PROFILE_EMOJIS, AVATAR_FRAMES, PROFILE_TITLES, SHOWCASE_MAX, BADGES } = progress;
 
 const app = express();
@@ -2359,7 +2359,9 @@ app.get("/api/admin/users", async (req, res) => {
         if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) {
             return adminFail(res, 400, "INVALID_PAGE", "page must be 1 or more and pageSize 1 to 100");
         }
-        const order = ADMIN_USER_ORDER[req.query.sort] ?? ADMIN_USER_ORDER.newest;
+        // own keys only: "constructor" and the like are unknown sorts, not SQL
+        const sort = typeof req.query.sort === "string" && Object.hasOwn(ADMIN_USER_ORDER, req.query.sort) ? req.query.sort : "newest";
+        const order = ADMIN_USER_ORDER[sort];
         const [result, count] = await Promise.all([
             pool.query(`${ADMIN_USER_SELECT} ${where} ORDER BY ${order} LIMIT $3 OFFSET $4`, [q, like, pageSize, (page - 1) * pageSize]),
             pool.query(`SELECT count(*)::int AS n FROM users ${where}`, [q, like]),
@@ -7846,10 +7848,9 @@ startFocusSchedule(pool, limitFromEnv("FOCUS_CHECK_MS", 5 * 1000));
 // events that are over are ticked off, also checked once a minute (first right away)
 closePastEvents();
 setInterval(closePastEvents, limitFromEnv("EVENT_CHECK_MS", 60 * 1000)).unref();
-// the usage statistics' "already counted" marks of periods that are over, once an hour (the totals stay)
-setInterval(() => {
-    cleanupUsage(pool).catch((err) => console.error("Cleaning up usage marks failed:", err.message));
-}, limitFromEnv("USAGE_CLEANUP_MS", 60 * 60 * 1000)).unref();
+// the usage statistics' "already counted" marks of periods that are over, at start and then once an
+// hour (the totals stay)
+startUsageCleanup(pool, limitFromEnv("USAGE_CLEANUP_MS", 60 * 60 * 1000));
 server.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
 });

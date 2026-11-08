@@ -165,10 +165,18 @@ async function cleanupUsage(db, now = new Date()) {
     return rowCount;
 }
 
+// Runs the cleanup once right away (marks that ended while the server was down go at its start) and
+// then every `everyMs`; a failure is only logged. Returns the interval (unref'd).
+function startUsageCleanup(db, everyMs) {
+    const run = () => cleanupUsage(db).catch((err) => console.error("Cleaning up usage marks failed:", err.message));
+    run();
+    return setInterval(run, everyMs).unref();
+}
+
 // Withdrawing the consent: the person's marks go at once
 async function withdrawUsage(db, userId) {
     await db.query("DELETE FROM usage_seen WHERE user_id = $1", [userId]);
     forgetUsageAccount(userId);
 }
 
-module.exports = { METRICS, CLIENT_METRICS, SERVER_METRICS, isMetric, planOf, cleanPlatform, localParts, countUsage, forgetUsageAccount, cleanupUsage, withdrawUsage };
+module.exports = { METRICS, CLIENT_METRICS, SERVER_METRICS, isMetric, planOf, cleanPlatform, localParts, countUsage, forgetUsageAccount, cleanupUsage, startUsageCleanup, withdrawUsage };
