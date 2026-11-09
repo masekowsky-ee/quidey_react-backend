@@ -1261,6 +1261,9 @@ app.post("/api/sessions", async (req, res) => {
     if (!Number.isFinite(totalTime) || totalTime < 0 || totalTime > 24 * 60 * 60) {
         return res.status(400).json({ error: "totalTime must be between 0 and 86400 seconds" });
     }
+    if (totalTime * 1000 < SESSION_MIN_MS) {
+        return res.status(400).json({ error: "A session is at least a minute long", code: "SESSION_TOO_SHORT" });
+    }
     if (!Array.isArray(workedTasks) || workedTasks.length > 500) {
         return res.status(400).json({ error: "workedTasks must be an array of at most 500 tasks" });
     }
@@ -3434,11 +3437,42 @@ const friendIdsOf = (param) => `
     SELECT CASE WHEN requester_id = ${param} THEN addressee_id ELSE requester_id END
     FROM friendships WHERE status = 'accepted' AND ${param} IN (requester_id, addressee_id)`;
 
+// A focus session shorter than this isn't saved (a start by mistake, a stop during a break);
+// older short ones still add their time but don't count as sessions.
+const SESSION_MIN_MS = 60 * 1000;
+
+// Focus per day of user $1 in their timezone (needs the CTE `me`): own sessions plus the team
+// stopwatch time beyond what those sessions already hold for session tasks (the solo timer on a
+// session task books both), the same rule as XP (utils/progress.js). Columns: day, ms (all focus),
+// n (sessions of at least a minute), session_ms (their time) and longest (the longest session).
+const FOCUS_DAYS_CTES = `
+    solo_days AS (
+        SELECT ((s.date AT TIME ZONE current_setting('TimeZone')) AT TIME ZONE me.tz)::date AS day,
+            sum(COALESCE(s.time_ms, 0))::bigint AS ms,
+            count(*) FILTER (WHERE s.time_ms >= ${SESSION_MIN_MS})::int AS n,
+            COALESCE(sum(s.time_ms) FILTER (WHERE s.time_ms >= ${SESSION_MIN_MS}), 0)::bigint AS session_ms,
+            COALESCE(max(s.time_ms), 0)::bigint AS longest,
+            COALESCE(sum(linked.ms), 0)::bigint AS shared_ms
+        FROM sessions AS s CROSS JOIN me
+        LEFT JOIN LATERAL (SELECT sum(time_ms) AS ms FROM session_shared_tasks WHERE session_id = s.id) AS linked ON true
+        WHERE s.user_id = $1 AND s.date IS NOT NULL
+        GROUP BY 1
+    ),
+    focus_days AS (
+        SELECT COALESCE(solo_days.day, team.day) AS day,
+            (COALESCE(solo_days.ms, 0) + GREATEST(COALESCE(team.time_ms, 0) - COALESCE(solo_days.shared_ms, 0), 0))::bigint AS ms,
+            COALESCE(solo_days.n, 0) AS n, COALESCE(solo_days.session_ms, 0)::bigint AS session_ms,
+            COALESCE(solo_days.longest, 0)::bigint AS longest
+        FROM solo_days
+        FULL JOIN (SELECT day, time_ms FROM shared_time_days WHERE user_id = $1) AS team ON team.day = solo_days.day
+    )`;
+
 // Focus statistics of one user. Days are counted in their own timezone (users.timezone, as for
 // reminder mails): a session at 23:30 in Berlin belongs to that day, not the next one.
 async function loadStats(userId) {
     const result = await pool.query(
         `WITH me AS (SELECT COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = $1),
+        ${FOCUS_DAYS_CTES},
         local AS (
             SELECT (sessions.date AT TIME ZONE current_setting('TimeZone')) AT TIME ZONE me.tz AS at,
                 COALESCE(sessions.time_ms, 0)::bigint AS ms
@@ -3447,9 +3481,9 @@ async function loadStats(userId) {
         )
         SELECT
             (SELECT to_char((now() AT TIME ZONE tz)::date, 'YYYY-MM-DD') FROM me) AS today,
-            (SELECT COALESCE(json_agg(json_build_object('day', day, 'ms', ms, 'sessions', n, 'longest', longest) ORDER BY day), '[]')
-                FROM (SELECT to_char(at::date, 'YYYY-MM-DD') AS day, sum(ms) AS ms, count(*) AS n, max(ms) AS longest
-                    FROM local GROUP BY at::date) AS days) AS days,
+            (SELECT COALESCE(json_agg(json_build_object('day', to_char(day, 'YYYY-MM-DD'), 'ms', ms, 'sessions', n,
+                    'sessionMs', session_ms, 'longest', longest) ORDER BY day), '[]')
+                FROM focus_days) AS days,
             (SELECT COALESCE(json_agg(json_build_object('hour', hour, 'ms', ms)), '[]')
                 FROM (SELECT extract(hour FROM at)::int AS hour, sum(ms) AS ms FROM local GROUP BY 1) AS hours) AS hours,
             (SELECT COALESCE(json_agg(json_build_object('name', name, 'color', color, 'ms', ms) ORDER BY ms DESC), '[]')
@@ -3505,6 +3539,8 @@ function summarizeStats(row) {
 
     const totalMs = days.reduce((sum, d) => sum + d.ms, 0);
     const sessions = days.reduce((sum, d) => sum + d.sessions, 0);
+    // the average of real sessions: no team stopwatch time, no runs under a minute
+    const sessionMs = days.reduce((sum, d) => sum + Number(d.sessionMs ?? d.ms), 0);
     const best = active.reduce((top, d) => (!top || d.ms > top.ms ? d : top), null);
 
     return {
@@ -3512,7 +3548,7 @@ function summarizeStats(row) {
         totalMs,
         sessions,
         activeDays: active.length,
-        avgSessionMs: sessions > 0 ? Math.round(totalMs / sessions) : 0,
+        avgSessionMs: sessions > 0 ? Math.round(sessionMs / sessions) : 0,
         longestSessionMs: days.reduce((max, d) => Math.max(max, d.longest), 0),
         currentStreak,
         longestStreak,
@@ -5862,6 +5898,10 @@ app.get("/api/stats", async (req, res) => {
             focus_in AS (
                 SELECT * FROM focus WHERE ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)
             ),
+            ${FOCUS_DAYS_CTES},
+            focus_days_in AS (
+                SELECT * FROM focus_days WHERE ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)
+            ),
             ${STATS_SHARED_CTES},
             events AS (
                 SELECT tasks.due AS day, COALESCE(tasks.duration_minutes, 0)::bigint * 60000 AS ms, tasks.event_type_id
@@ -5875,9 +5915,9 @@ app.get("/api/stats", async (req, res) => {
             )
             SELECT
                 (SELECT to_char((now() AT TIME ZONE tz)::date, 'YYYY-MM-DD') FROM me) AS today,
-                (SELECT to_char(min(day), 'YYYY-MM-DD') FROM (SELECT day FROM focus UNION ALL SELECT day FROM events) AS all_days) AS first_day,
+                (SELECT to_char(min(day), 'YYYY-MM-DD') FROM (SELECT day FROM focus_days UNION ALL SELECT day FROM events) AS all_days) AS first_day,
                 (SELECT COALESCE(json_agg(json_build_object('day', to_char(day, 'YYYY-MM-DD'), 'ms', ms, 'n', n) ORDER BY day), '[]')
-                    FROM (SELECT day, sum(ms) AS ms, count(*) AS n FROM focus_in GROUP BY day) AS d) AS focus_days,
+                    FROM focus_days_in) AS focus_days,
                 (SELECT COALESCE(json_agg(json_build_object('day', to_char(day, 'YYYY-MM-DD'), 'ms', ms, 'n', n) ORDER BY day), '[]')
                     FROM (SELECT day, sum(ms) AS ms, count(*) AS n FROM events_in GROUP BY day) AS d) AS event_days,
                 (SELECT COALESCE(json_agg(json_build_object('id', id, 'name', name, 'color', color, 'ms', ms, 'count', n) ORDER BY ms DESC, n DESC), '[]')

@@ -1847,6 +1847,55 @@ describe("events and reminders in a family", () => {
     });
 });
 
+describe("focus in shared sessions counts in my totals", () => {
+    // kim works 400 s on a session task with the solo timer (booked as her session AND as team
+    // time), 200 s more with the session's own stopwatch; yesterday only the stopwatch, 300 s.
+    const setUp = async (prefix) => {
+        const kim = await member(`${prefix}kim`);
+        const lou = await member(`${prefix}lou`);
+        await befriend(kim, lou, `${prefix}lou`);
+        const ses = (await call("POST", "/api/shared-sessions", { name: "Lerngruppe", friendIds: [lou.id] }, kim.token)).data.id;
+        const task = (await call("POST", `/api/shared-sessions/${ses}/tasks`, { name: "Kapitel 4" }, kim.token)).data.tasks.find(t => t.name === "Kapitel 4");
+        assert.equal((await call("POST", "/api/sessions", { totalTime: 400, workedTasks: [{ sharedTaskId: task.id, name: "Kapitel 4", time: 400 }] }, kim.token)).status, 201);
+        await sql("INSERT INTO shared_time_days (user_id, day, time_ms) VALUES ($1, (now() AT TIME ZONE 'Europe/Berlin')::date, 600000)", [kim.id]);
+        await sql("INSERT INTO shared_time_days (user_id, day, time_ms) VALUES ($1, (now() AT TIME ZONE 'Europe/Berlin')::date - 1, 300000)", [kim.id]);
+        // a few seconds started by mistake: time counts, but it isn't a session
+        await sql("INSERT INTO sessions (user_id, time_ms, date) VALUES ($1, 20000, now())", [kim.id]);
+        return kim;
+    };
+
+    test("statistics: team time beyond my own sessions, short runs not counted as sessions", async () => {
+        const kim = await setUp("ftot");
+        const week = (await call("GET", `/api/stats?from=${daysFromToday(-6)}&to=${daysFromToday(0)}`, null, kim.token)).data;
+        assert.equal(week.focus.ms, 400_000 + 20_000 + 200_000 + 300_000, "the 400 s on the session task count once");
+        assert.equal(week.focus.sessions, 1);
+        assert.deepEqual(week.focus.days, [{ day: daysFromToday(-1), ms: 300_000 }, { day: daysFromToday(0), ms: 620_000 }]);
+        assert.equal(week.together.teamMs, 900_000, "the breakdown stays");
+        assert.equal(week.firstDay, daysFromToday(-1));
+    });
+
+    test("profile: totals and streak include team time", async () => {
+        const kim = await setUp("fpro");
+        const stats = (await call("GET", "/api/profile", null, kim.token)).data.stats;
+        assert.equal(stats.totalMs, 920_000);
+        assert.equal(stats.sessions, 1);
+        assert.equal(stats.avgSessionMs, 400_000, "only real sessions");
+        assert.equal(stats.currentStreak, 2);
+        assert.equal(stats.todayMs, 620_000);
+    });
+
+    test("a session under a minute is not saved", async () => {
+        const pia = await member("fshort");
+        for (const totalTime of [0, 59]) {
+            const res = await call("POST", "/api/sessions", { totalTime, workedTasks: [] }, pia.token);
+            assert.equal(res.status, 400);
+            assert.equal(res.data.code, "SESSION_TOO_SHORT");
+        }
+        assert.equal((await call("POST", "/api/sessions", { totalTime: 60, workedTasks: [] }, pia.token)).status, 201);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM sessions WHERE user_id = $1", [pia.id]))[0].n, 1);
+    });
+});
+
 describe("notices about my families and sessions", () => {
     const F = "/api/families";
     let ann, ben, cleo, familyId, otherFamilyId, sessionId;
