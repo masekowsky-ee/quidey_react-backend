@@ -36,6 +36,18 @@ const AI_FAKE = {
         kind: "event", name: "Study", date: "2026-11-19", time: "13:00", endTime: "15:00", durationMinutes: null,
         color: "blue", eventType: "school", remindersMinutesBefore: [15, 99999], priority: null,
     },
+    scan: {
+        plan: {
+            name: "Biologie Klausur", kind: "exam", due: "2099-03-02", subject: "Biologie",
+            parts: [{ name: "Zellatmung", minutes: 90 }, { name: "Fotosynthese", minutes: 4 }, { name: "", minutes: 60 }],
+        },
+        notes: { title: "Zellatmung", body: "# Zellatmung\r\n- Glykolyse\n- [ ] Schaubild\n" },
+        entries: [
+            { kind: "event", name: "Klausur Biologie", date: "2099-03-02", time: "08:00", endTime: "09:30", durationMinutes: null },
+            { kind: "task", name: "Abgabe Protokoll", date: "2099-02-27", time: null, endTime: null, durationMinutes: null },
+            { kind: "task", name: "kaputt", date: "2099-02-31", time: "25:00", endTime: null, durationMinutes: 9999 },
+        ],
+    },
 };
 const conn = (database) => ({
     user: process.env.DB_USER, password: process.env.DB_PASSWORD,
@@ -5054,5 +5066,70 @@ describe("AI help: daily limits and reading a quick-entry line", () => {
         const nobeta = await member("quotanobeta", { pro: false });
         assert.equal((await call("GET", "/api/ai/quota", null, nobeta.token)).status, 403);
         assert.equal((await call("GET", "/api/ai/quota")).status, 401);
+    });
+});
+
+describe("AI scan: a document, photos or a note into a plan, notes and entries", () => {
+    const PDF = Buffer.from("%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n%%EOF").toString("base64");
+    const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]).toString("base64");
+
+    test("reads pasted text into what was asked for, checked, and uses the day's scan", async () => {
+        const ina = await member("scanina");
+        const r = await call("POST", "/api/ai/scan", { wants: ["plan", "notes", "entries"], source: { kind: "text", text: "Klausur Biologie am 2.3. ..." } }, ina.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        assert.deepEqual(r.data.result.plan, {
+            name: "Biologie Klausur", kind: "exam", due: "2099-03-02", subject: "Biologie",
+            parts: [{ name: "Zellatmung", minutes: 90 }, { name: "Fotosynthese", minutes: 15 }],
+        });
+        assert.deepEqual(r.data.result.notes, { title: "Zellatmung", body: "# Zellatmung\n- Glykolyse\n- [ ] Schaubild" });
+        assert.deepEqual(r.data.result.entries.map(e => [e.kind, e.name, e.due, e.time, e.durationMinutes]), [
+            ["event", "Klausur Biologie", "2099-03-02", "08:00", 90],
+            ["task", "Abgabe Protokoll", "2099-02-27", null, null],
+            ["task", "kaputt", null, null, null],
+        ]);
+        assert.deepEqual(r.data.quota.scan, { used: 1, max: 1 });
+        const again = await call("POST", "/api/ai/scan", { wants: ["notes"], source: { kind: "text", text: "noch was" } }, ina.token);
+        assert.equal(again.status, 429);
+        assert.equal(again.data.kind, "scan");
+    });
+
+    test("only what was asked for comes back", async () => {
+        const jan = await member("scanjan");
+        const r = await call("POST", "/api/ai/scan", { wants: ["notes"], source: { kind: "pdf", data: PDF, name: "skript.pdf" } }, jan.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        assert.equal(r.data.result.plan, null);
+        assert.deepEqual(r.data.result.entries, []);
+        assert.equal(r.data.result.notes.title, "Zellatmung");
+    });
+
+    test("one of my own notes can be scanned, nobody else's", async () => {
+        const kai = await member("scankai");
+        const lou = await member("scanlou");
+        const note = await call("POST", "/api/notebook", { title: "Bio", body: "Zellatmung, Fotosynthese" }, kai.token);
+        assert.equal((await call("POST", "/api/ai/scan", { wants: ["plan"], source: { kind: "note", noteId: note.data.id } }, lou.token)).status, 404);
+        assert.equal((await call("GET", "/api/ai/quota", null, lou.token)).data.scan.used, 0);
+        assert.equal((await call("POST", "/api/ai/scan", { wants: ["plan"], source: { kind: "note", noteId: note.data.id } }, kai.token)).status, 200);
+    });
+
+    test("what isn't a PDF or a picture, too many pictures, or nothing asked for is refused, and costs nothing", async () => {
+        const mo = await member("scanmo");
+        const bad = [
+            { wants: [], source: { kind: "text", text: "x" } },
+            { wants: ["notes"], source: { kind: "pdf", data: Buffer.from("<html>").toString("base64") } },
+            { wants: ["notes"], source: { kind: "images", images: Array.from({ length: 6 }, () => ({ data: PNG })) } },
+            { wants: ["notes"], source: { kind: "images", images: [{ data: Buffer.from("GIF89a").toString("base64") }] } },
+            { wants: ["notes"], source: { kind: "text", text: "" } },
+            { wants: ["essay"], source: { kind: "text", text: "x" } },
+        ];
+        for (const body of bad) assert.equal((await call("POST", "/api/ai/scan", body, mo.token)).status, 400, JSON.stringify(body).slice(0, 80));
+        assert.equal((await call("GET", "/api/ai/quota", null, mo.token)).data.scan.used, 0);
+        assert.equal((await call("POST", "/api/ai/scan", { wants: ["notes"], source: { kind: "images", images: [{ data: PNG }] } }, mo.token)).status, 200);
+    });
+
+    test("a failed scan gives the day's scan back", async () => {
+        const nia = await member("scannia");
+        const r = await call("POST", "/api/ai/scan", { wants: ["notes"], source: { kind: "text", text: "AI_FAIL" } }, nia.token);
+        assert.equal(r.status, 502);
+        assert.equal((await call("GET", "/api/ai/quota", null, nia.token)).data.scan.used, 0);
     });
 });

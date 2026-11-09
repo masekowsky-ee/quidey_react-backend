@@ -84,6 +84,157 @@ function cleanEntry(raw, { types, text }) {
     };
 }
 
+
+// ---------- scanning a document, photos, a note or pasted text ----------
+const SCAN_WANTS = ["plan", "notes", "entries"];
+const SCAN_PDF_MAX_BYTES = 10 * 1024 * 1024;
+const SCAN_PDF_MAX_PAGES = 20;
+const SCAN_IMAGES_MAX = 5;
+const SCAN_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+const SCAN_TEXT_MAX = 60000;
+const SCAN_PARTS_MAX = 30;
+const SCAN_ENTRIES_MAX = 30;
+const GOAL_KINDS = ["exam", "assignment", "presentation", "other"];
+
+const SCAN_SCHEMA = {
+    type: "object",
+    properties: {
+        plan: nullable({
+            type: "object",
+            properties: {
+                name: { type: "string" },
+                kind: { type: "string", enum: GOAL_KINDS },
+                due: nullable({ type: "string" }),
+                subject: nullable({ type: "string" }),
+                parts: { type: "array", items: { type: "object", properties: { name: { type: "string" }, minutes: { type: "integer" } }, required: ["name", "minutes"], additionalProperties: false } },
+            },
+            required: ["name", "kind", "due", "subject", "parts"],
+            additionalProperties: false,
+        }),
+        notes: nullable({
+            type: "object",
+            properties: { title: { type: "string" }, body: { type: "string" } },
+            required: ["title", "body"],
+            additionalProperties: false,
+        }),
+        entries: {
+            type: "array",
+            items: {
+                type: "object",
+                properties: {
+                    kind: { type: "string", enum: ["task", "event"] },
+                    name: { type: "string" },
+                    date: nullable({ type: "string" }),
+                    time: nullable({ type: "string" }),
+                    endTime: nullable({ type: "string" }),
+                    durationMinutes: nullable({ type: "integer" }),
+                },
+                required: ["kind", "name", "date", "time", "endTime", "durationMinutes"],
+                additionalProperties: false,
+            },
+        },
+    },
+    required: ["plan", "notes", "entries"],
+    additionalProperties: false,
+};
+
+const SCAN_SYSTEM = `You read a student's study material (lecture notes, a script, a syllabus, an exam plan, a worksheet, a timetable, a photo of a board or a page) and turn it into what they ask for. Write in the language of the material.
+- plan: a study goal: its name, kind (exam, assignment, presentation, other), the due date when the material states one (YYYY-MM-DD, resolved against today), the subject, and the topics to learn as parts in a sensible learning order, each with realistic minutes for a student to learn it (15 to 600). Only when asked for, else null.
+- notes: study notes with a short title and a body in this line format, one item per line: "# " heading, "## " subheading, "- " bullet, "- [ ] " a checklist item of what to learn or do, "1. " numbered, "> " quote; **bold** for key terms. Summarise and structure, don't copy whole paragraphs. Only when asked for, else null.
+- entries: dated things in the material (exams, deadlines, appointments, lessons) as tasks or events: an event has a time or a time span, a task is something to hand in or do by a day. Dates YYYY-MM-DD resolved against today, times HH:MM. Only when asked for, else [].
+Never invent dates, times or topics the material doesn't contain.`;
+
+const base64Bytes = (data) => Math.floor((data.length * 3) / 4) - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+const cleanBase64 = (value) => (typeof value === "string" && /^[A-Za-z0-9+/]+={0,2}$/.test(value) ? value : null);
+
+// the picture's real type from its first bytes (what the client says isn't trusted)
+function imageType(data) {
+    const head = Buffer.from(data.slice(0, 24), "base64");
+    if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return "image/jpeg";
+    if (head.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+    if (head.slice(0, 4).toString("latin1") === "RIFF" && head.slice(8, 12).toString("latin1") === "WEBP") return "image/webp";
+    return null;
+}
+
+// a rough page count (page objects); 0 when the file doesn't say
+const pdfPages = (bytes) => (bytes.toString("latin1").match(/\/Type\s*\/Page(?![s\w])/g) || []).length;
+
+// the part of the request to read: content blocks for Claude, or { error: [status, code, field] }
+async function scanContent(pool, userId, source) {
+    if (!source || typeof source !== "object") return { error: [400, "INVALID_INPUT", "source"] };
+    if (source.kind === "text") {
+        const text = typeof source.text === "string" ? source.text.trim() : "";
+        if (!text || text.length > SCAN_TEXT_MAX) return { error: [400, "INVALID_INPUT", "text"] };
+        return { blocks: [{ type: "text", text: `The material:\n${text}` }] };
+    }
+    if (source.kind === "note") {
+        const id = Number(source.noteId);
+        if (!Number.isInteger(id) || id < 1) return { error: [400, "INVALID_INPUT", "noteId"] };
+        const { rows } = await pool.query("SELECT title, body FROM notebook_notes WHERE id = $1 AND user_id = $2 AND trashed_at IS NULL", [id, userId]);
+        if (!rows[0]) return { error: [404, "NOT_FOUND", "noteId"] };
+        const text = `${rows[0].title ?? ""}\n${rows[0].body ?? ""}`.trim();
+        if (!text) return { error: [400, "INVALID_INPUT", "noteId"] };
+        return { blocks: [{ type: "text", text: `The material (a note):\n${text.slice(0, SCAN_TEXT_MAX)}` }] };
+    }
+    if (source.kind === "pdf") {
+        const data = cleanBase64(source.data);
+        if (!data || base64Bytes(data) > SCAN_PDF_MAX_BYTES) return { error: [400, "INVALID_INPUT", "data"] };
+        const bytes = Buffer.from(data, "base64");
+        if (bytes.slice(0, 5).toString("latin1") !== "%PDF-") return { error: [400, "INVALID_INPUT", "data"] };
+        if (pdfPages(bytes) > SCAN_PDF_MAX_PAGES) return { error: [400, "SCAN_TOO_LONG", "data"] };
+        return { blocks: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data } }] };
+    }
+    if (source.kind === "images") {
+        const images = Array.isArray(source.images) ? source.images : [];
+        if (images.length === 0 || images.length > SCAN_IMAGES_MAX) return { error: [400, "INVALID_INPUT", "images"] };
+        const blocks = [];
+        for (const image of images) {
+            const data = cleanBase64(image?.data);
+            const media = data && base64Bytes(data) <= SCAN_IMAGE_MAX_BYTES ? imageType(data) : null;
+            if (!media) return { error: [400, "INVALID_INPUT", "images"] };
+            blocks.push({ type: "image", source: { type: "base64", media_type: media, data } });
+        }
+        return { blocks };
+    }
+    return { error: [400, "INVALID_INPUT", "source"] };
+}
+
+const cleanText = (value, max) => (typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, max) : "");
+
+// Claude's answer as something the app can show and create: only what was asked for, checked
+function cleanScan(raw, wants) {
+    let plan = null;
+    if (wants.includes("plan") && raw?.plan && typeof raw.plan === "object") {
+        const parts = (Array.isArray(raw.plan.parts) ? raw.plan.parts : [])
+            .map(part => ({ name: cleanText(part?.name, 200), minutes: Number.isInteger(part?.minutes) ? Math.min(600, Math.max(15, part.minutes)) : 60 }))
+            .filter(part => part.name)
+            .slice(0, SCAN_PARTS_MAX);
+        const name = cleanText(raw.plan.name, 200);
+        if (name && parts.length) {
+            plan = {
+                name,
+                kind: GOAL_KINDS.includes(raw.plan.kind) ? raw.plan.kind : "other",
+                due: validDate(raw.plan.due),
+                subject: cleanText(raw.plan.subject, 60) || null,
+                parts,
+            };
+        }
+    }
+    let notes = null;
+    if (wants.includes("notes") && raw?.notes && typeof raw.notes === "object") {
+        const body = (typeof raw.notes.body === "string" ? raw.notes.body : "").replace(/\r\n?/g, "\n").trim().slice(0, 20000);
+        if (body) notes = { title: cleanText(raw.notes.title, 120) || body.split("\n")[0].replace(/^#+\s*/, "").slice(0, 120), body };
+    }
+    const entries = wants.includes("entries") && Array.isArray(raw?.entries)
+        ? raw.entries.slice(0, SCAN_ENTRIES_MAX)
+            .map(entry => cleanEntry({ ...entry, kind: entry?.kind === "event" ? "event" : "task", remindersMinutesBefore: [], color: null, eventType: null, priority: null }, { types: [], text: "" }))
+            .filter(entry => entry.name)
+            // an event needs a day
+            .map(entry => (entry.kind === "event" && !entry.due ? { ...entry, kind: "task" } : entry))
+        : [];
+    return { plan, notes, entries };
+}
+
 module.exports = function aiRouter({ pool }) {
     const router = express.Router();
     // days older than a week aren't needed any more
@@ -133,7 +284,41 @@ module.exports = function aiRouter({ pool }) {
         });
     });
 
+
+    //   POST /api/ai/scan { wants: ['plan'|'notes'|'entries'], source } → { result: { plan, notes, entries }, quota }
+    //   source: { kind: 'pdf', data (base64), name } | { kind: 'images', images: [{ data }] } (≤ 5)
+    //         | { kind: 'note', noteId } (one of mine) | { kind: 'text', text }
+    // Uses the day's scan (given back when it fails). Nothing of it is stored here: the app shows the
+    // result and creates what the person keeps through the usual routes.
+    router.post("/scan", async (req, res) => {
+        const wants = Array.isArray(req.body?.wants) ? [...new Set(req.body.wants)] : [];
+        if (wants.length === 0 || wants.some(want => !SCAN_WANTS.includes(want))) {
+            return res.status(400).json({ error: "Say what to make", code: "INVALID_INPUT", field: "wants" });
+        }
+        const content = await scanContent(pool, req.user.userId, req.body?.source);
+        if (content.error) {
+            const [status, code, field] = content.error;
+            return res.status(status).json({ error: "This can't be scanned", code, field });
+        }
+        const { rows: [me] } = await pool.query(
+            `SELECT to_char(now() AT TIME ZONE COALESCE(timezone, 'Europe/Berlin'), 'YYYY-MM-DD') AS today FROM users WHERE id = $1`, [req.user.userId]);
+        await withQuota(req, res, "scan", async () => {
+            const raw = await ask("scan", {
+                system: SCAN_SYSTEM,
+                content: [
+                    ...content.blocks,
+                    { type: "text", text: `Today: ${me.today}.\nMake: ${wants.join(", ")}.` },
+                ],
+                schema: SCAN_SCHEMA,
+                maxTokens: 8000,
+                timeoutMs: 90000,
+            });
+            return { result: cleanScan(raw, wants) };
+        });
+    });
+
     return router;
 };
 
 module.exports.cleanEntry = cleanEntry;
+module.exports.cleanScan = cleanScan;
