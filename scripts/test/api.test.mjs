@@ -5009,7 +5009,7 @@ describe("AI help: daily limits and reading a quick-entry line", () => {
         const ana = await member("quotaana");
         const r = await call("GET", "/api/ai/quota", null, ana.token);
         assert.equal(r.status, 200);
-        assert.deepEqual({ scan: r.data.scan, aiLine: r.data.aiLine }, { scan: { used: 0, max: 1 }, aiLine: { used: 0, max: 5 } });
+        assert.deepEqual({ available: r.data.available, scan: r.data.scan, aiLine: r.data.aiLine }, { available: true, scan: { used: 0, max: 1 }, aiLine: { used: 0, max: 5 } });
         assert.ok(Date.parse(r.data.resetsAt) > Date.now());
     });
 

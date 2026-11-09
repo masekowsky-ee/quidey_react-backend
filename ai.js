@@ -1,7 +1,7 @@
 // The AI features (later part of Quidey Pro, for now with daily allowances, utils/quota.js).
 // Mounted at /api/ai, behind authenticateToken + requirePro.
 //
-//   GET  /api/ai/quota       → { scan: { used, max }, aiLine: { used, max }, resetsAt }
+//   GET  /api/ai/quota       → { available, scan: { used, max }, aiLine: { used, max }, resetsAt }
 //   POST /api/ai/parse-entry { text } → { entry, quota }: a quick-entry line the app's own rules
 //        didn't understand, read by Claude (utils/ai.js). Uses one "aiLine" of the day (given back
 //        when the AI fails). entry = { kind, name, due, time, durationMinutes, color, eventTypeId,
@@ -10,7 +10,7 @@
 
 const express = require("express");
 const quota = require("./utils/quota");
-const { ask, AiError, aiErrorResponse } = require("./utils/ai");
+const { ask, available, AiError, aiErrorResponse } = require("./utils/ai");
 
 const TASK_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
 const LINE_MAX = 500;
@@ -104,8 +104,9 @@ module.exports = function aiRouter({ pool }) {
         }
     }
 
+    // available: false when the AI isn't set up here (no ANTHROPIC_API_KEY): the app hides its buttons
     router.get("/quota", async (req, res) => {
-        res.json(await quota.status(pool, req.user.userId));
+        res.json({ available: available(), ...await quota.status(pool, req.user.userId) });
     });
 
     router.post("/parse-entry", async (req, res) => {
