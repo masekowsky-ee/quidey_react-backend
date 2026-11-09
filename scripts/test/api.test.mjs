@@ -15,6 +15,7 @@ import dotenv from "dotenv";
 import { io } from "socket.io-client";
 import { generateKeyPairSync } from "node:crypto";
 import jwt from "jsonwebtoken";
+import { startFakeUntis } from "./fakeUntis.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 dotenv.config({ path: join(ROOT, ".env"), quiet: true });
@@ -29,6 +30,8 @@ const googleToken = (claims) => jwt.sign(
     GOOGLE_KEY.privateKey.export({ type: "pkcs8", format: "pem" }),
     { algorithm: "RS256", keyid: GOOGLE_KID, expiresIn: "5m" }
 );
+// WebUntis, played by a local fake (fakeUntis.mjs); the server reaches it through UNTIS_TEST_BASE
+const fakeUntis = await startFakeUntis();
 const PW = "Sup3r-secret-pass!";
 // what the fake AI answers per job (utils/ai.js): a line read by the AI, a scanned document
 const AI_FAKE = {
@@ -132,6 +135,7 @@ before(async () => {
             GOOGLE_CLIENT_IDS: GOOGLE_CLIENT,
             // the AI answers from fixed replies (utils/ai.js), never the real API; "AI_FAIL" in the input fails
             ANTHROPIC_API_KEY: "", AI_FAKE: JSON.stringify(AI_FAKE),
+            UNTIS_TEST_BASE: fakeUntis.base, UNTIS_SECRET: "a-test-secret-for-untis-that-is-long-enough",
             GOOGLE_TEST_CERTS: JSON.stringify({ [GOOGLE_KID]: GOOGLE_KEY.publicKey.export({ type: "spki", format: "pem" }) }),
         },
     });
@@ -143,6 +147,7 @@ before(async () => {
 
 after(async () => {
     server?.kill();
+    await fakeUntis.close();
     await db?.end();
     const admin = new pg.Client(conn("postgres"));
     await admin.connect();
@@ -5131,5 +5136,85 @@ describe("AI scan: a document, photos or a note into a plan, notes and entries",
         const r = await call("POST", "/api/ai/scan", { wants: ["notes"], source: { kind: "text", text: "AI_FAIL" } }, nia.token);
         assert.equal(r.status, 502);
         assert.equal((await call("GET", "/api/ai/quota", null, nia.token)).data.scan.used, 0);
+    });
+});
+
+describe("Untis: the timetable in the calendar", () => {
+    const pad = (n) => String(n).padStart(2, "0");
+    const iso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const today = iso(new Date());
+    const LOGIN = { mode: "login", server: "neilo.webuntis.com", school: "gym-muster", schoolLabel: "Gymnasium Musterstadt", username: "lena", password: "richtig" };
+
+    test("not connected at first; schools are found, only on webuntis.com", async () => {
+        const ole = await member("untisole");
+        const status = await call("GET", "/api/untis", null, ole.token);
+        assert.equal(status.status, 200);
+        assert.deepEqual(status.data, { available: true, connected: false });
+        assert.equal((await call("GET", "/api/untis/schools?q=ab", null, ole.token)).status, 400);
+        const found = await call("GET", "/api/untis/schools?q=Muster", null, ole.token);
+        assert.deepEqual(found.data, [{ server: "neilo.webuntis.com", school: "gym-muster", label: "Gymnasium Musterstadt", address: "Musterstadt" }]);
+    });
+
+    test("a wrong password stores nothing", async () => {
+        const pia = await member("untispia");
+        const r = await call("PUT", "/api/untis", { ...LOGIN, password: "falsch" }, pia.token);
+        assert.equal(r.status, 400);
+        assert.equal(r.data.code, "UNTIS_LOGIN_FAILED");
+        assert.equal((await sql("SELECT count(*)::int AS n FROM untis_accounts WHERE user_id = $1", [pia.id]))[0].n, 0);
+    });
+
+    test("signed in: the lessons are there (a double lesson as one, a cancelled one marked), the password only encrypted", async () => {
+        const quinn = await member("untisquinn");
+        const r = await call("PUT", "/api/untis", LOGIN, quinn.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        assert.equal(r.data.connected, true);
+        assert.equal(r.data.mode, "login");
+        assert.equal(r.data.schoolLabel, "Gymnasium Musterstadt");
+        assert.equal(r.data.username, "lena");
+        assert.ok(r.data.lastSyncAt);
+        const [row] = await sql("SELECT secret FROM untis_accounts WHERE user_id = $1", [quinn.id]);
+        assert.ok(!row.secret.includes("richtig"));
+        const lessons = await call("GET", `/api/untis/lessons?from=${today}&to=${today}`, null, quinn.token);
+        assert.equal(lessons.status, 200);
+        assert.deepEqual(lessons.data.lessons.map(l => [l.day, l.start, l.end, l.subject, l.room, l.status]), [
+            [today, "08:00", "09:35", "M", "R12", "normal"],
+            [today, "09:55", "10:40", "E", "R3", "cancelled"],
+        ]);
+        assert.equal(lessons.data.lessons[0].subjectLong, "Mathematik");
+        // the session was ended again
+        assert.ok(fakeUntis.calls.some(c => c.method === "logout"));
+        // nobody else sees them
+        const rae = await member("untisrae");
+        assert.deepEqual((await call("GET", `/api/untis/lessons?from=${today}&to=${today}`, null, rae.token)).data.lessons, []);
+    });
+
+    test("the iCal link: only https on webuntis.com", async () => {
+        const sam = await member("untissam");
+        for (const url of ["http://neilo.webuntis.com/WebUntis/Ical.do?key=abc", "https://evil.example.com/x.ics", "https://127.0.0.1/x.ics"]) {
+            assert.equal((await call("PUT", "/api/untis", { mode: "ical", url }, sam.token)).status, 400, url);
+        }
+        const wrong = await call("PUT", "/api/untis", { mode: "ical", url: "https://neilo.webuntis.com/WebUntis/Ical.do?key=nope" }, sam.token);
+        assert.equal(wrong.status, 400);
+        const r = await call("PUT", "/api/untis", { mode: "ical", url: "https://neilo.webuntis.com/WebUntis/Ical.do?key=abc" }, sam.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        assert.equal(r.data.mode, "ical");
+        const lessons = await call("GET", `/api/untis/lessons?from=${today}&to=${today}`, null, sam.token);
+        assert.deepEqual(lessons.data.lessons.map(l => [l.subject, l.start, l.end, l.room]), [["Biologie", "10:00", "10:45", "Lab"]]);
+    });
+
+    test("disconnecting deletes the login and every lesson", async () => {
+        const tom = await member("untistom");
+        await call("PUT", "/api/untis", LOGIN, tom.token);
+        assert.equal((await call("DELETE", "/api/untis", null, tom.token)).status, 204);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM untis_accounts WHERE user_id = $1", [tom.id]))[0].n, 0);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM untis_lessons WHERE user_id = $1", [tom.id]))[0].n, 0);
+        assert.deepEqual((await call("GET", "/api/untis", null, tom.token)).data, { available: true, connected: false });
+    });
+
+    test("only with app access, and a long range is refused", async () => {
+        const uma = await member("untisuma", { pro: false });
+        assert.equal((await call("GET", "/api/untis", null, uma.token)).status, 403);
+        const vic = await member("untisvic");
+        assert.equal((await call("GET", "/api/untis/lessons?from=2026-01-01&to=2026-12-31", null, vic.token)).status, 400);
     });
 });

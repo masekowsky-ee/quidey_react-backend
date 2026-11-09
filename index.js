@@ -245,6 +245,7 @@ app.use("/api/notebook", authenticateToken);
 // usage statistics: every signed-in account, also while waiting for beta access (not behind requirePro)
 app.use("/api/usage", authenticateToken);
 app.use("/api/ai", authenticateToken);
+app.use("/api/untis", authenticateToken);
 
 // Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
 // Checked against the account on every request (not stored in the token; see loadAccount), so
@@ -262,7 +263,7 @@ function requirePro(req, res, next) {
 // the beacon (/api/usage) it allows
 const OPEN_WITHOUT_ACCESS = new Set(["/api/profile/usage-consent"]);
 app.use(
-    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families", "/api/push", "/api/focus", "/api/routines", "/api/notebook", "/api/avatars", "/api/ai"],
+    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families", "/api/push", "/api/focus", "/api/routines", "/api/notebook", "/api/avatars", "/api/ai", "/api/untis"],
     (req, res, next) => (OPEN_WITHOUT_ACCESS.has((req.baseUrl + req.path).replace(/\/+$/, "")) ? next() : requirePro(req, res, next))
 );
 
@@ -299,6 +300,8 @@ app.use("/api/notebook", express.json({ limit: "4mb" }));
 // limit; a scan's document is bigger than other requests, so only it gets a larger body limit here
 app.use("/api/ai/scan", express.json({ limit: "15mb" }));
 app.use("/api/ai", require("./ai")({ pool }));
+// the timetable from WebUntis (untis.js)
+app.use("/api/untis", require("./untis")({ pool }));
 
 // ---------- input checks ----------
 // Ids from the URL: a positive integer, or null (answered with 404 instead of a database error)
