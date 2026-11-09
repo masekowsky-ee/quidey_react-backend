@@ -68,7 +68,7 @@ CREATE TABLE public.admin_actions (
     target_username text NOT NULL,
     action text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT admin_actions_action_check CHECK ((action = ANY (ARRAY['grant_pro'::text, 'revoke_pro'::text, 'grant_admin'::text, 'revoke_admin'::text, 'grant_tester'::text, 'revoke_tester'::text, 'approve_request'::text, 'decline_request'::text, 'reset_request'::text, 'remove_avatar'::text])))
+    CONSTRAINT admin_actions_action_check CHECK ((action = ANY (ARRAY['grant_pro'::text, 'revoke_pro'::text, 'grant_admin'::text, 'revoke_admin'::text, 'grant_tester'::text, 'revoke_tester'::text, 'approve_request'::text, 'decline_request'::text, 'reset_request'::text, 'remove_avatar'::text, 'export_users'::text])))
 );
 
 --
@@ -2312,6 +2312,309 @@ CREATE INDEX IF NOT EXISTS subscriptions_user_idx ON public.subscriptions USING 
 ALTER TABLE public.users ADD COLUMN IF NOT EXISTS pro_until timestamp with time zone;
 ALTER TABLE public.users ADD COLUMN IF NOT EXISTS stripe_customer_id text;
 CREATE UNIQUE INDEX IF NOT EXISTS users_stripe_customer_key ON public.users USING btree (stripe_customer_id);
+
+--
+-- 036: the notes area and collections (see migrations/036_notes_collections.sql)
+--
+
+CREATE TABLE IF NOT EXISTS public.note_folders (
+    id serial PRIMARY KEY,
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 40),
+    emoji text,
+    created_at timestamp with time zone NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS note_folders_user_name ON public.note_folders (user_id, lower(name));
+
+ALTER TABLE public.notebook_notes ADD COLUMN IF NOT EXISTS folder_id integer REFERENCES public.note_folders(id) ON DELETE SET NULL;
+ALTER TABLE public.notebook_notes ADD COLUMN IF NOT EXISTS tags text[] NOT NULL DEFAULT '{}'::text[];
+ALTER TABLE public.notebook_notes ADD COLUMN IF NOT EXISTS color text;
+ALTER TABLE public.notebook_notes ADD COLUMN IF NOT EXISTS archived boolean NOT NULL DEFAULT false;
+ALTER TABLE public.notebook_notes ADD COLUMN IF NOT EXISTS trashed_at timestamp with time zone;
+CREATE INDEX IF NOT EXISTS notebook_notes_trashed ON public.notebook_notes (trashed_at) WHERE trashed_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.collections (
+    id serial PRIMARY KEY,
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 60),
+    emoji text,
+    color text,
+    description text NOT NULL DEFAULT '',
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS collections_user ON public.collections (user_id);
+
+CREATE TABLE IF NOT EXISTS public.collection_items (
+    id serial PRIMARY KEY,
+    collection_id integer NOT NULL REFERENCES public.collections(id) ON DELETE CASCADE,
+    task_id integer REFERENCES public.tasks(id) ON DELETE CASCADE,
+    note_id integer REFERENCES public.notebook_notes(id) ON DELETE CASCADE,
+    added_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT collection_items_one_thing CHECK ((task_id IS NULL) <> (note_id IS NULL)),
+    CONSTRAINT collection_items_task_once UNIQUE (collection_id, task_id),
+    CONSTRAINT collection_items_note_once UNIQUE (collection_id, note_id)
+);
+CREATE INDEX IF NOT EXISTS collection_items_task ON public.collection_items (task_id) WHERE task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS collection_items_note ON public.collection_items (note_id) WHERE note_id IS NOT NULL;
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS groups_imported_at timestamp with time zone;
+
+--
+-- 037: notes pinned to a family's or shared session's board (see migrations/037_board_notes.sql)
+--
+
+CREATE TABLE IF NOT EXISTS public.board_notes (
+    id serial PRIMARY KEY,
+    note_id integer NOT NULL REFERENCES public.notebook_notes(id) ON DELETE CASCADE,
+    family_id integer REFERENCES public.families(id) ON DELETE CASCADE,
+    session_id integer REFERENCES public.shared_sessions(id) ON DELETE CASCADE,
+    pinned_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT board_notes_one_board CHECK ((family_id IS NULL) <> (session_id IS NULL)),
+    CONSTRAINT board_notes_family_once UNIQUE (family_id, note_id),
+    CONSTRAINT board_notes_session_once UNIQUE (session_id, note_id)
+);
+CREATE INDEX IF NOT EXISTS board_notes_note ON public.board_notes (note_id);
+
+--
+-- 038: the arcade's scores (see migrations/038_arcade_scores.sql)
+--
+
+CREATE TABLE IF NOT EXISTS public.arcade_scores (
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    game text NOT NULL CHECK (char_length(game) BETWEEN 1 AND 20),
+    level text NOT NULL CHECK (level IN ('easy', 'normal', 'hard')),
+    best integer NOT NULL DEFAULT 0 CHECK (best >= 0),
+    ranked_best integer CHECK (ranked_best >= 0),
+    ranked_at timestamp with time zone,
+    plays integer NOT NULL DEFAULT 0,
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, game, level)
+);
+CREATE INDEX IF NOT EXISTS arcade_scores_board ON public.arcade_scores (game, level, ranked_best DESC, ranked_at)
+    WHERE ranked_best IS NOT NULL;
+
+--
+-- 039: reminders (see migrations/039_reminders.sql)
+--
+
+CREATE TABLE IF NOT EXISTS public.reminders (
+    id serial PRIMARY KEY,
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    text text NOT NULL CHECK (char_length(text) BETWEEN 1 AND 200),
+    at timestamp with time zone,
+    days smallint[],
+    at_time time without time zone,
+    snoozed_until timestamp with time zone,
+    done_at timestamp with time zone,
+    fired_for timestamp with time zone,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT reminders_once_or_weekly CHECK (
+        (at IS NOT NULL AND days IS NULL AND at_time IS NULL)
+        OR (at IS NULL AND at_time IS NOT NULL AND cardinality(days) BETWEEN 1 AND 7)
+    )
+);
+CREATE INDEX IF NOT EXISTS reminders_user ON public.reminders (user_id);
+CREATE INDEX IF NOT EXISTS reminders_open ON public.reminders (user_id) WHERE done_at IS NULL;
+
+ALTER TABLE public.push_subscriptions ADD COLUMN IF NOT EXISTS alarms boolean NOT NULL DEFAULT false;
+
+--
+-- 040: family events and reminders, done_by, push kind groups (see migrations/040_family_events_groups_push.sql)
+--
+
+ALTER TABLE public.family_tasks ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'task';
+ALTER TABLE public.family_tasks ADD COLUMN IF NOT EXISTS reminders integer[] NOT NULL DEFAULT '{}';
+ALTER TABLE public.family_tasks ADD COLUMN IF NOT EXISTS push_sent_for timestamp with time zone;
+ALTER TABLE public.family_tasks ADD COLUMN IF NOT EXISTS done_by integer REFERENCES public.users(id) ON DELETE SET NULL;
+ALTER TABLE public.family_tasks ADD COLUMN IF NOT EXISTS completed_at timestamp with time zone;
+ALTER TABLE public.family_tasks DROP CONSTRAINT IF EXISTS family_tasks_kind_check;
+ALTER TABLE public.family_tasks ADD CONSTRAINT family_tasks_kind_check CHECK (kind IN ('task', 'event'));
+ALTER TABLE public.family_tasks DROP CONSTRAINT IF EXISTS family_tasks_event_needs_due_check;
+ALTER TABLE public.family_tasks ADD CONSTRAINT family_tasks_event_needs_due_check CHECK (kind <> 'event' OR due IS NOT NULL);
+ALTER TABLE public.family_tasks DROP CONSTRAINT IF EXISTS family_tasks_reminders_check;
+ALTER TABLE public.family_tasks ADD CONSTRAINT family_tasks_reminders_check
+    CHECK (cardinality(reminders) <= 5 AND array_position(reminders, NULL) IS NULL
+        AND 0 <= ALL (reminders) AND 10080 >= ALL (reminders));
+
+ALTER TABLE public.shared_session_tasks ADD COLUMN IF NOT EXISTS done_by integer REFERENCES public.users(id) ON DELETE SET NULL;
+ALTER TABLE public.shared_session_tasks ADD COLUMN IF NOT EXISTS completed_at timestamp with time zone;
+
+ALTER TABLE public.push_subscriptions ADD COLUMN IF NOT EXISTS groups boolean NOT NULL DEFAULT true;
+
+ALTER TABLE public.notifications DROP CONSTRAINT IF EXISTS notifications_kind_check;
+ALTER TABLE public.notifications ADD CONSTRAINT notifications_kind_check
+    CHECK (kind IN ('broadcast', 'system', 'task_assigned', 'entries_added'));
+
+CREATE INDEX IF NOT EXISTS family_tasks_open_events ON public.family_tasks (due) WHERE kind = 'event' AND NOT done;
+CREATE INDEX IF NOT EXISTS family_tasks_done_by ON public.family_tasks (done_by, completed_at);
+CREATE INDEX IF NOT EXISTS shared_session_tasks_done_by ON public.shared_session_tasks (done_by, completed_at);
+
+--
+-- 041: study goals (see migrations/041_study_goals.sql)
+--
+
+CREATE TABLE IF NOT EXISTS public.subjects (
+    id serial PRIMARY KEY,
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 60),
+    emoji text,
+    color text,
+    archived boolean NOT NULL DEFAULT false,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT subjects_color_check
+        CHECK (color IS NULL OR color IN ('red', 'orange', 'yellow', 'green', 'teal', 'blue', 'violet', 'pink'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS subjects_user_name ON public.subjects (user_id, lower(name));
+
+CREATE TABLE IF NOT EXISTS public.goals (
+    id serial PRIMARY KEY,
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    subject_id integer NOT NULL REFERENCES public.subjects(id) ON DELETE CASCADE,
+    kind text NOT NULL,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 200),
+    due date NOT NULL,
+    due_time time without time zone,
+    plan_mode text NOT NULL DEFAULT 'slots',
+    status text NOT NULL DEFAULT 'active',
+    behind_notified_minutes integer NOT NULL DEFAULT 0,
+    behind_notified_on date,
+    freed_minutes integer NOT NULL DEFAULT 0,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT goals_kind_check CHECK (kind IN ('exam', 'assignment', 'presentation', 'other')),
+    CONSTRAINT goals_plan_mode_check CHECK (plan_mode IN ('slots', 'days')),
+    CONSTRAINT goals_status_check CHECK (status IN ('active', 'done', 'archived'))
+);
+CREATE INDEX IF NOT EXISTS goals_user_status ON public.goals (user_id, status);
+
+CREATE TABLE IF NOT EXISTS public.goal_parts (
+    id serial PRIMARY KEY,
+    goal_id integer NOT NULL REFERENCES public.goals(id) ON DELETE CASCADE,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 200),
+    position integer NOT NULL DEFAULT 0,
+    estimate_minutes integer NOT NULL,
+    estimate_source text NOT NULL DEFAULT 'default',
+    role text NOT NULL DEFAULT 'part',
+    done_at timestamp with time zone,
+    actual_minutes integer,
+    CONSTRAINT goal_parts_estimate_check CHECK (estimate_minutes BETWEEN 15 AND 1200),
+    CONSTRAINT goal_parts_source_check CHECK (estimate_source IN ('history', 'pages', 'ai', 'default', 'manual')),
+    CONSTRAINT goal_parts_role_check CHECK (role IN ('part', 'review'))
+);
+CREATE INDEX IF NOT EXISTS goal_parts_goal ON public.goal_parts (goal_id);
+
+CREATE TABLE IF NOT EXISTS public.study_windows (
+    id serial PRIMARY KEY,
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    weekday smallint NOT NULL,
+    start_time time without time zone NOT NULL,
+    end_time time without time zone NOT NULL,
+    CONSTRAINT study_windows_weekday_check CHECK (weekday BETWEEN 1 AND 7),
+    CONSTRAINT study_windows_time_check CHECK (start_time < end_time)
+);
+CREATE INDEX IF NOT EXISTS study_windows_user ON public.study_windows (user_id);
+
+ALTER TABLE public.tasks ADD COLUMN IF NOT EXISTS goal_part_id integer REFERENCES public.goal_parts(id) ON DELETE SET NULL;
+ALTER TABLE public.tasks ADD COLUMN IF NOT EXISTS plan_pinned boolean NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS tasks_goal_part ON public.tasks (goal_part_id) WHERE goal_part_id IS NOT NULL;
+
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS study_session_minutes integer NOT NULL DEFAULT 45;
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS study_daily_max_minutes integer NOT NULL DEFAULT 180;
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS study_ai_auto boolean NOT NULL DEFAULT false;
+ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_study_session_minutes_check;
+ALTER TABLE public.users ADD CONSTRAINT users_study_session_minutes_check CHECK (study_session_minutes BETWEEN 15 AND 180);
+ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_study_daily_max_minutes_check;
+ALTER TABLE public.users ADD CONSTRAINT users_study_daily_max_minutes_check CHECK (study_daily_max_minutes BETWEEN 15 AND 720);
+
+ALTER TABLE public.push_subscriptions ADD COLUMN IF NOT EXISTS study boolean NOT NULL DEFAULT true;
+
+-- 042: own colours and a shape per study goal.
+-- A colour is still one of the eight names, or now a colour of one's own as "#rrggbb" (picked on
+-- the colour wheel in the app). Applies to everything the app lets one colour with the same picker:
+-- tasks, groups, event types, the tasks of shared sessions and families, and study subjects.
+-- Study goals get an optional shape (shown in the subject's colour), so the goals of one subject
+-- can be told apart at a glance.
+
+DO $$
+DECLARE
+    t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['tasks', 'groups', 'event_types', 'shared_session_tasks', 'family_tasks', 'subjects'] LOOP
+        EXECUTE format('ALTER TABLE public.%I DROP CONSTRAINT IF EXISTS %I', t, t || '_color_check');
+        EXECUTE format(
+            'ALTER TABLE public.%I ADD CONSTRAINT %I CHECK (color IS NULL OR color IN '
+            '(''red'', ''orange'', ''yellow'', ''green'', ''teal'', ''blue'', ''violet'', ''pink'') '
+            'OR color ~ ''^#[0-9a-f]{6}$'')',
+            t, t || '_color_check');
+    END LOOP;
+END $$;
+
+ALTER TABLE public.goals ADD COLUMN IF NOT EXISTS shape text;
+ALTER TABLE public.goals DROP CONSTRAINT IF EXISTS goals_shape_check;
+ALTER TABLE public.goals ADD CONSTRAINT goals_shape_check
+    CHECK (shape IS NULL OR shape IN ('circle', 'square', 'triangle', 'diamond', 'star', 'hexagon', 'heart'));
+
+--
+-- 043: a task's notes live in the notebook (see migrations/043_task_notes_into_notebook.sql):
+-- the rows of `notes` moved into notebook_notes (task_id); `notes` stays, empty.
+--
+
+INSERT INTO public.notebook_notes (user_id, task_id, title, body, created_at, updated_at)
+SELECT tasks.user_id, notes.task_id, '', btrim(notes.content),
+       COALESCE(notes.created_at, now()), COALESCE(notes.created_at, now())
+FROM public.notes
+JOIN public.tasks ON tasks.id = notes.task_id
+WHERE tasks.user_id IS NOT NULL AND btrim(COALESCE(notes.content, '')) <> ''
+ORDER BY notes.id;
+
+DELETE FROM public.notes;
+
+--
+-- 044: usage statistics, only with consent (see migrations/044_usage_statistics.sql)
+--
+
+ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS usage_consent text CHECK (usage_consent IN ('granted', 'denied')),  -- NULL = not asked yet
+  ADD COLUMN IF NOT EXISTS usage_consent_at timestamp with time zone,
+  ADD COLUMN IF NOT EXISTS usage_consent_version smallint;
+
+-- the only analytics data that stays: totals, no user id
+CREATE TABLE IF NOT EXISTS public.usage_hourly (
+  hour        timestamp with time zone NOT NULL,   -- UTC, truncated to the hour
+  local_hour  smallint    NOT NULL CHECK (local_hour BETWEEN 0 AND 23),   -- in the person's timezone
+  weekday     smallint    NOT NULL CHECK (weekday BETWEEN 1 AND 7),       -- ISO, 1 = Monday, local
+  metric      text        NOT NULL CHECK (metric ~ '^[a-z0-9_:]{1,48}$'),
+  platform    text        NOT NULL CHECK (platform IN ('web', 'pwa', 'android')),
+  language    text        NOT NULL CHECK (language IN ('de', 'en')),
+  plan        text        NOT NULL CHECK (plan IN ('free', 'tester', 'pro')),
+  events      integer     NOT NULL DEFAULT 0,
+  people      integer     NOT NULL DEFAULT 0,  -- distinct people in this hour for this row's dimensions
+  value_sum   bigint      NOT NULL DEFAULT 0,  -- e.g. focus seconds, active minutes
+  PRIMARY KEY (hour, local_hour, weekday, metric, platform, language, plan)
+);
+CREATE INDEX IF NOT EXISTS usage_hourly_hour_idx ON public.usage_hourly USING btree (hour);
+
+-- short-lived "already counted" marks so people are distinct; deleted when their period is over
+CREATE TABLE IF NOT EXISTS public.usage_seen (
+  scope     text        NOT NULL CHECK (scope IN ('hour', 'day', 'week')),
+  period    timestamp with time zone NOT NULL,   -- start of the hour / local day / ISO week
+  metric    text        NOT NULL,   -- '*' = "active at all"
+  user_id   integer     NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  PRIMARY KEY (scope, period, metric, user_id)
+);
+CREATE INDEX IF NOT EXISTS usage_seen_user_idx ON public.usage_seen USING btree (user_id);
+
+-- distinct people per day and week (across all hours), also totals only
+CREATE TABLE IF NOT EXISTS public.usage_people (
+  scope    text        NOT NULL CHECK (scope IN ('day', 'week')),
+  period   date        NOT NULL,
+  metric   text        NOT NULL,
+  platform text        NOT NULL,
+  language text        NOT NULL,
+  plan     text        NOT NULL,
+  people   integer     NOT NULL DEFAULT 0,
+  PRIMARY KEY (scope, period, metric, platform, language, plan)
+);
 
 --
 -- PostgreSQL database dump complete

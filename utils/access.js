@@ -10,6 +10,19 @@
 // ahead, kept by utils/billing.js). Pro never sees what is in test: that is for testers only.
 const ACCESS_MODE = process.env.ACCESS_MODE === "open" ? "open" : "beta";
 
+// PRO_BILLING (env): 'on' sells Quidey Pro (Stripe / Google Play, utils/billing.js); anything else
+// (the default) keeps it switched off: the routes that show or sell it answer 404 BILLING_OFF and
+// the free plan has no limits (there would be nothing to lift them with). Gifted Pro (is_pro) still
+// counts. Webhooks and the cancel button stay on, so a subscription that exists is never stuck.
+// The frontend has its own switch for what it shows (VITE_PRO=on); turn both on together.
+const PRO_BILLING = process.env.PRO_BILLING === "on";
+
+// The routes that sell Pro, while PRO_BILLING is off
+const requireProBilling = (req, res, next) => {
+    if (PRO_BILLING) return next();
+    res.status(404).json({ error: "Quidey Pro isn't available yet", code: "BILLING_OFF" });
+};
+
 const hasPro = (account) => Boolean(account.is_pro || (account.pro_until && new Date(account.pro_until) > new Date()));
 
 const hasAppAccess = (account) => ACCESS_MODE === "open" || Boolean(hasPro(account) || account.is_tester || account.is_admin);
@@ -27,4 +40,4 @@ const APP_ACCESS_SQL = ACCESS_MODE === "open" ? "true" : `(${PRO_SQL} OR users.i
 // The same as hasTesterAccess, for SQL on the users table
 const TESTER_ACCESS_SQL = "(users.is_tester OR users.is_admin)";
 
-module.exports = { ACCESS_MODE, hasPro, hasAppAccess, hasTesterAccess, hasNoLimits, PRO_SQL, APP_ACCESS_SQL, TESTER_ACCESS_SQL };
+module.exports = { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasAppAccess, hasTesterAccess, hasNoLimits, PRO_SQL, APP_ACCESS_SQL, TESTER_ACCESS_SQL };

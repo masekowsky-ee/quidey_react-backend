@@ -16,10 +16,13 @@ const { startFocusSchedule } = require("./utils/focus");
 const { PUSH_PUBLIC_KEY, PUSH_FCM_ENABLED, PUSH_KINDS, PUSH_MAX_DEVICES, PUSH_TEXTS, pushLater, deliver, startPushSchedule } = require("./utils/push");
 const http = require("node:http");
 const realtime = require("./realtime");
-const { ACCESS_MODE, hasPro, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
+const { toNotice, noticeEntryAdded, noticeFamilyAssigned, pushChat } = require("./utils/groupNotices");
+const { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
 const { FREE_LIMITS, FREE_STATS_DAYS, limited, usage, refuseOverLimit } = require("./utils/limits");
 const { FCM_ENDPOINT, isFcmEndpoint } = require("./utils/fcm");
 const progress = require("./utils/progress");
+const { resolveRange, usageReport, usageRaw } = require("./utils/usageReport");
+const { CLIENT_METRICS, cleanPlatform, countUsage, forgetUsageAccount, startUsageCleanup, withdrawUsage } = require("./utils/usage");
 const { PROFILE_COLORS, PROFILE_BANNERS, PROFILE_EMOJIS, AVATAR_FRAMES, PROFILE_TITLES, SHOWCASE_MAX, BADGES } = progress;
 
 const app = express();
@@ -239,6 +242,8 @@ app.use("/api/avatars", authenticateToken);
 app.use("/api/focus", authenticateToken);
 app.use("/api/routines", authenticateToken);
 app.use("/api/notebook", authenticateToken);
+// usage statistics: every signed-in account, also while waiting for beta access (not behind requirePro)
+app.use("/api/usage", authenticateToken);
 
 // Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
 // Checked against the account on every request (not stored in the token; see loadAccount), so
@@ -252,9 +257,12 @@ function requirePro(req, res, next) {
     next();
 }
 
+// The consent to the usage statistics is asked of everybody signed in (the beta screen too), like
+// the beacon (/api/usage) it allows
+const OPEN_WITHOUT_ACCESS = new Set(["/api/profile/usage-consent"]);
 app.use(
     ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families", "/api/push", "/api/focus", "/api/routines", "/api/notebook", "/api/avatars"],
-    requirePro
+    (req, res, next) => (OPEN_WITHOUT_ACCESS.has((req.baseUrl + req.path).replace(/\/+$/, "")) ? next() : requirePro(req, res, next))
 );
 
 // Features not released to everyone yet: only testers (and admins). Every route under
@@ -281,6 +289,9 @@ app.use("/api", rateLimit({
     message: { error: "Too many requests, please slow down", code: "RATE_LIMITED" },
 }));
 
+// Study goals (testers): below the overall limit, behind /api/tester's authenticateToken + requireTester above
+app.use("/api/tester/study", require("./study")({ pool, realtime, loadTask }));
+
 app.use("/api/notebook", express.json({ limit: "4mb" }));
 
 // ---------- input checks ----------
@@ -290,10 +301,13 @@ const idParam = (value) => {
     return Number.isInteger(id) && id > 0 && id <= 2147483647 ? id : null;
 };
 
-// Text: trimmed, null when empty; undefined when it has the wrong type or is longer than max
+// A NUL character: Postgres can't store it in text or jsonb (a database error otherwise)
+const hasNul = (value) => value.includes("\u0000");
+
+// Text: trimmed, null when empty; undefined when it has the wrong type, a NUL or is longer than max
 function cleanText(value, max) {
     if (value === undefined || value === null) return null;
-    if (typeof value !== "string") return undefined;
+    if (typeof value !== "string" || hasNul(value)) return undefined;
     const trimmed = value.trim();
     if (trimmed.length > max) return undefined;
     return trimmed === "" ? null : trimmed;
@@ -389,8 +403,17 @@ function cleanLink(value) {
 
 const TASK_KINDS = ["task", "event"];
 
-// The colours a task can have (the app draws them); null is the default look
+// The colours a task can have (the app draws them); null is the default look. Beside the eight
+// names a colour of one's own, picked on the app's colour wheel: "#rrggbb" (stored lower case).
 const TASK_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
+const HEX_COLOR = /^#[0-9a-f]{6}$/;
+// the colour as it is stored, or undefined when it is none of these
+const cleanColor = (value) => {
+    if (typeof value !== "string") return undefined;
+    if (TASK_COLORS.includes(value)) return value;
+    const hex = value.toLowerCase();
+    return HEX_COLOR.test(hex) ? hex : undefined;
+};
 
 // How far the next one of a repeating task is from the last (Postgres intervals)
 const REPEAT_INTERVALS = { daily: "1 day", weekly: "7 days", monthly: "1 month", yearly: "1 year" };
@@ -414,7 +437,7 @@ const TASK_EXTRAS = {
     repeat: (value) => (value === null || value === "" ? null : Object.hasOwn(REPEAT_INTERVALS, value) ? value : undefined),
     // how many more times it comes back after this one (null = no end)
     repeat_left: (value) => cleanMinutes(value, 0, REPEAT_LEFT_MAX),
-    color: (value) => (value === null || value === "" ? null : TASK_COLORS.includes(value) ? value : undefined),
+    color: (value) => (value === null || value === "" ? null : cleanColor(value)),
     // also remind by mail (only the owner can change it, see PUT /api/tasks/:id)
     reminder_email: (value) => (typeof value === "boolean" ? value : undefined),
     // 'task' (ticked off by hand) or 'event' (done once it is over); only the owner changes it
@@ -424,6 +447,8 @@ const TASK_EXTRAS = {
 };
 // the fields only a task's owner can change (the others' values are ignored)
 const OWNER_ONLY_FIELDS = ["reminder_email", "kind", "event_type_id"];
+// the columns that may change without pinning a planned study session: ticking it off (SQL text[])
+const PIN_IGNORED = "'{done,completed_at,plan_pinned}'::text[]";
 function readTaskExtras(body, fields = TASK_EXTRAS) {
     // an app from before several reminders sends one as reminder_minutes (null: none)
     if (fields.reminders && body?.reminders === undefined && body?.reminder_minutes !== undefined) {
@@ -456,8 +481,11 @@ const SHARED_TASK_FIELDS = {
 };
 
 // A shared session's tasks also can be events: they need a day and are done once they are
-// over (syncSessionEvents). Family calendars stay with SHARED_TASK_FIELDS.
+// over (syncSessionEvents).
 const SESSION_TASK_FIELDS = { ...SHARED_TASK_FIELDS, kind: TASK_EXTRAS.kind };
+// A family's entries too (syncFamilyEvents), and they have reminders, which reach every joined
+// member (kept only while the entry has a day)
+const FAMILY_TASK_FIELDS = { ...SESSION_TASK_FIELDS, reminders: TASK_EXTRAS.reminders };
 
 // Ids of the tasks a user may see and change: their own, and the ones shared with them that
 // they accepted. `param` is the query parameter holding the user id, e.g. "$2".
@@ -468,7 +496,9 @@ const accessibleTaskIds = (param) =>
 // Tasks in the shape the app uses, for the user in $1: the task's columns (due_time as "HH:MM"),
 // group_ids (only that user's own groups), isOwner, owner (who shared it, for a task shared
 // with me), shareId (my share of somebody else's task, to leave it) and
-// sharedWith: [{ shareId, status: 'pending' | 'accepted', user }] (everybody it was sent to).
+// sharedWith: [{ shareId, status: 'pending' | 'accepted', user }] (everybody it was sent to),
+// and for a planned study session (goal_part_id) of the user's own goal: study_info
+// { goalId, goalName, partName, subjectName, subjectEmoji, subjectColor }, else null.
 // Add conditions with "AND ...".
 const TASK_SELECT = `
     SELECT tasks.id, tasks.name, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
@@ -480,6 +510,12 @@ const TASK_SELECT = `
         tasks.kind, tasks.event_type_id, event_types.name AS event_type_name, event_types.color AS event_type_color,
         owner.username AS owner_username, owner.display_name AS owner_display_name,
         my_share.id AS my_share_id,
+        tasks.goal_part_id, tasks.plan_pinned,
+        CASE WHEN study_goal.id IS NULL THEN NULL ELSE json_build_object(
+            'goalId', study_goal.id, 'goalName', study_goal.name, 'partName', study_part.name,
+            'subjectName', study_subject.name, 'subjectEmoji', study_subject.emoji, 'subjectColor', study_subject.color,
+            'goalShape', study_goal.shape
+        ) END AS study_info,
         COALESCE((
             SELECT array_agg(task_groups.group_id ORDER BY task_groups.group_id)
             FROM task_groups
@@ -501,6 +537,9 @@ const TASK_SELECT = `
     LEFT JOIN event_types ON event_types.id = tasks.event_type_id
     LEFT JOIN task_shares AS my_share
         ON my_share.task_id = tasks.id AND my_share.user_id = $1 AND my_share.status = 'accepted'
+    LEFT JOIN goal_parts AS study_part ON study_part.id = tasks.goal_part_id
+    LEFT JOIN goals AS study_goal ON study_goal.id = study_part.goal_id AND study_goal.user_id = $1
+    LEFT JOIN subjects AS study_subject ON study_subject.id = study_goal.subject_id
     WHERE (tasks.user_id = $1 OR my_share.id IS NOT NULL)`;
 
 function toTaskResponse(row, userId) {
@@ -540,6 +579,10 @@ function toTaskResponse(row, userId) {
         owner: isOwner ? null : { id: row.user_id, username: row.owner_username, displayName: row.owner_display_name },
         shareId: row.my_share_id,
         sharedWith: row.shared_with,
+        // a planned study session; somebody it is shared with sees an ordinary task
+        goal_part_id: isOwner ? row.goal_part_id : null,
+        plan_pinned: isOwner ? row.plan_pinned : false,
+        study: row.study_info,
     };
 }
 
@@ -644,36 +687,34 @@ app.get("/api/groups", async (req, res) => {
     }
 });
 
+// A task's notes are my notebook notes about it (notebook_notes.task_id, migration 043). These
+// routes keep the old shape { id, task_id, content, created_at } for the task cards and older apps;
+// content is the title line (if the note has one) and the text.
+const taskNoteJson = (row) => ({
+    id: row.id,
+    task_id: row.task_id,
+    content: row.title ? `${row.title}
+${row.body}`.trimEnd() : row.body,
+    created_at: row.created_at,
+});
+const TASK_NOTES_OF = `SELECT * FROM notebook_notes WHERE user_id = $1 AND task_id IS NOT NULL AND trashed_at IS NULL
+    AND task_id IN (${accessibleTaskIds("$1")})`;
+
 app.get("/api/tasks/:taskId/notes", async (req, res) => {
     const taskId = idParam(req.params.taskId);
-    const userId = req.user.userId;
     if (!taskId) return notFound(res, "Task");
-
     try {
-       const result = await pool.query(
-       `SELECT notes.* FROM notes
-       WHERE notes.task_id = $1 AND notes.task_id IN (${accessibleTaskIds("$2")})
-       ORDER BY notes.id`,
-        [taskId, userId]
-    );
-    res.json(result.rows);
+        const result = await pool.query(`${TASK_NOTES_OF} AND task_id = $2 ORDER BY created_at, id`, [req.user.userId, taskId]);
+        res.json(result.rows.map(taskNoteJson));
     } catch (err) {
         serverError(res, err);
     }
 });
 
 app.get("/api/notes", async (req, res) => {
-    const userId = req.user.userId;
-
     try {
-        const result = await pool.query(
-            `SELECT notes.*
-            FROM notes
-            WHERE notes.task_id IN (${accessibleTaskIds("$1")})
-            ORDER BY notes.id`,
-            [userId]
-        );
-        res.json(result.rows);
+        const result = await pool.query(`${TASK_NOTES_OF} ORDER BY created_at, id`, [req.user.userId]);
+        res.json(result.rows.map(taskNoteJson));
     } catch (err) {
         serverError(res, err);
     }
@@ -772,6 +813,7 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
                 users.google_sub IS NOT NULL AS google_linked,
                 to_char(users.allday_reminder_time, 'HH24:MI') AS allday_reminder_time,
                 users.tour_seen_at IS NOT NULL AS tour_seen,
+                users.usage_consent, users.usage_consent_at, users.usage_consent_version,
                 beta_access_requests.status, beta_access_requests.reason, beta_access_requests.created_at,
                 CASE WHEN users.is_admin
                     THEN (SELECT count(*) FROM beta_access_requests WHERE status = 'pending')::int END AS pending_count
@@ -795,12 +837,16 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
             allDayReminderTime: row.allday_reminder_time,
             tourSeen: row.tour_seen,
             accessMode: ACCESS_MODE,
+            // whether Quidey Pro can be bought (PRO_BILLING); the apps show it only then
+            proSales: PRO_BILLING,
             // Pro: paid (pro_until ahead) or a gift (is_pro); limits/usage only on the free plan
             pro: { active: hasPro(row), gift: row.is_pro, until: row.pro_until },
             limits: limited(row) ? { ...FREE_LIMITS, statsDays: FREE_STATS_DAYS } : null,
             usage: limited(row) ? await usage(pool, row.id) : null,
             hasPassword: row.has_password,
             googleLinked: row.google_linked,
+            // the anonymous usage statistics: choice null = not asked yet (see PUT /api/profile/usage-consent)
+            usageConsent: toUsageConsent(row),
         });
     } catch (err) {
         serverError(res, err);
@@ -831,6 +877,110 @@ app.post("/api/beta-requests", authenticateToken, async (req, res) => {
         const row = result.rows[0];
         res.status(201).json({ status: row.status, reason: row.reason, createdAt: row.created_at });
         pushBetaRequest(userId, row.reason);
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- anonymous usage statistics (utils/usage.js) ----------
+// Only counted for accounts that agreed (users.usage_consent = 'granted'); the text they agreed to is version 1.
+const USAGE_CONSENT_VERSION = 1;
+const toUsageConsent = (row) => ({ choice: row.usage_consent ?? null, at: row.usage_consent_at ?? null, version: row.usage_consent_version ?? null });
+
+// The app names its platform (web / pwa / android) in this header; anything else counts as web
+const usagePlatform = (req) => cleanPlatform(req.get("X-Quidey-Platform"));
+
+// A count by the server (task_created, task_done, focus_done) after the route's commit: not awaited,
+// never fails the request (countUsage logs and swallows its errors)
+function countLater(req, metric, value = 0) {
+    countUsage(pool, req.user.userId, metric, { value, platform: usagePlatform(req) }).catch(() => {});
+}
+
+// Yes or no to the statistics: { granted: boolean }. No also drops the person's "already counted"
+// marks at once (the totals have no user id and stay). Answers { choice, at, version }.
+app.put("/api/profile/usage-consent", async (req, res) => {
+    const userId = req.user.userId;
+    const granted = req.body?.granted;
+    if (typeof granted !== "boolean") return invalidInput(res, "granted");
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const result = await client.query(
+            `UPDATE users SET usage_consent = $2, usage_consent_at = now(), usage_consent_version = $3 WHERE id = $1
+            RETURNING usage_consent, usage_consent_at, usage_consent_version`,
+            [userId, granted ? "granted" : "denied", USAGE_CONSENT_VERSION]
+        );
+        if (result.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return res.status(401).json({ error: "User not found" });
+        }
+        if (!granted) await withdrawUsage(client, userId);
+        await client.query("COMMIT");
+        forgetUsageAccount(userId);
+        res.json(toUsageConsent(result.rows[0]));
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        serverError(res, err);
+    } finally {
+        client.release();
+    }
+});
+
+// The app's own events: { platform, events: [{ metric, at?, value? }] }, at most USAGE_EVENTS_MAX.
+// Always 204 for that shape, also without consent (the app needn't know). Dropped: unknown metrics and
+// the ones the server counts itself, events more than a day old or later than a minute from now, and a
+// second active_minute of the same minute. Only active_minute has a value (one minute).
+const USAGE_EVENTS_MAX = 200;
+const USAGE_LATE_MS = 24 * 60 * 60 * 1000;
+const USAGE_EARLY_MS = 60 * 1000;
+// the last active minute per user (minutes since 1970), a bounded map like accountCache
+const lastActiveMinute = new Map();
+const LAST_ACTIVE_MINUTE_MAX = 10000;
+
+const usageLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_USAGE", 30),
+    skip: (req) => req.method === "OPTIONS",
+    keyGenerator: (req) => `usage:${req.user.userId}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many requests, please slow down", code: "RATE_LIMITED" },
+});
+
+// When an event happened: missing = now; a date string or milliseconds; null when unusable
+function usageTime(value) {
+    if (value === undefined || value === null) return new Date();
+    if (typeof value !== "string" && typeof value !== "number") return null;
+    const at = new Date(value);
+    return Number.isNaN(at.getTime()) ? null : at;
+}
+
+function isRepeatedMinute(userId, at) {
+    const minute = Math.floor(at.getTime() / 60000);
+    if (lastActiveMinute.get(userId) === minute) return true;
+    lastActiveMinute.delete(userId);
+    if (lastActiveMinute.size >= LAST_ACTIVE_MINUTE_MAX) lastActiveMinute.delete(lastActiveMinute.keys().next().value);
+    lastActiveMinute.set(userId, minute);
+    return false;
+}
+
+app.post("/api/usage", usageLimiter, async (req, res) => {
+    const userId = req.user.userId;
+    const events = req.body?.events;
+    if (!Array.isArray(events) || events.length > USAGE_EVENTS_MAX) return invalidInput(res, "events");
+    const platform = cleanPlatform(req.body?.platform ?? req.get("X-Quidey-Platform"));
+    try {
+        const now = Date.now();
+        // one after the other: counting the same person's marks in parallel would only wait on itself
+        for (const event of events) {
+            const metric = event?.metric;
+            if (typeof metric !== "string" || !CLIENT_METRICS.has(metric)) continue;
+            const at = usageTime(event.at);
+            if (!at || at.getTime() < now - USAGE_LATE_MS || at.getTime() > now + USAGE_EARLY_MS) continue;
+            if (metric === "active_minute" && isRepeatedMinute(userId, at)) continue;
+            await countUsage(pool, userId, metric, { value: metric === "active_minute" ? 1 : 0, platform, at });
+        }
+        res.status(204).end();
     } catch (err) {
         serverError(res, err);
     }
@@ -877,6 +1027,8 @@ app.post("/api/tasks", async (req, res) => {
         // an event entered afterwards (e.g. yesterday's work) is over right away
         const [synced] = await syncEvents(client, "tasks.id = $1", [id]);
         await client.query("COMMIT");
+        // tasks only: events are never ticked off by hand, so "created vs. done" leaves them out
+        if (extras.values.kind !== "event") countLater(req, "task_created");
         const task = await loadTask(id, userId);
         res.status(201).json(synced?.nextId ? { ...task, nextTask: await loadTask(synced.nextId, userId) } : task);
     } catch (err) {
@@ -934,9 +1086,9 @@ async function syncEvents(db, where, params = []) {
 // false, when the caller does). Returns the ids of the sessions that changed.
 async function syncSessionEvents(where, params = [], notify = true) {
     const result = await pool.query(
-        `UPDATE shared_session_tasks SET done = state.over
+        `UPDATE shared_session_tasks SET done = state.over, completed_at = CASE WHEN state.over THEN state.ends_at END
         FROM (
-            SELECT shared_session_tasks.id, ends.at <= now() AS over
+            SELECT shared_session_tasks.id, ends.at AS ends_at, ends.at <= now() AS over
             FROM shared_session_tasks
             JOIN shared_sessions ON shared_sessions.id = shared_session_tasks.session_id
             JOIN users ON users.id = shared_sessions.owner_id
@@ -953,6 +1105,32 @@ async function syncSessionEvents(where, params = [], notify = true) {
         for (const sessionId of sessions) await notifySession(sessionId).catch(() => {});
     }
     return sessions;
+}
+
+// The same for a family's events, in the family owner's time zone; completed_at is when one
+// ended. Returns the ids of the families that changed (and tells their members unless notify is false).
+async function syncFamilyEvents(where, params = [], notify = true) {
+    const result = await pool.query(
+        `UPDATE family_tasks SET done = state.over, completed_at = CASE WHEN state.over THEN state.ends_at END
+        FROM (
+            SELECT family_tasks.id, ends.at AS ends_at, ends.at <= now() AS over
+            FROM family_tasks
+            JOIN families ON families.id = family_tasks.family_id
+            JOIN users ON users.id = families.owner_id
+            CROSS JOIN LATERAL (SELECT ${EVENT_END_SQL.replaceAll("tasks.", "family_tasks.")} AS at) AS ends
+            WHERE family_tasks.kind = 'event' AND family_tasks.due IS NOT NULL AND (${where})
+        ) AS state
+        WHERE family_tasks.id = state.id
+            AND (family_tasks.done IS DISTINCT FROM state.over
+                OR family_tasks.completed_at IS DISTINCT FROM CASE WHEN state.over THEN state.ends_at END)
+        RETURNING family_tasks.family_id`,
+        params
+    );
+    const families = [...new Set(result.rows.map(row => row.family_id))];
+    if (notify) {
+        for (const familyId of families) await notifyFamily(familyId).catch(() => {});
+    }
+    return families;
 }
 
 // syncEvents in a transaction of its own, so an ended event and its next repeat come together
@@ -979,6 +1157,7 @@ async function closePastEvents() {
         // an event after tomorrow can't be over yet, whatever the time zone
         changed = await syncEventsNow("NOT tasks.done AND tasks.due <= current_date + 1");
         await syncSessionEvents("NOT shared_session_tasks.done AND shared_session_tasks.due <= current_date + 1");
+        await syncFamilyEvents("NOT family_tasks.done AND family_tasks.due <= current_date + 1");
     } catch (err) {
         console.error("Closing past events failed:", err);
         return;
@@ -1060,13 +1239,15 @@ app.post("/api/tasks/:taskId/notes", async (req, res) => {
             return res.status(404).json({ error: "Task not found" });
         }
 
+        const count = await pool.query("SELECT count(*)::int AS n FROM notebook_notes WHERE user_id = $1", [userId]);
+        if (count.rows[0].n >= NOTEBOOK_MAX) return res.status(409).json({ error: "Too many notes", code: "NOTEBOOK_LIMIT" });
         const result = await pool.query(
-            `INSERT INTO notes (task_id, content)
-            VALUES ($1, $2)
+            `INSERT INTO notebook_notes (user_id, task_id, title, body)
+            VALUES ($1, $2, '', $3)
             RETURNING *`,
-            [taskId, content]
+            [userId, taskId, content]
         );
-        res.status(201).json(result.rows[0]);
+        res.status(201).json(taskNoteJson(result.rows[0]));
     } catch (err) {
         serverError(res, err);
     }
@@ -1079,6 +1260,9 @@ app.post("/api/sessions", async (req, res) => {
     // a session is at most a day long, with at most 500 tasks
     if (!Number.isFinite(totalTime) || totalTime < 0 || totalTime > 24 * 60 * 60) {
         return res.status(400).json({ error: "totalTime must be between 0 and 86400 seconds" });
+    }
+    if (totalTime * 1000 < SESSION_MIN_MS) {
+        return res.status(400).json({ error: "A session is at least a minute long", code: "SESSION_TOO_SHORT" });
     }
     if (!Array.isArray(workedTasks) || workedTasks.length > 500) {
         return res.status(400).json({ error: "workedTasks must be an array of at most 500 tasks" });
@@ -1159,6 +1343,7 @@ app.post("/api/sessions", async (req, res) => {
         }
 
         await client.query("COMMIT");
+        if (totalTime > 0) countLater(req, "focus_done", totalTime);
 
         const result = await pool.query(
             `${SESSION_SELECT}
@@ -1845,13 +2030,7 @@ app.post("/api/messages/:userId/read", async (req, res) => {
     }
 });
 
-// My notifications (the latest 100), newest first
-// A notification as the app gets it (list and live); data only for kinds that have some
-// (task_assigned: { sessionId, taskId, by })
-const toNotice = (row) => ({
-    id: row.id, kind: row.kind, title: row.title, body: row.body, createdAt: row.created_at, readAt: row.read_at,
-    ...(row.data && { data: row.data }),
-});
+// My notifications (the latest 100), newest first (toNotice: utils/groupNotices.js)
 
 app.get("/api/notifications", async (req, res) => {
     try {
@@ -1918,6 +2097,10 @@ async function logAdminAction(db, admin, target, action) {
 const ADMIN_USER_SELECT = `
     SELECT users.id, users.username, users.display_name, users.email, users.created_at,
         users.is_pro, users.pro_until, users.is_admin, users.is_tester,
+        to_char(users.birth_date, 'YYYY-MM-DD') AS birth_date, users.email_verified,
+        users.terms_accepted_at, users.privacy_accepted_at, users.language, users.timezone,
+        users.has_password, (users.google_sub IS NOT NULL) AS has_google, users.level, users.is_owner,
+        users.usage_consent, users.usage_consent_at, users.usage_consent_version,
         EXISTS (SELECT 1 FROM user_avatars WHERE user_avatars.user_id = users.id) AS has_avatar,
         beta_access_requests.status AS request_status, beta_access_requests.reason AS request_reason,
         beta_access_requests.created_at AS request_created_at, beta_access_requests.decided_at AS request_decided_at
@@ -1936,6 +2119,16 @@ const toAdminUser = (row) => ({
     proUntil: row.pro_until,
     isAdmin: row.is_admin,
     isTester: row.is_tester,
+    birthDate: row.birth_date,
+    emailVerified: row.email_verified,
+    termsAcceptedAt: row.terms_accepted_at,
+    privacyAcceptedAt: row.privacy_accepted_at,
+    language: row.language,
+    timezone: row.timezone,
+    signIn: row.has_google ? (row.has_password ? "both" : "google") : "password",
+    level: row.level,
+    isOwner: row.is_owner,
+    usageConsent: toUsageConsent(row),
     // a profile picture admins may take down
     hasAvatar: Boolean(row.has_avatar),
     request: row.request_status ? {
@@ -2044,6 +2237,43 @@ app.get("/api/admin/overview", async (req, res) => {
     }
 });
 
+// Anonymous usage report (utils/usageReport.js): ?from=&to= (Berlin dates, default last 30 days) &platform=&language=&plan=
+const USAGE_FILTERS = { platform: ["web", "pwa", "android"], language: ["de", "en"], plan: ["free", "tester", "pro"] };
+function usageParams(req, res) {
+    const params = {};
+    for (const [name, allowed] of Object.entries(USAGE_FILTERS)) {
+        const v = req.query[name];
+        if (v === undefined || v === "") continue;
+        if (typeof v !== "string" || !allowed.includes(v)) { adminFail(res, 400, "INVALID_INPUT", `Invalid ${name}`); return null; }
+        params[name] = v;
+    }
+    const range = resolveRange(req.query.from, req.query.to);
+    if (range.error) { adminFail(res, 400, "INVALID_RANGE", range.error); return null; }
+    return { ...params, from: range.from, to: range.to };
+}
+
+app.get("/api/admin/usage", async (req, res) => {
+    const params = usageParams(req, res);
+    if (!params) return;
+    try {
+        res.json(await usageReport(pool, params));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.get("/api/admin/usage/raw", async (req, res) => {
+    const params = usageParams(req, res);
+    if (!params) return;
+    try {
+        const rows = await usageRaw(pool, params, limitFromEnv("USAGE_RAW_MAX", 200000));
+        if (!rows) return adminFail(res, 400, "USAGE_RANGE_TOO_BIG", "Too many rows, narrow the range");
+        res.json({ rows });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
 // Beta requests, oldest first: ?status=pending (default) | all
 app.get("/api/admin/requests", async (req, res) => {
     const all = req.query.status === "all";
@@ -2108,18 +2338,49 @@ app.delete("/api/admin/requests/:userId", async (req, res) => {
     }
 });
 
-// All users, newest first; ?q= searches username, display name and email
+// All users; ?q= searches username, display name and email. Without ?page: the newest 200 as an array
+// (older apps). With ?page=&pageSize= (1-100, default 50) and ?sort=newest|oldest|name: { users, total }.
+const ADMIN_USER_ORDER = {
+    newest: "users.created_at DESC, users.id DESC",
+    oldest: "users.created_at, users.id",
+    name: "lower(coalesce(users.display_name, users.username)), users.id",
+};
 app.get("/api/admin/users", async (req, res) => {
     const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 100) : "";
+    const like = `%${q.replace(/[\\%_]/g, "\\$&")}%`;
+    const where = "WHERE $1 = '' OR users.username ILIKE $2 OR users.display_name ILIKE $2 OR users.email ILIKE $2";
     try {
-        const result = await pool.query(
-            `${ADMIN_USER_SELECT}
-            WHERE $1 = '' OR users.username ILIKE $2 OR users.display_name ILIKE $2 OR users.email ILIKE $2
-            ORDER BY users.created_at DESC, users.id DESC
-            LIMIT 200`,
-            [q, `%${q.replace(/[\\%_]/g, "\\$&")}%`]
-        );
-        res.json(result.rows.map(toAdminUser));
+        if (req.query.page === undefined) {
+            const result = await pool.query(
+                `${ADMIN_USER_SELECT} ${where} ORDER BY ${ADMIN_USER_ORDER.newest} LIMIT 200`,
+                [q, like]
+            );
+            return res.json(result.rows.map(toAdminUser));
+        }
+        const page = Number(req.query.page);
+        const pageSize = req.query.pageSize === undefined ? 50 : Number(req.query.pageSize);
+        if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) {
+            return adminFail(res, 400, "INVALID_PAGE", "page must be 1 or more and pageSize 1 to 100");
+        }
+        // own keys only: "constructor" and the like are unknown sorts, not SQL
+        const sort = typeof req.query.sort === "string" && Object.hasOwn(ADMIN_USER_ORDER, req.query.sort) ? req.query.sort : "newest";
+        const order = ADMIN_USER_ORDER[sort];
+        const [result, count] = await Promise.all([
+            pool.query(`${ADMIN_USER_SELECT} ${where} ORDER BY ${order} LIMIT $3 OFFSET $4`, [q, like, pageSize, (page - 1) * pageSize]),
+            pool.query(`SELECT count(*)::int AS n FROM users ${where}`, [q, like]),
+        ]);
+        res.json({ users: result.rows.map(toAdminUser), total: count.rows[0].n });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Every account, newest first, for the admin's download; logged
+app.get("/api/admin/users/export", async (req, res) => {
+    try {
+        const result = await pool.query(`${ADMIN_USER_SELECT} ORDER BY ${ADMIN_USER_ORDER.newest}`);
+        await logAdminAction(pool, req.admin, req.admin, "export_users");
+        res.json({ users: result.rows.map(toAdminUser) });
     } catch (err) {
         serverError(res, err);
     }
@@ -2382,9 +2643,11 @@ app.delete("/api/users", authLimiter, async (req, res) => {
             WHERE families.id = heir.family_id AND families.owner_id = $1`,
             [userId]
         );
+        // (its usage_seen marks go with it, FK cascade; the anonymous usage totals stay)
         await client.query("DELETE FROM users WHERE id = $1", [userId]);
         await client.query("COMMIT");
         forgetAccount(userId);
+        forgetUsageAccount(userId);
         realtime.disconnectUser(userId);
         res.json({ message: "Account deleted" });
     } catch (err) {
@@ -2419,7 +2682,8 @@ app.put("/api/tasks/:id", async (req, res) => {
     try {
         await client.query("BEGIN");
         const before = await client.query(
-            `SELECT done, kind, user_id FROM tasks WHERE id = $1 AND id IN (${accessibleTaskIds("$2")}) FOR UPDATE`,
+            `SELECT done, kind, user_id, to_jsonb(tasks) - ${PIN_IGNORED} AS fields
+            FROM tasks WHERE id = $1 AND id IN (${accessibleTaskIds("$2")}) FOR UPDATE`,
             [id, userId]
         );
         if (before.rows.length === 0) {
@@ -2461,12 +2725,21 @@ app.put("/api/tasks/:id", async (req, res) => {
             values.push(extras.values.repeat);
             sets.push(`repeat_skip = CASE WHEN tasks.repeat IS DISTINCT FROM $${values.length} THEN '{}' ELSE tasks.repeat_skip END`);
         }
-
         await client.query(`UPDATE tasks SET ${sets.join(", ")} WHERE id = $6 AND id IN (${accessibleTaskIds("$7")})`, values);
+        // a planned study session the user changed in any way but ticking it off is theirs now:
+        // a re-plan keeps it (with its notes) instead of replacing it (controller ruling 18)
+        await client.query(
+            `UPDATE tasks SET plan_pinned = true
+            WHERE id = $1 AND goal_part_id IS NOT NULL AND NOT plan_pinned
+                AND to_jsonb(tasks) - ${PIN_IGNORED} IS DISTINCT FROM $2::jsonb`,
+            [id, old.fields]
+        );
         const [synced] = await syncEvents(client, "tasks.id = $1", [id]);
         const nextId = kind === "event" ? synced?.nextId ?? null
             : old.done || !done ? null : await createNextRepeat(client, id);
         await client.query("COMMIT");
+        // ticked off just now (events are done once they are over, not by anybody)
+        if (kind !== "event" && done && !old.done) countLater(req, "task_done");
 
         const task = await loadTask(id, userId);
         // a repeating task that was just done comes back with the next one
@@ -2563,20 +2836,27 @@ app.put("/api/notes/:id", async (req, res) => {
     if (content === undefined) return invalidInput(res, "content");
 
     try {
+        // a note with a title keeps it while its first line still is that title
         const result = await pool.query(
-            `UPDATE notes
-            SET content = $1
-            WHERE id = $2
-            AND task_id IN (${accessibleTaskIds("$3")})
+            `UPDATE notebook_notes
+            SET title = CASE WHEN title <> '' AND split_part($1, E'
+', 1) = title THEN title ELSE '' END,
+                body = CASE WHEN title <> '' AND split_part($1, E'
+', 1) = title
+                    THEN btrim(substr($1, length(title) + 2), E'
+') ELSE $1 END,
+                updated_at = now()
+            WHERE id = $2 AND user_id = $3 AND task_id IS NOT NULL
             RETURNING *`,
-            [content, id, userId]
+            [content ?? "", id, userId]
         )
 
         if (result.rows.length === 0) {
             return res.status(404).json({ error: "Note not found" });
         }
 
-        res.json(result.rows[0]);
+        res.json(taskNoteJson(result.rows[0]));
+        notifyBoardsOfNote(id).catch(() => {});
     } catch (err) {
         serverError(res, err);
     }
@@ -2739,10 +3019,10 @@ app.delete("/api/notes/:id", async (req, res) => {
     if (!id) return notFound(res, "Note");
 
     try {
+        const boards = await boardsOfNote(id);
         const result = await pool.query(
-            `DELETE FROM notes
-             WHERE id = $1
-            AND task_id IN (${accessibleTaskIds("$2")})
+            `DELETE FROM notebook_notes
+             WHERE id = $1 AND user_id = $2 AND task_id IS NOT NULL
             RETURNING *`,
             [id, userId]
         );
@@ -2751,7 +3031,8 @@ app.delete("/api/notes/:id", async (req, res) => {
             return res.status(404).json({ error: "Note not found" });
         }
 
-        res.json({ message: "Note deleted", note: result.rows[0] });
+        res.json({ message: "Note deleted", note: taskNoteJson(result.rows[0]) });
+        for (const board of boards) notifyBoard(board.kind, board.id).catch(() => {});
     } catch (err) {
         serverError(res, err);
     }
@@ -2894,7 +3175,7 @@ const publicUser = (row, prefix = "") => ({
 // Sending requests answers "does this username exist?", so it's limited per IP
 const friendRequestLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    limit: 30,
+    limit: limitFromEnv("RATE_LIMIT_FRIEND_REQUESTS", 30),
     skip: (req) => req.method === "OPTIONS",
     standardHeaders: "draft-8",
     legacyHeaders: false,
@@ -3156,11 +3437,42 @@ const friendIdsOf = (param) => `
     SELECT CASE WHEN requester_id = ${param} THEN addressee_id ELSE requester_id END
     FROM friendships WHERE status = 'accepted' AND ${param} IN (requester_id, addressee_id)`;
 
+// A focus session shorter than this isn't saved (a start by mistake, a stop during a break);
+// older short ones still add their time but don't count as sessions.
+const SESSION_MIN_MS = 60 * 1000;
+
+// Focus per day of user $1 in their timezone (needs the CTE `me`): own sessions plus the team
+// stopwatch time beyond what those sessions already hold for session tasks (the solo timer on a
+// session task books both), the same rule as XP (utils/progress.js). Columns: day, ms (all focus),
+// n (sessions of at least a minute), session_ms (their time) and longest (the longest session).
+const FOCUS_DAYS_CTES = `
+    solo_days AS (
+        SELECT ((s.date AT TIME ZONE current_setting('TimeZone')) AT TIME ZONE me.tz)::date AS day,
+            sum(COALESCE(s.time_ms, 0))::bigint AS ms,
+            count(*) FILTER (WHERE s.time_ms >= ${SESSION_MIN_MS})::int AS n,
+            COALESCE(sum(s.time_ms) FILTER (WHERE s.time_ms >= ${SESSION_MIN_MS}), 0)::bigint AS session_ms,
+            COALESCE(max(s.time_ms), 0)::bigint AS longest,
+            COALESCE(sum(linked.ms), 0)::bigint AS shared_ms
+        FROM sessions AS s CROSS JOIN me
+        LEFT JOIN LATERAL (SELECT sum(time_ms) AS ms FROM session_shared_tasks WHERE session_id = s.id) AS linked ON true
+        WHERE s.user_id = $1 AND s.date IS NOT NULL
+        GROUP BY 1
+    ),
+    focus_days AS (
+        SELECT COALESCE(solo_days.day, team.day) AS day,
+            (COALESCE(solo_days.ms, 0) + GREATEST(COALESCE(team.time_ms, 0) - COALESCE(solo_days.shared_ms, 0), 0))::bigint AS ms,
+            COALESCE(solo_days.n, 0) AS n, COALESCE(solo_days.session_ms, 0)::bigint AS session_ms,
+            COALESCE(solo_days.longest, 0)::bigint AS longest
+        FROM solo_days
+        FULL JOIN (SELECT day, time_ms FROM shared_time_days WHERE user_id = $1) AS team ON team.day = solo_days.day
+    )`;
+
 // Focus statistics of one user. Days are counted in their own timezone (users.timezone, as for
 // reminder mails): a session at 23:30 in Berlin belongs to that day, not the next one.
 async function loadStats(userId) {
     const result = await pool.query(
         `WITH me AS (SELECT COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = $1),
+        ${FOCUS_DAYS_CTES},
         local AS (
             SELECT (sessions.date AT TIME ZONE current_setting('TimeZone')) AT TIME ZONE me.tz AS at,
                 COALESCE(sessions.time_ms, 0)::bigint AS ms
@@ -3169,9 +3481,9 @@ async function loadStats(userId) {
         )
         SELECT
             (SELECT to_char((now() AT TIME ZONE tz)::date, 'YYYY-MM-DD') FROM me) AS today,
-            (SELECT COALESCE(json_agg(json_build_object('day', day, 'ms', ms, 'sessions', n, 'longest', longest) ORDER BY day), '[]')
-                FROM (SELECT to_char(at::date, 'YYYY-MM-DD') AS day, sum(ms) AS ms, count(*) AS n, max(ms) AS longest
-                    FROM local GROUP BY at::date) AS days) AS days,
+            (SELECT COALESCE(json_agg(json_build_object('day', to_char(day, 'YYYY-MM-DD'), 'ms', ms, 'sessions', n,
+                    'sessionMs', session_ms, 'longest', longest) ORDER BY day), '[]')
+                FROM focus_days) AS days,
             (SELECT COALESCE(json_agg(json_build_object('hour', hour, 'ms', ms)), '[]')
                 FROM (SELECT extract(hour FROM at)::int AS hour, sum(ms) AS ms FROM local GROUP BY 1) AS hours) AS hours,
             (SELECT COALESCE(json_agg(json_build_object('name', name, 'color', color, 'ms', ms) ORDER BY ms DESC), '[]')
@@ -3227,6 +3539,8 @@ function summarizeStats(row) {
 
     const totalMs = days.reduce((sum, d) => sum + d.ms, 0);
     const sessions = days.reduce((sum, d) => sum + d.sessions, 0);
+    // the average of real sessions: no team stopwatch time, no runs under a minute
+    const sessionMs = days.reduce((sum, d) => sum + Number(d.sessionMs ?? d.ms), 0);
     const best = active.reduce((top, d) => (!top || d.ms > top.ms ? d : top), null);
 
     return {
@@ -3234,7 +3548,7 @@ function summarizeStats(row) {
         totalMs,
         sessions,
         activeDays: active.length,
-        avgSessionMs: sessions > 0 ? Math.round(totalMs / sessions) : 0,
+        avgSessionMs: sessions > 0 ? Math.round(sessionMs / sessions) : 0,
         longestSessionMs: days.reduce((max, d) => Math.max(max, d.longest), 0),
         currentStreak,
         longestStreak,
@@ -4341,11 +4655,14 @@ app.post("/api/shared-sessions/:id/tasks", async (req, res) => {
             VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING id`,
             values
         );
+        // a new task (one of my own shared into the session isn't new; events aren't tasks)
+        if (!task.sourceTaskId && task.fields.kind !== "event") countLater(req, "task_created");
         // an event entered afterwards is over right away
         await syncSessionEvents("shared_session_tasks.id = $1", [created.rows[0].id], false);
         await logEvent(pool, session.sessionId, userId, "task_added", { taskId: created.rows[0].id, taskName: task.name });
         await sendSharedSession(res, session.sessionId, userId, 201);
         await notifySession(session.sessionId);
+        noticeEntryAdded(pool, { place: "session", placeId: session.sessionId, byId: userId, entryId: created.rows[0].id, name: task.name });
     } catch (err) {
         if (err.code === "23505") {
             return fail(res, 409, "TASK_ALREADY_SHARED", "This task is already in the session");
@@ -4409,9 +4726,9 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
             if (member?.status !== "joined") return fail(res, 404, "MEMBER_NOT_FOUND", "Member not found");
         }
 
-        const values = [setDone ?? null, changesAssignee, assigneeId, taskId, name ?? null];
+        const values = [setDone ?? null, changesAssignee, assigneeId, taskId, name ?? null, userId];
         const sets = ["done = COALESCE($1, done)", "assignee_id = CASE WHEN $2 THEN $3::int ELSE assignee_id END",
-            "name = COALESCE($5, name)"];
+            "name = COALESCE($5, name)", ...doneBySets("$1", "$6")];
         for (const [column, value] of Object.entries(fields.values)) {
             values.push(value);
             sets.push(`${column} = $${values.length}`);
@@ -4431,6 +4748,7 @@ app.patch("/api/shared-sessions/:id/tasks/:taskId", async (req, res) => {
                 );
             }
             await logEvent(pool, session.sessionId, userId, done ? "task_done" : "task_reopened", { taskId, taskName: task.name });
+            if (done) countLater(req, "task_done");
         }
         const assignedToOther = changesAssignee && assigneeId !== task.assignee_id && assigneeId && assigneeId !== userId;
         if (changesAssignee && assigneeId !== task.assignee_id) {
@@ -4611,6 +4929,7 @@ app.post("/api/shared-sessions/:id/messages", messageLimiter, async (req, res) =
         // the other members (and my other tabs) get it right away
         const event = loaded.events.find(e => e.id === eventId);
         if (event) realtime.toSession(session.sessionId, "session:event", { sessionId: session.sessionId, event });
+        pushChat(pool, { place: "session", placeId: session.sessionId, byId: userId, text });
     } catch (err) {
         serverError(res, err);
     }
@@ -4769,6 +5088,8 @@ const toFamilyMessage = (row) => ({
 //   week:   { weekStart, people: [{ userId, xp, focusMin, streak }] } (joined members who show
 //           their statistics, and me) }
 async function loadFamily(familyId, userId) {
+    // an event that ended since is shown done (whoever looks first ticks it off)
+    await syncFamilyEvents("family_tasks.family_id = $1", [familyId], false);
     const [family, members, tasks, groups] = await Promise.all([
         pool.query(
             `SELECT families.id, families.name, families.created_at, families.emoji, families.color,
@@ -4794,6 +5115,7 @@ async function loadFamily(familyId, userId) {
                 family_tasks.due, to_char(family_tasks.due_time, 'HH24:MI') AS due_time, family_tasks.prio,
                 family_tasks.duration_minutes, family_tasks.location, family_tasks.link, family_tasks.details,
                 family_tasks.color, family_tasks.created_at, family_tasks.group_id,
+                family_tasks.kind, family_tasks.reminders, family_tasks.completed_at,
                 users.id AS adder_id, users.username AS adder_username, users.display_name AS adder_display_name,
                 assignee.id AS assignee_id, assignee.username AS assignee_username, assignee.display_name AS assignee_display_name
             FROM family_tasks LEFT JOIN users ON users.id = family_tasks.added_by
@@ -4859,6 +5181,9 @@ async function loadFamily(familyId, userId) {
             assignee: task.assignee_id ? publicUser(task, "assignee_") : null,
             createdAt: task.created_at,
             groupId: task.group_id,
+            kind: task.kind,
+            reminders: task.reminders,
+            completedAt: task.completed_at,
         })),
         groups,
     };
@@ -5102,15 +5427,94 @@ app.delete(`${familyBase}/:id/members/:userId`, async (req, res) => {
     }
 });
 
+// The SQL that books who ticked an entry off and when: done ($done, null = not sent) by $me.
+// Ticked again while done keeps the first one; opened again clears both.
+const doneBySets = (doneParam, meParam) => [
+    `done_by = CASE WHEN ${doneParam}::boolean IS NULL THEN done_by WHEN ${doneParam} THEN (CASE WHEN done THEN done_by ELSE ${meParam}::int END) END`,
+    `completed_at = CASE WHEN ${doneParam}::boolean IS NULL THEN completed_at WHEN ${doneParam} THEN COALESCE(completed_at, now()) END`,
+];
+
+// Moves one of my own open tasks or events into a family: the entry gets its details and
+// reminders, my task is deleted (its groups, collections, notes and the per-task split of focus
+// time go with it; the focus sessions and their totals stay). Repeating ones and ones shared
+// with somebody stay mine. Answers the family (201) or { error }.
+async function moveTaskToFamily(req, res, family, extra) {
+    const userId = req.user.userId;
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const own = await client.query(
+            `SELECT tasks.id, tasks.name, tasks.description, tasks.due, to_char(tasks.due_time, 'HH24:MI') AS due_time,
+                tasks.prio, tasks.duration_minutes, tasks.location, tasks.link, tasks.details,
+                COALESCE(tasks.color, event_types.color) AS color, tasks.kind, tasks.reminders,
+                tasks.done, tasks.repeat, EXISTS (SELECT 1 FROM task_shares WHERE task_shares.task_id = tasks.id) AS shared
+            FROM tasks LEFT JOIN event_types ON event_types.id = tasks.event_type_id
+            WHERE tasks.id = $1 AND tasks.user_id = $2
+            FOR UPDATE OF tasks`,
+            [idParam(req.body.taskId), userId]
+        );
+        const task = own.rows[0];
+        const refuse = (status, code, message) => client.query("ROLLBACK").then(() => fail(res, status, code, message));
+        if (!task) return refuse(404, "TASK_NOT_FOUND", "Task not found");
+        if (task.done) return refuse(400, "TASK_DONE", "The task is done already");
+        if (task.repeat) return refuse(400, "TASK_REPEATS", "A repeating task stays with its owner");
+        if (task.shared) return refuse(400, "TASK_SHARED", "A shared task stays with its owner");
+
+        const { id, done, repeat, shared, ...fields } = task;
+        if (!fields.due) fields.reminders = [];
+        Object.assign(fields, extra);
+        const columns = ["family_id", "added_by", ...Object.keys(fields)];
+        const values = [family.familyId, userId, ...Object.values(fields)];
+        const created = await client.query(
+            `INSERT INTO family_tasks (${columns.join(", ")}) VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING id`,
+            values
+        );
+        await client.query("DELETE FROM tasks WHERE id = $1", [id]);
+        await client.query("COMMIT");
+        if (fields.kind === "event") await syncFamilyEvents("family_tasks.id = $1", [created.rows[0].id], false);
+        await sendFamily(res, family.familyId, userId, 201);
+        realtime.toUser(userId, "tasks:changed", {});
+        await notifyFamily(family.familyId);
+        return { entryId: created.rows[0].id, name: fields.name };
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+    } finally {
+        client.release();
+    }
+}
+
 // A calendar entry (or, without a day, an item on the family's list):
-// { name, assignee_id?, group_id? (testers: a sub-group), and any of SHARED_TASK_FIELDS }
+// { name, assignee_id?, group_id? (a sub-group), and any of FAMILY_TASK_FIELDS }, or
+// { taskId, assignee_id?, group_id? } moves one of my own tasks / events in (moveTaskToFamily).
+// An event needs a day; reminders are kept only with one.
 app.post(`${familyBase}/:id/tasks`, async (req, res) => {
     const userId = req.user.userId;
+    if (req.body?.taskId !== undefined) {
+        try {
+            const family = await requireFamily(req, res);
+            if (!family) return;
+            const extra = {};
+            const assignee = await familyAssignee(family.familyId, req.body);
+            if (assignee.error) return invalidInput(res, assignee.error);
+            if ("value" in assignee) extra.assignee_id = assignee.value;
+            const subGroup = await readSubGroup(req, "family", family.familyId);
+            if (subGroup.error) return invalidInput(res, subGroup.error);
+            if ("value" in subGroup) extra.group_id = subGroup.value;
+            const moved = await moveTaskToFamily(req, res, family, extra);
+            if (moved) announceFamilyEntry(family.familyId, userId, moved.entryId, moved.name, extra.assignee_id);
+        } catch (err) {
+            serverError(res, err);
+        }
+        return;
+    }
     const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, TASK_NAME_MAX) : "";
     if (!name) return fail(res, 400, "NAME_REQUIRED", "Name is required");
-    const fields = readTaskExtras(req.body, SHARED_TASK_FIELDS);
+    const fields = readTaskExtras(req.body, FAMILY_TASK_FIELDS);
     if (fields.error) return invalidInput(res, fields.error);
     if (fields.values.due_time && !fields.values.due) return invalidInput(res, "due_time");
+    if (fields.values.kind === "event" && !fields.values.due) return invalidInput(res, "due");
+    if (!fields.values.due) delete fields.values.reminders;
     try {
         const family = await requireFamily(req, res);
         if (!family) return;
@@ -5122,24 +5526,36 @@ app.post(`${familyBase}/:id/tasks`, async (req, res) => {
         if ("value" in subGroup) fields.values.group_id = subGroup.value;
         const columns = ["family_id", "name", "added_by", ...Object.keys(fields.values)];
         const values = [family.familyId, name, userId, ...Object.values(fields.values)];
-        await pool.query(
-            `INSERT INTO family_tasks (${columns.join(", ")}) VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")})`,
+        const created = await pool.query(
+            `INSERT INTO family_tasks (${columns.join(", ")}) VALUES (${values.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING id, kind`,
             values
         );
+        // tasks only, not events (never ticked off by hand)
+        if (created.rows[0].kind !== "event") countLater(req, "task_created");
+        // an event entered afterwards is over right away
+        if (created.rows[0].kind === "event") await syncFamilyEvents("family_tasks.id = $1", [created.rows[0].id], false);
         await sendFamily(res, family.familyId, userId, 201);
         await notifyFamily(family.familyId);
+        announceFamilyEntry(family.familyId, userId, created.rows[0].id, name, fields.values.assignee_id);
     } catch (err) {
         serverError(res, err);
     }
 });
 
-// Change an entry: { done?, name?, assignee_id?, group_id? (testers), and any of SHARED_TASK_FIELDS (null clears one) }
+// A new entry in a family: the other members hear of it, whoever it was given to once (as given to them)
+function announceFamilyEntry(familyId, byId, entryId, name, assigneeId) {
+    noticeEntryAdded(pool, { place: "family", placeId: familyId, byId, entryId, name, skip: assigneeId ? [assigneeId] : [] });
+    noticeFamilyAssigned(pool, { familyId, entryId, name, byId, assigneeId });
+}
+
+// Change an entry: { done?, name?, assignee_id?, group_id?, and any of FAMILY_TASK_FIELDS (null clears one) }.
+// An event is done once it is over, never by hand; without a day an entry has no reminders.
 app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
     const userId = req.user.userId;
     const taskId = idParam(req.params.taskId);
     const { done } = req.body ?? {};
     const name = req.body?.name === undefined ? undefined : cleanText(req.body.name, TASK_NAME_MAX);
-    const fields = readTaskExtras(req.body, SHARED_TASK_FIELDS);
+    const fields = readTaskExtras(req.body, FAMILY_TASK_FIELDS);
     if (done !== undefined && typeof done !== "boolean") return fail(res, 400, "DONE_REQUIRED", "done must be true or false");
     if (name === null || (req.body?.name !== undefined && name === undefined)) return invalidInput(res, "name");
     if (fields.error) return invalidInput(res, fields.error);
@@ -5156,22 +5572,41 @@ app.patch(`${familyBase}/:id/tasks/:taskId`, async (req, res) => {
         const subGroup = await readSubGroup(req, "family", family.familyId);
         if (subGroup.error) return invalidInput(res, subGroup.error);
         if ("value" in subGroup) fields.values.group_id = subGroup.value;
-        const before = await pool.query("SELECT due FROM family_tasks WHERE id = $1 AND family_id = $2", [taskId, family.familyId]);
+        const before = await pool.query("SELECT name, due, kind, assignee_id, done FROM family_tasks WHERE id = $1 AND family_id = $2", [taskId, family.familyId]);
         if (before.rows.length === 0) return fail(res, 404, "TASK_NOT_FOUND", "Task not found");
-        // a time of day needs a day; taking the day away takes the time along
-        const due = "due" in fields.values ? fields.values.due : before.rows[0].due;
+        const entry = before.rows[0];
+        // a time of day needs a day; taking the day away takes the time and the reminders along
+        const due = "due" in fields.values ? fields.values.due : entry.due;
         if (fields.values.due_time && !due) return invalidInput(res, "due_time");
         if (!due && !("due_time" in fields.values)) fields.values.due_time = null;
+        if (!due) fields.values.reminders = [];
+        // an event happens on a day and is done once it's over, never by hand
+        const kind = fields.values.kind ?? entry.kind;
+        if (kind === "event" && !due) return invalidInput(res, "due");
+        if (kind === "event" && done !== undefined && name === undefined && Object.keys(fields.values).length === 0
+            && req.body?.assignee_id === undefined && req.body?.group_id === undefined) {
+            return fail(res, 400, "EVENT_NOT_DONE_BY_HAND", "An event is done once it is over");
+        }
+        const setDone = kind === "event" ? null : done ?? null;
 
-        const values = [taskId, done ?? null, name ?? null];
-        const sets = ["done = COALESCE($2, done)", "name = COALESCE($3, name)"];
+        const values = [taskId, setDone, name ?? null, userId];
+        // (push_sent_for stays: a moved entry reminds again by itself, see PICK_DUE_FAMILY_ENTRIES,
+        // and an edit that keeps the time must not remind everybody once more)
+        const sets = ["done = COALESCE($2, done)", "name = COALESCE($3, name)", ...doneBySets("$2", "$4")];
         for (const [column, value] of Object.entries(fields.values)) {
             values.push(value);
             sets.push(`${column} = $${values.length}`);
         }
         await pool.query(`UPDATE family_tasks SET ${sets.join(", ")} WHERE id = $1`, values);
+        if (setDone === true && !entry.done) countLater(req, "task_done");
+        // a moved event can be over (or open again)
+        if (kind === "event") await syncFamilyEvents("family_tasks.id = $1", [taskId], false);
         await sendFamily(res, family.familyId, userId);
         await notifyFamily(family.familyId);
+        // given to somebody else than before (and not to myself): they hear of it
+        if (fields.values.assignee_id && fields.values.assignee_id !== entry.assignee_id) {
+            noticeFamilyAssigned(pool, { familyId: family.familyId, entryId: taskId, name: name ?? entry.name, byId: userId, assigneeId: fields.values.assignee_id });
+        }
     } catch (err) {
         serverError(res, err);
     }
@@ -5242,6 +5677,7 @@ app.post(`${familyBase}/:id/messages`, messageLimiter, async (req, res) => {
         );
         const message = toFamilyMessage(result.rows[0]);
         res.status(201).json(message);
+        pushChat(pool, { place: "family", placeId: family.familyId, byId: userId, text });
         for (const id of await familyMemberIds(family.familyId)) {
             realtime.toUser(id, "family:message", { familyId: family.familyId, message });
         }
@@ -5394,10 +5830,45 @@ app.delete("/api/event-types/:id", async (req, res) => {
 //   events:    { ms, count, days: [{ day, ms }], types: [{ id, name, color, ms, count }] }
 //              past events (time = their duration), per type; id null = without a type
 //   groups:    [{ name, color, ms }]  focus per group, the six biggest
+//   collections (testers, in place of groups): [{ id, name, emoji, color, ms }] focus on the
+//              tasks of each collection (as booked on them in the sessions), the six biggest
 //   tasksDone: tasks ticked off in the period (events don't count)
 //   firstDay:  the first day with anything at all, to draw "everything" from there
+//   together:  { teamMs, places: [{ kind, id, name, emoji, color, done, events }], done: [{ id, name, completedAt, where }] }
+// Work in sessions and families counts too (events and tasksDone): their tasks I ticked off or
+// that were given to me, their events I added or that were given to me (once over). A session's
+// copy of one of my own tasks / events isn't counted twice.
 const STATS_DAY = /^\d{4}-\d{2}-\d{2}$/;
 const STATS_MAX_DAYS = 3700;
+const STATS_TOGETHER_PLACES = 8;
+const STATS_TOGETHER_DONE = 50;
+// shared_done / shared_events (+ _in: in the period) for the user in $1, period $2–$3, after `me`
+const STATS_SHARED_CTES = `
+    mine_elsewhere AS (SELECT id FROM tasks WHERE user_id = $1),
+    shared_done AS (
+        SELECT 'family' AS place, family_id AS place_id, id, name, completed_at FROM family_tasks
+        WHERE kind = 'task' AND done AND completed_at IS NOT NULL AND (done_by = $1 OR assignee_id = $1)
+        UNION ALL
+        SELECT 'session', session_id, id, name, completed_at FROM shared_session_tasks
+        WHERE kind = 'task' AND done AND completed_at IS NOT NULL AND (done_by = $1 OR assignee_id = $1)
+            AND (source_task_id IS NULL OR source_task_id NOT IN (SELECT id FROM mine_elsewhere))
+    ),
+    shared_done_in AS (
+        SELECT shared_done.* FROM shared_done, me
+        WHERE ($2::date IS NULL OR (completed_at AT TIME ZONE me.tz)::date >= $2::date)
+            AND ($3::date IS NULL OR (completed_at AT TIME ZONE me.tz)::date <= $3::date)
+    ),
+    shared_events AS (
+        SELECT 'family' AS place, family_id AS place_id, due AS day, COALESCE(duration_minutes, 0)::bigint * 60000 AS ms FROM family_tasks
+        WHERE kind = 'event' AND done AND (added_by = $1 OR assignee_id = $1)
+        UNION ALL
+        SELECT 'session', session_id, due, COALESCE(duration_minutes, 0)::bigint * 60000 FROM shared_session_tasks
+        WHERE kind = 'event' AND done AND (added_by = $1 OR assignee_id = $1)
+            AND (source_task_id IS NULL OR source_task_id NOT IN (SELECT id FROM mine_elsewhere))
+    ),
+    shared_events_in AS (
+        SELECT * FROM shared_events WHERE ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)
+    )`;
 
 app.get("/api/stats", async (req, res) => {
     const userId = req.user.userId;
@@ -5427,19 +5898,26 @@ app.get("/api/stats", async (req, res) => {
             focus_in AS (
                 SELECT * FROM focus WHERE ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)
             ),
+            ${FOCUS_DAYS_CTES},
+            focus_days_in AS (
+                SELECT * FROM focus_days WHERE ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)
+            ),
+            ${STATS_SHARED_CTES},
             events AS (
                 SELECT tasks.due AS day, COALESCE(tasks.duration_minutes, 0)::bigint * 60000 AS ms, tasks.event_type_id
                 FROM tasks
                 WHERE tasks.user_id = $1 AND tasks.kind = 'event' AND tasks.done
+                -- a session's or family's event has no type of mine
+                UNION ALL SELECT day, ms, NULL FROM shared_events
             ),
             events_in AS (
                 SELECT * FROM events WHERE ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)
             )
             SELECT
                 (SELECT to_char((now() AT TIME ZONE tz)::date, 'YYYY-MM-DD') FROM me) AS today,
-                (SELECT to_char(min(day), 'YYYY-MM-DD') FROM (SELECT day FROM focus UNION ALL SELECT day FROM events) AS all_days) AS first_day,
+                (SELECT to_char(min(day), 'YYYY-MM-DD') FROM (SELECT day FROM focus_days UNION ALL SELECT day FROM events) AS all_days) AS first_day,
                 (SELECT COALESCE(json_agg(json_build_object('day', to_char(day, 'YYYY-MM-DD'), 'ms', ms, 'n', n) ORDER BY day), '[]')
-                    FROM (SELECT day, sum(ms) AS ms, count(*) AS n FROM focus_in GROUP BY day) AS d) AS focus_days,
+                    FROM focus_days_in) AS focus_days,
                 (SELECT COALESCE(json_agg(json_build_object('day', to_char(day, 'YYYY-MM-DD'), 'ms', ms, 'n', n) ORDER BY day), '[]')
                     FROM (SELECT day, sum(ms) AS ms, count(*) AS n FROM events_in GROUP BY day) AS d) AS event_days,
                 (SELECT COALESCE(json_agg(json_build_object('id', id, 'name', name, 'color', color, 'ms', ms, 'count', n) ORDER BY ms DESC, n DESC), '[]')
@@ -5454,10 +5932,59 @@ app.get("/api/stats", async (req, res) => {
                 (SELECT count(*)::int FROM tasks, me
                     WHERE tasks.user_id = $1 AND tasks.kind = 'task' AND tasks.done AND tasks.completed_at IS NOT NULL
                         AND ($2::date IS NULL OR (tasks.completed_at AT TIME ZONE me.tz)::date >= $2::date)
-                        AND ($3::date IS NULL OR (tasks.completed_at AT TIME ZONE me.tz)::date <= $3::date)) AS tasks_done`,
+                        AND ($3::date IS NULL OR (tasks.completed_at AT TIME ZONE me.tz)::date <= $3::date))
+                    + (SELECT count(*)::int FROM shared_done_in) AS tasks_done`,
             [userId, from, to]
         );
         const row = result.rows[0];
+        const together = (await pool.query(
+            `WITH me AS (SELECT COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = $1),
+            ${STATS_SHARED_CTES},
+            counted AS (
+                SELECT place, place_id, count(*)::int AS done, 0 AS events FROM shared_done_in GROUP BY place, place_id
+                UNION ALL
+                SELECT place, place_id, 0, count(*)::int FROM shared_events_in GROUP BY place, place_id
+            ),
+            places AS (
+                SELECT counted.place, counted.place_id, sum(counted.done)::int AS done, sum(counted.events)::int AS events,
+                    COALESCE(families.name, shared_sessions.name) AS name, families.emoji, families.color
+                FROM counted
+                LEFT JOIN families ON counted.place = 'family' AND families.id = counted.place_id
+                LEFT JOIN shared_sessions ON counted.place = 'session' AND shared_sessions.id = counted.place_id
+                GROUP BY counted.place, counted.place_id, families.name, shared_sessions.name, families.emoji, families.color
+            )
+            SELECT
+                (SELECT COALESCE(sum(time_ms), 0)::bigint FROM shared_time_days
+                    WHERE user_id = $1 AND ($2::date IS NULL OR day >= $2::date) AND ($3::date IS NULL OR day <= $3::date)) AS team_ms,
+                (SELECT COALESCE(json_agg(json_build_object('kind', place, 'id', place_id, 'name', name, 'emoji', emoji, 'color', color,
+                        'done', done, 'events', events) ORDER BY done + events DESC, name), '[]')
+                    FROM (SELECT * FROM places WHERE name IS NOT NULL ORDER BY done + events DESC, name LIMIT ${STATS_TOGETHER_PLACES}) AS p) AS places,
+                (SELECT COALESCE(json_agg(json_build_object('id', d.id, 'name', d.name, 'completedAt', d.completed_at,
+                        'where', json_build_object('kind', d.place, 'id', d.place_id, 'name', COALESCE(families.name, shared_sessions.name)))
+                        ORDER BY d.completed_at DESC), '[]')
+                    FROM (SELECT * FROM shared_done_in ORDER BY completed_at DESC LIMIT ${STATS_TOGETHER_DONE}) AS d
+                    LEFT JOIN families ON d.place = 'family' AND families.id = d.place_id
+                    LEFT JOIN shared_sessions ON d.place = 'session' AND shared_sessions.id = d.place_id) AS done`,
+            [userId, from, to]
+        )).rows[0];
+        const collections = hasTesterAccess(req.account) ? (await pool.query(
+            `WITH me AS (SELECT COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = $1),
+            focus_in AS (
+                SELECT sessions.id FROM sessions, me
+                WHERE sessions.user_id = $1 AND sessions.date IS NOT NULL
+                    AND ($2::date IS NULL OR ((sessions.date AT TIME ZONE current_setting('TimeZone')) AT TIME ZONE me.tz)::date >= $2::date)
+                    AND ($3::date IS NULL OR ((sessions.date AT TIME ZONE current_setting('TimeZone')) AT TIME ZONE me.tz)::date <= $3::date)
+            )
+            SELECT collections.id, collections.name, collections.emoji, collections.color, sum(session_tasks.time_ms)::bigint AS ms
+            FROM session_tasks
+            JOIN focus_in ON focus_in.id = session_tasks.session_id
+            JOIN collection_items ON collection_items.task_id = session_tasks.task_id
+            JOIN collections ON collections.id = collection_items.collection_id AND collections.user_id = $1
+            GROUP BY collections.id
+            HAVING sum(session_tasks.time_ms) > 0
+            ORDER BY ms DESC LIMIT 6`,
+            [userId, from, to]
+        )).rows : null;
         const days = (list) => list.map(d => ({ day: d.day, ms: Number(d.ms), count: Number(d.n) }));
         const focusDays = days(row.focus_days);
         const eventDays = days(row.event_days);
@@ -5475,7 +6002,9 @@ app.get("/api/stats", async (req, res) => {
                 types: row.event_types.map(type => ({ id: type.id, name: type.name, color: type.color, ms: Number(type.ms), count: Number(type.count) })),
             },
             groups: row.groups.map(group => ({ name: group.name, color: group.color, ms: Number(group.ms) })),
+            ...(collections ? { collections: collections.map(c => ({ id: c.id, name: c.name, emoji: c.emoji, color: c.color, ms: Number(c.ms) })) } : {}),
             tasksDone: row.tasks_done,
+            together: { teamMs: Number(together.team_ms), places: together.places, done: together.done },
         });
     } catch (err) {
         serverError(res, err);
@@ -5682,7 +6211,7 @@ app.delete("/api/feed/:id/cheer", (req, res) => setCheer(req, res, false));
 // ---------- Push notifications ----------
 // A device (browser) turns them on in the app's settings: it asks its push service for an
 // address and hands it over here with its keys (see utils/push.js). One row per device; the
-// account signed in there last owns it. Kinds per device: plan, digest, messages, social.
+// account signed in there last owns it. Kinds per device: plan, digest, messages, social, groups.
 
 // Who did something, for the text of a push: { id, username, displayName }
 async function pushSender(userId) {
@@ -5721,7 +6250,7 @@ app.get("/api/push/key", (req, res) => {
     res.json({ publicKey: PUSH_PUBLIC_KEY || null, fcm: PUSH_FCM_ENABLED });
 });
 
-// This device wants pushes (again): { endpoint, keys: { p256dh, auth }, kinds?: { plan, digest, messages, social } }.
+// This device wants pushes (again): { endpoint, keys: { p256dh, auth }, kinds?: { plan, digest, messages, social, groups } }.
 // A device of the Android app sends { endpoint: 'fcm:<token>', kinds? } without keys.
 // Also called on every start of the app, so a renewed address or another account on the device
 // is picked up. Kinds not sent stay as they were (all on for a new device). Answers { kinds }.
@@ -5737,11 +6266,11 @@ app.put("/api/push/subscription", async (req, res) => {
     const wanted = PUSH_KINDS.map(kind => kinds?.[kind] ?? null);
     try {
         const saved = await pool.query(
-            `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, plan, digest, messages, social)
-            VALUES ($1, $2, $3, $4, COALESCE($5, true), COALESCE($6, true), COALESCE($7, true), COALESCE($8, true))
+            // one column per kind, $5 … in the order of PUSH_KINDS
+            `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, ${PUSH_KINDS.join(", ")})
+            VALUES ($1, $2, $3, $4, ${PUSH_KINDS.map((_, i) => `COALESCE($${i + 5}::boolean, true)`).join(", ")})
             ON CONFLICT (endpoint) DO UPDATE SET user_id = EXCLUDED.user_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth,
-                plan = COALESCE($5, push_subscriptions.plan), digest = COALESCE($6, push_subscriptions.digest),
-                messages = COALESCE($7, push_subscriptions.messages), social = COALESCE($8, push_subscriptions.social),
+                ${PUSH_KINDS.map((kind, i) => `${kind} = COALESCE($${i + 5}::boolean, push_subscriptions.${kind})`).join(", ")},
                 updated_at = now()
             RETURNING ${PUSH_KINDS.join(", ")}`,
             [userId, endpoint, app ? null : keys.p256dh, app ? null : keys.auth, ...wanted]
@@ -5832,7 +6361,7 @@ const proChanged = (userId) => {
 };
 
 // My Pro: { active, gift, until, subscription, canManageStripe, stripe, play, prices, playAccountId }
-app.get("/api/billing", authenticateToken, async (req, res) => {
+app.get("/api/billing", authenticateToken, requireProBilling, async (req, res) => {
     try {
         res.json({ ...(await billing.proStatus(pool, req.user.userId)), prices: PRO_PRICES, playAccountId: billing.playAccountId(req.user.userId) });
     } catch (err) {
@@ -5841,7 +6370,7 @@ app.get("/api/billing", authenticateToken, async (req, res) => {
 });
 
 // Stripe Checkout for { plan: 'monthly' | 'yearly' }: { url } to send the browser to
-app.post("/api/billing/checkout", authenticateToken, billingLimiter, async (req, res) => {
+app.post("/api/billing/checkout", authenticateToken, requireProBilling, billingLimiter, async (req, res) => {
     if (!billing.STRIPE_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
     const plan = req.body?.plan;
     if (!billing.PLANS.includes(plan)) return invalidInput(res, "plan");
@@ -5857,7 +6386,7 @@ app.post("/api/billing/checkout", authenticateToken, billingLimiter, async (req,
 });
 
 // Stripe's customer portal (change plan, payment method, cancel, invoices): { url }
-app.post("/api/billing/portal", authenticateToken, billingLimiter, async (req, res) => {
+app.post("/api/billing/portal", authenticateToken, requireProBilling, billingLimiter, async (req, res) => {
     if (!billing.STRIPE_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
     try {
         const url = await billing.stripePortal(pool, { userId: req.user.userId, frontendUrl: FRONTEND_URL });
@@ -5885,7 +6414,7 @@ app.post("/api/billing/stripe-webhook", express.raw({ type: "application/json", 
 });
 
 // The Android app bought (or restores) Pro in Google Play: { purchaseToken }
-app.post("/api/billing/play", authenticateToken, billingLimiter, async (req, res) => {
+app.post("/api/billing/play", authenticateToken, requireProBilling, billingLimiter, async (req, res) => {
     if (!billing.PLAY_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
     const token = req.body?.purchaseToken;
     if (typeof token !== "string" || token.length < 10 || token.length > 1000 || !/^[A-Za-z0-9._:-]+$/.test(token)) return invalidInput(res, "purchaseToken");
@@ -6169,6 +6698,185 @@ app.post("/api/routines/:id/runs", async (req, res) => {
     }
 });
 
+// ---------- Reminders (testers) ----------
+// A reminder is a text and a time, no task: once { text, at: ISO time } or on weekdays
+// { text, days: [1..7] (Monday = 1), atTime: "HH:MM" } in my time zone. Pushed at its time
+// (utils/focus.js); the Android app rings them itself as an alarm clock and tells the server so
+// for its device (PUT /api/tester/reminders/device), which then gets no push for them.
+// "Erledigt" ends a once reminder (a weekly one goes on), "später" rings again in N minutes.
+const REMINDER_MAX = 100;
+const REMINDER_TEXT_MAX = 200;
+const REMINDER_AHEAD_MS = 2 * 366 * 24 * 60 * 60 * 1000;
+
+// { values } (columns) or { field } (the invalid one). Partial: only what was sent; a new time
+// replaces the whole schedule (once <-> weekly) and starts it afresh.
+function cleanReminder(body, partial) {
+    const out = {};
+    if (!partial || body.text !== undefined) {
+        const text = cleanText(body.text, REMINDER_TEXT_MAX);
+        if (!text) return { field: "text" };
+        out.text = text;
+    }
+    const once = body.at !== undefined;
+    const weekly = body.days !== undefined || body.atTime !== undefined;
+    if (once && weekly) return { field: "at" };
+    if (!partial && !once && !weekly) return { field: "at" };
+    if (once) {
+        const at = typeof body.at === "string" && body.at.length <= 40 ? Date.parse(body.at) : NaN;
+        if (Number.isNaN(at) || at < Date.now() - 60 * 1000 || at > Date.now() + REMINDER_AHEAD_MS) return { field: "at" };
+        Object.assign(out, { at: new Date(at).toISOString(), days: null, at_time: null });
+    }
+    if (weekly) {
+        const days = body.days;
+        if (!Array.isArray(days) || days.length < 1 || days.length > 7 || days.some(day => !Number.isInteger(day) || day < 1 || day > 7)) return { field: "days" };
+        if (typeof body.atTime !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(body.atTime)) return { field: "atTime" };
+        Object.assign(out, { at: null, days: [...new Set(days)].sort(), at_time: body.atTime });
+    }
+    return { values: out };
+}
+
+const REMINDER_COLUMNS = `id, text, at, days, to_char(at_time, 'HH24:MI') AS at_time_text, snoozed_until, done_at, fired_for, created_at`;
+const reminderJson = (row) => ({
+    id: row.id,
+    text: row.text,
+    at: row.at ?? null,
+    days: row.days ?? null,
+    atTime: row.at_time_text ?? null,
+    snoozedUntil: row.snoozed_until ?? null,
+    doneAt: row.done_at ?? null,
+    firedFor: row.fired_for ?? null,
+    createdAt: row.created_at,
+});
+const remindersChanged = (userId) => realtime.toUser(userId, "reminders:changed", {});
+
+// the open ones and those done in the last 7 days; done ones older than 30 days go
+app.get("/api/tester/reminders", async (req, res) => {
+    try {
+        await pool.query("DELETE FROM reminders WHERE user_id = $1 AND done_at < now() - interval '30 days'", [req.user.userId]);
+        const result = await pool.query(
+            `SELECT ${REMINDER_COLUMNS} FROM reminders
+            WHERE user_id = $1 AND (done_at IS NULL OR done_at > now() - interval '7 days')
+            ORDER BY done_at DESC NULLS FIRST, id`,
+            [req.user.userId]
+        );
+        res.json(result.rows.map(reminderJson));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.post("/api/tester/reminders", async (req, res) => {
+    const { field, values } = cleanReminder(req.body ?? {}, false);
+    if (field) return invalidInput(res, field);
+    try {
+        const count = await pool.query("SELECT count(*)::int AS n FROM reminders WHERE user_id = $1 AND done_at IS NULL", [req.user.userId]);
+        if (count.rows[0].n >= REMINDER_MAX) return res.status(409).json({ error: "Too many reminders", code: "REMINDER_LIMIT" });
+        const saved = await pool.query(
+            `INSERT INTO reminders (user_id, text, at, days, at_time) VALUES ($1, $2, $3, $4::smallint[], $5)
+            RETURNING ${REMINDER_COLUMNS}`,
+            [req.user.userId, values.text, values.at, values.days, values.at_time]
+        );
+        remindersChanged(req.user.userId);
+        res.status(201).json(reminderJson(saved.rows[0]));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// This device rings reminders itself (the Android app with exact alarms allowed): { endpoint, alarms }.
+// Answers { alarms, known } (known: the device has push on; without, nothing is pushed to it anyway).
+app.put("/api/tester/reminders/device", async (req, res) => {
+    const { endpoint, alarms } = req.body ?? {};
+    if (typeof endpoint !== "string" || endpoint.length < 1 || endpoint.length > 4100) return invalidInput(res, "endpoint");
+    if (typeof alarms !== "boolean") return invalidInput(res, "alarms");
+    try {
+        const result = await pool.query(
+            "UPDATE push_subscriptions SET alarms = $3 WHERE endpoint = $1 AND user_id = $2 RETURNING alarms",
+            [endpoint, req.user.userId, alarms]
+        );
+        res.json({ alarms: result.rows[0]?.alarms ?? alarms, known: result.rows.length > 0 });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.patch("/api/tester/reminders/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Reminder");
+    const { field, values } = cleanReminder(req.body ?? {}, true);
+    if (field) return invalidInput(res, field);
+    const columns = Object.keys(values);
+    if (columns.length === 0) return invalidInput(res, "text");
+    const sets = columns.map((column, i) => `${column} = $${i + 3}${column === "days" ? "::smallint[]" : ""}`);
+    // a new time rings afresh (also a reminder that was done)
+    if (values.at !== undefined) sets.push("fired_for = NULL", "snoozed_until = NULL", "done_at = NULL");
+    try {
+        const result = await pool.query(
+            `UPDATE reminders SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 AND user_id = $2 RETURNING ${REMINDER_COLUMNS}`,
+            [id, req.user.userId, ...columns.map(column => values[column])]
+        );
+        if (result.rows.length === 0) return notFound(res, "Reminder");
+        remindersChanged(req.user.userId);
+        res.json(reminderJson(result.rows[0]));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.delete("/api/tester/reminders/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Reminder");
+    try {
+        const result = await pool.query("DELETE FROM reminders WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
+        if (result.rows.length === 0) return notFound(res, "Reminder");
+        remindersChanged(req.user.userId);
+        res.json({ deleted: id });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// "Erledigt": a once reminder is over; a weekly one only drops its snooze. Either way the time
+// that is ringing now counts as sent (no push follows on the other devices).
+app.post("/api/tester/reminders/:id/done", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Reminder");
+    try {
+        const result = await pool.query(
+            `UPDATE reminders SET done_at = CASE WHEN at IS NOT NULL THEN now() ELSE NULL END,
+                snoozed_until = NULL, fired_for = GREATEST(fired_for, now()), updated_at = now()
+            WHERE id = $1 AND user_id = $2 RETURNING ${REMINDER_COLUMNS}`,
+            [id, req.user.userId]
+        );
+        if (result.rows.length === 0) return notFound(res, "Reminder");
+        remindersChanged(req.user.userId);
+        res.json(reminderJson(result.rows[0]));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// "Später": rings again in { minutes } (1–120)
+app.post("/api/tester/reminders/:id/snooze", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Reminder");
+    const minutes = req.body?.minutes;
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 120) return invalidInput(res, "minutes");
+    try {
+        const result = await pool.query(
+            `UPDATE reminders SET snoozed_until = now() + make_interval(mins => $3), done_at = NULL,
+                fired_for = GREATEST(fired_for, now()), updated_at = now()
+            WHERE id = $1 AND user_id = $2 RETURNING ${REMINDER_COLUMNS}`,
+            [id, req.user.userId, minutes]
+        );
+        if (result.rows.length === 0) return notFound(res, "Reminder");
+        remindersChanged(req.user.userId);
+        res.json(reminderJson(result.rows[0]));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
 // ---------- Notebook (Fokusraum) ----------
 // Notes of my own, on their own or about a task: { title, body, taskId?, pinned, attachments }.
 // attachments: [{ kind: 'link', url, title? } | { kind: 'image', data: 'data:image/…;base64,…', name? }]
@@ -6205,7 +6913,7 @@ function cleanAttachments(list) {
     const clean = [];
     for (const item of list) {
         if (item?.kind === "link") {
-            if (typeof item.url !== "string" || item.url.length > 2000 || !LINK_URL.test(item.url)) return undefined;
+            if (typeof item.url !== "string" || item.url.length > 2000 || !LINK_URL.test(item.url) || hasNul(item.url)) return undefined;
             const title = cleanText(item.title, 120);
             if (title === undefined) return undefined;
             clean.push({ kind: "link", url: item.url, ...(title ? { title } : {}) });
@@ -6230,7 +6938,7 @@ function cleanNote(body, partial) {
         out.title = title ?? "";
     }
     if (!partial || body.body !== undefined) {
-        if (body.body !== undefined && body.body !== null && (typeof body.body !== "string" || body.body.length > NOTEBOOK_BODY_MAX)) return { field: "body" };
+        if (body.body !== undefined && body.body !== null && (typeof body.body !== "string" || body.body.length > NOTEBOOK_BODY_MAX || hasNul(body.body))) return { field: "body" };
         out.body = body.body ?? "";
     }
     if (body.pinned !== undefined) {
@@ -6246,9 +6954,65 @@ function cleanNote(body, partial) {
         if (!attachments) return { field: "attachments" };
         out.attachments = JSON.stringify(attachments);
     }
+    // the notes area's fields (testers first: see NOTE_TESTER_COLUMNS)
+    if (body.folderId !== undefined) {
+        if (body.folderId !== null && !idParam(body.folderId)) return { field: "folderId" };
+        out.folder_id = body.folderId === null ? null : idParam(body.folderId);
+    }
+    if (body.tags !== undefined) {
+        const tags = cleanTags(body.tags);
+        if (!tags) return { field: "tags" };
+        out.tags = tags;
+    }
+    if (body.color !== undefined) {
+        if (body.color !== null && cleanColor(body.color) === undefined) return { field: "color" };
+        out.color = body.color;
+    }
+    if (body.archived !== undefined) {
+        if (typeof body.archived !== "boolean") return { field: "archived" };
+        out.archived = body.archived;
+    }
+    if (body.trashed !== undefined) {
+        if (typeof body.trashed !== "boolean") return { field: "trashed" };
+        out.trashed_at = body.trashed ? new Date().toISOString() : null;
+    }
     if (!partial && !out.title && !out.body.trim() && !(body.attachments?.length)) return { field: "body" };
     return { values: out };
 }
+
+// Tags: single words of my own ("#" in front dropped), the same word in any case only once
+const NOTE_TAGS_MAX = 10;
+const NOTE_TAG_MAX = 30;
+function cleanTags(list) {
+    if (!Array.isArray(list) || list.length > NOTE_TAGS_MAX) return undefined;
+    const tags = [];
+    for (const item of list) {
+        if (typeof item !== "string") return undefined;
+        const tag = item.trim().replace(/^#+/, "");
+        if (!tag || tag.length > NOTE_TAG_MAX || /[\s,]/.test(tag) || hasNul(tag)) return undefined;
+        if (!tags.some(seen => seen.toLowerCase() === tag.toLowerCase())) tags.push(tag);
+    }
+    return tags;
+}
+
+// The notes area is in test: only testers may set these (everybody else's notes keep them empty)
+const NOTE_TESTER_COLUMNS = ["folder_id", "tags", "color", "archived", "trashed_at"];
+const usesTesterNoteFields = (values) => NOTE_TESTER_COLUMNS.some(column => column in values);
+const testersOnly = (res) => res.status(403).json({ error: "Only for testers", code: "TESTER_REQUIRED" });
+// a change of these says the note was edited (updated_at); moving it around doesn't
+const NOTE_CONTENT_COLUMNS = ["title", "body", "attachments", "task_id", "tags", "color"];
+
+// a folder a note goes into must be mine
+async function folderMine(folderId, userId) {
+    if (!folderId) return true;
+    const check = await pool.query("SELECT 1 FROM note_folders WHERE id = $1 AND user_id = $2", [folderId, userId]);
+    return check.rows.length > 0;
+}
+
+// Notes stay in the trash this long, then they go for good (checked whenever the list is loaded)
+const NOTE_TRASH_DAYS = 30;
+const purgeOldTrash = (userId) => pool.query(
+    `DELETE FROM notebook_notes WHERE user_id = $1 AND trashed_at < now() - interval '${NOTE_TRASH_DAYS} days'`, [userId]);
 
 // full: with the pictures' data; otherwise only that they are there
 const noteJson = (row, full) => ({
@@ -6258,6 +7022,11 @@ const noteJson = (row, full) => ({
     taskId: row.task_id,
     pinned: row.pinned,
     attachments: full ? row.attachments : row.attachments.map(item => item.kind === "image" ? { kind: "image", name: item.name ?? null } : item),
+    folderId: row.folder_id,
+    tags: row.tags ?? [],
+    color: row.color,
+    archived: row.archived,
+    trashedAt: row.trashed_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
 });
@@ -6269,10 +7038,14 @@ async function taskVisible(taskId, userId) {
     return check.rows.length > 0;
 }
 
+// the notes, without the ones in the trash (?trash=1: only those)
 app.get("/api/notebook", async (req, res) => {
+    const trash = req.query.trash === "1";
     try {
+        await purgeOldTrash(req.user.userId);
         const result = await pool.query(
-            "SELECT * FROM notebook_notes WHERE user_id = $1 ORDER BY pinned DESC, updated_at DESC",
+            `SELECT * FROM notebook_notes WHERE user_id = $1 AND trashed_at IS ${trash ? "NOT NULL" : "NULL"}
+            ORDER BY pinned DESC, updated_at DESC`,
             [req.user.userId]
         );
         res.json(result.rows.map(row => noteJson(row, false)));
@@ -6296,15 +7069,18 @@ app.get("/api/notebook/:id", async (req, res) => {
 app.post("/api/notebook", async (req, res) => {
     const { field, values } = cleanNote(req.body ?? {}, false);
     if (field) return invalidInput(res, field);
+    if (usesTesterNoteFields(values) && !hasTesterAccess(req.account)) return testersOnly(res);
     try {
         if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");
+        if (!await folderMine(values.folder_id, req.user.userId)) return notFound(res, "Folder");
         const count = await pool.query("SELECT count(*)::int AS n FROM notebook_notes WHERE user_id = $1", [req.user.userId]);
         if (count.rows[0].n >= NOTEBOOK_MAX) return res.status(409).json({ error: "Too many notes", code: "NOTEBOOK_LIMIT" });
         if (values.attachments && !await notebookHasRoom(req.user.userId, null, values.attachments)) return storageFull(res);
         const saved = await pool.query(
-            `INSERT INTO notebook_notes (user_id, task_id, title, body, pinned, attachments)
-            VALUES ($1, $2, $3, $4, COALESCE($5, false), COALESCE($6::jsonb, '[]'::jsonb)) RETURNING *`,
-            [req.user.userId, values.task_id ?? null, values.title, values.body, values.pinned ?? null, values.attachments ?? null]
+            `INSERT INTO notebook_notes (user_id, task_id, title, body, pinned, attachments, folder_id, tags, color)
+            VALUES ($1, $2, $3, $4, COALESCE($5, false), COALESCE($6::jsonb, '[]'::jsonb), $7, COALESCE($8, '{}'::text[]), $9) RETURNING *`,
+            [req.user.userId, values.task_id ?? null, values.title, values.body, values.pinned ?? null, values.attachments ?? null,
+                values.folder_id ?? null, values.tags ?? null, values.color ?? null]
         );
         res.status(201).json(noteJson(saved.rows[0], true));
     } catch (err) {
@@ -6317,17 +7093,22 @@ app.put("/api/notebook/:id", async (req, res) => {
     if (!id) return notFound(res, "Note");
     const { field, values } = cleanNote(req.body ?? {}, true);
     if (field) return invalidInput(res, field);
+    if (usesTesterNoteFields(values) && !hasTesterAccess(req.account)) return testersOnly(res);
     const columns = Object.keys(values);
     try {
         if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");
+        if (!await folderMine(values.folder_id, req.user.userId)) return notFound(res, "Folder");
         if (values.attachments && !await notebookHasRoom(req.user.userId, id, values.attachments)) return storageFull(res);
         const sets = columns.map((column, i) => `${column} = $${i + 3}${column === "attachments" ? "::jsonb" : ""}`);
+        if (sets.length === 0 || columns.some(column => NOTE_CONTENT_COLUMNS.includes(column))) sets.push("updated_at = now()");
         const result = await pool.query(
-            `UPDATE notebook_notes SET ${[...sets, "updated_at = now()"].join(", ")} WHERE id = $1 AND user_id = $2 RETURNING *`,
+            `UPDATE notebook_notes SET ${sets.join(", ")} WHERE id = $1 AND user_id = $2 RETURNING *`,
             [id, req.user.userId, ...columns.map(column => values[column])]
         );
         if (result.rows.length === 0) return notFound(res, "Note");
         res.json(noteJson(result.rows[0], true));
+        // the boards it is pinned to show it as it is now
+        if (columns.some(column => NOTE_CONTENT_COLUMNS.includes(column) || column === "trashed_at")) notifyBoardsOfNote(id).catch(() => {});
     } catch (err) {
         serverError(res, err);
     }
@@ -6337,18 +7118,654 @@ app.delete("/api/notebook/:id", async (req, res) => {
     const id = idParam(req.params.id);
     if (!id) return notFound(res, "Note");
     try {
+        const boards = await boardsOfNote(id);
         const result = await pool.query("DELETE FROM notebook_notes WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
         if (result.rows.length === 0) return notFound(res, "Note");
+        res.json({ deleted: id });
+        for (const board of boards) notifyBoard(board.kind, board.id).catch(() => {});
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- boards: notes pinned in a family or a shared session ----------
+// A joined member pins one of their own notes (not in the trash) to the board of a family or of
+// an open shared session (board_notes). It stays their note: the others read it as it is now
+// (edits show there, the trash or deleting it takes it off) and can't change it. The note's
+// owner and the family's / session's owner take a note off the board. Notes of people who are
+// no longer in it aren't shown.
+//   GET    /api/families/:id/board | /api/shared-sessions/:id/board   the board (pictures without their data)
+//   GET    .../board/:pinId                                           one note with its pictures
+//   POST   .../board { noteId }                                       pin it (again: the same pin)
+//   DELETE .../board/:pinId                                           take it off
+//   GET    /api/notebook/:id/boards                                   where a note of mine is pinned
+// Live: "board:changed" { kind: 'family' | 'session', id } to the joined members.
+const BOARD_NOTES_MAX = 30;
+const BOARDS = {
+    family: { column: "family_id", members: "family_members", memberColumn: "family_id" },
+    session: { column: "session_id", members: "shared_session_members", memberColumn: "session_id" },
+};
+
+// The board I may look at (change: also pin to it), or null after answering the request
+async function boardAccess(kind, req, res, change = false) {
+    if (kind === "family") {
+        const family = await requireFamily(req, res);
+        return family && { kind, id: family.familyId, isOwner: family.isOwner };
+    }
+    const sessionId = idParam(req.params.id);
+    const membership = sessionId && await getMembership(sessionId, req.user.userId);
+    if (!membership || membership.status !== "joined") {
+        fail(res, 404, "SESSION_NOT_FOUND", "Session not found");
+        return null;
+    }
+    if (change && membership.ended_at) {
+        fail(res, 409, "SESSION_ENDED", "This session has ended");
+        return null;
+    }
+    return { kind, id: sessionId, isOwner: membership.owner_id === req.user.userId };
+}
+
+// The pins of a board that are shown (only pinId's with one), newest first
+async function loadBoard(kind, boardId, pinId = null) {
+    const { column, members, memberColumn } = BOARDS[kind];
+    const result = await pool.query(
+        `SELECT board_notes.id AS pin_id, board_notes.pinned_at, notebook_notes.id, notebook_notes.user_id,
+            notebook_notes.title, notebook_notes.body, notebook_notes.attachments, notebook_notes.color,
+            notebook_notes.updated_at, users.id AS owner_id, users.username AS owner_username, users.display_name AS owner_display_name
+        FROM board_notes
+        JOIN notebook_notes ON notebook_notes.id = board_notes.note_id
+        JOIN users ON users.id = notebook_notes.user_id
+        WHERE board_notes.${column} = $1 AND notebook_notes.trashed_at IS NULL
+            AND ($2::int IS NULL OR board_notes.id = $2)
+            AND EXISTS (SELECT 1 FROM ${members} AS member WHERE member.${memberColumn} = $1
+                AND member.user_id = notebook_notes.user_id AND member.status = 'joined')
+        ORDER BY board_notes.pinned_at DESC`,
+        [boardId, pinId]
+    );
+    return result.rows;
+}
+
+const boardNoteJson = (row, full, viewerId, isOwner) => ({
+    id: row.pin_id,
+    noteId: row.id,
+    title: row.title,
+    body: row.body,
+    color: row.color,
+    attachments: full ? row.attachments : row.attachments.map(item => item.kind === "image" ? { kind: "image", name: item.name ?? null } : item),
+    updatedAt: row.updated_at,
+    pinnedAt: row.pinned_at,
+    owner: publicUser(row, "owner_"),
+    mine: row.user_id === viewerId,
+    canRemove: row.user_id === viewerId || isOwner,
+});
+
+// The joined members of a board load it again
+async function notifyBoard(kind, boardId) {
+    const { members, memberColumn } = BOARDS[kind];
+    const result = await pool.query(`SELECT user_id FROM ${members} WHERE ${memberColumn} = $1 AND status = 'joined'`, [boardId]);
+    for (const row of result.rows) realtime.toUser(row.user_id, "board:changed", { kind, id: boardId });
+}
+
+async function boardsOfNote(noteId) {
+    const result = await pool.query("SELECT id, family_id, session_id FROM board_notes WHERE note_id = $1", [noteId]);
+    return result.rows.map(row => row.family_id
+        ? { kind: "family", id: row.family_id, pinId: row.id }
+        : { kind: "session", id: row.session_id, pinId: row.id });
+}
+
+async function notifyBoardsOfNote(noteId) {
+    for (const board of await boardsOfNote(noteId)) await notifyBoard(board.kind, board.id);
+}
+
+for (const [kind, base] of [["family", "/api/families"], ["session", "/api/shared-sessions"]]) {
+    app.get(`${base}/:id/board`, async (req, res) => {
+        try {
+            const board = await boardAccess(kind, req, res);
+            if (!board) return;
+            const rows = await loadBoard(kind, board.id);
+            res.json(rows.map(row => boardNoteJson(row, false, req.user.userId, board.isOwner)));
+        } catch (err) {
+            serverError(res, err);
+        }
+    });
+
+    app.get(`${base}/:id/board/:pinId`, async (req, res) => {
+        const pinId = idParam(req.params.pinId);
+        try {
+            const board = await boardAccess(kind, req, res);
+            if (!board) return;
+            const [row] = pinId ? await loadBoard(kind, board.id, pinId) : [];
+            if (!row) return notFound(res, "Note");
+            res.json(boardNoteJson(row, true, req.user.userId, board.isOwner));
+        } catch (err) {
+            serverError(res, err);
+        }
+    });
+
+    app.post(`${base}/:id/board`, async (req, res) => {
+        const noteId = idParam(req.body?.noteId);
+        if (!noteId) return invalidInput(res, "noteId");
+        try {
+            const board = await boardAccess(kind, req, res, true);
+            if (!board) return;
+            const note = await pool.query("SELECT 1 FROM notebook_notes WHERE id = $1 AND user_id = $2 AND trashed_at IS NULL", [noteId, req.user.userId]);
+            if (note.rows.length === 0) return notFound(res, "Note");
+            const { column } = BOARDS[kind];
+            const already = await pool.query(`SELECT id FROM board_notes WHERE ${column} = $1 AND note_id = $2`, [board.id, noteId]);
+            if (already.rows.length === 0) {
+                const count = await pool.query(`SELECT count(*)::int AS n FROM board_notes WHERE ${column} = $1`, [board.id]);
+                if (count.rows[0].n >= BOARD_NOTES_MAX) return fail(res, 409, "BOARD_FULL", "This board is full");
+            }
+            const saved = await pool.query(
+                `INSERT INTO board_notes (note_id, ${column}) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id`,
+                [noteId, board.id]
+            );
+            const pinId = saved.rows[0]?.id ?? already.rows[0]?.id;
+            const [row] = await loadBoard(kind, board.id, pinId);
+            res.status(saved.rows.length ? 201 : 200).json(boardNoteJson(row, false, req.user.userId, board.isOwner));
+            if (saved.rows.length) notifyBoard(kind, board.id).catch(() => {});
+        } catch (err) {
+            serverError(res, err);
+        }
+    });
+
+    app.delete(`${base}/:id/board/:pinId`, async (req, res) => {
+        const pinId = idParam(req.params.pinId);
+        try {
+            const board = await boardAccess(kind, req, res);
+            if (!board) return;
+            const { column } = BOARDS[kind];
+            const pin = pinId && await pool.query(
+                `SELECT notebook_notes.user_id FROM board_notes JOIN notebook_notes ON notebook_notes.id = board_notes.note_id
+                WHERE board_notes.id = $1 AND board_notes.${column} = $2`,
+                [pinId, board.id]
+            );
+            if (!pin || pin.rows.length === 0) return notFound(res, "Note");
+            if (pin.rows[0].user_id !== req.user.userId && !board.isOwner) {
+                return fail(res, 403, "NOT_ALLOWED", "Only the note's owner or the owner can take it off");
+            }
+            await pool.query("DELETE FROM board_notes WHERE id = $1", [pinId]);
+            res.json({ deleted: pinId });
+            notifyBoard(kind, board.id).catch(() => {});
+        } catch (err) {
+            serverError(res, err);
+        }
+    });
+}
+
+app.get("/api/notebook/:id/boards", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Note");
+    try {
+        const note = await pool.query("SELECT 1 FROM notebook_notes WHERE id = $1 AND user_id = $2", [id, req.user.userId]);
+        if (note.rows.length === 0) return notFound(res, "Note");
+        res.json(await boardsOfNote(id));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- the notes area: folders and the trash (testers first) ----------
+// The notes are the notebook's (above); testers can also sort them into folders, tag, colour,
+// archive and trash them. Folders: { id, name, emoji, notes } (notes = how many, not in the trash).
+const NOTE_FOLDERS_MAX = 50;
+const NOTE_FOLDER_NAME_MAX = 40;
+const EMOJI_MAX = 16;
+
+const folderJson = (row) => ({ id: row.id, name: row.name, emoji: row.emoji, notes: row.notes ?? 0, createdAt: row.created_at });
+const nameTaken = (err) => err.code === "23505";
+
+function cleanFolder(body, partial) {
+    const out = {};
+    if (!partial || body.name !== undefined) {
+        const name = cleanText(body.name, NOTE_FOLDER_NAME_MAX);
+        if (!name) return { field: "name" };
+        out.name = name;
+    }
+    if (body.emoji !== undefined) {
+        const emoji = cleanText(body.emoji, EMOJI_MAX);
+        if (emoji === undefined) return { field: "emoji" };
+        out.emoji = emoji;
+    }
+    return { values: out };
+}
+
+app.get("/api/tester/note-folders", async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT note_folders.*, (SELECT count(*)::int FROM notebook_notes
+                WHERE notebook_notes.folder_id = note_folders.id AND notebook_notes.trashed_at IS NULL) AS notes
+            FROM note_folders WHERE user_id = $1 ORDER BY lower(name)`,
+            [req.user.userId]
+        );
+        res.json(result.rows.map(folderJson));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.post("/api/tester/note-folders", async (req, res) => {
+    const { field, values } = cleanFolder(req.body ?? {}, false);
+    if (field) return invalidInput(res, field);
+    try {
+        const count = await pool.query("SELECT count(*)::int AS n FROM note_folders WHERE user_id = $1", [req.user.userId]);
+        if (count.rows[0].n >= NOTE_FOLDERS_MAX) return res.status(409).json({ error: "Too many folders", code: "FOLDER_LIMIT" });
+        const saved = await pool.query(
+            "INSERT INTO note_folders (user_id, name, emoji) VALUES ($1, $2, $3) RETURNING *",
+            [req.user.userId, values.name, values.emoji ?? null]
+        );
+        res.status(201).json(folderJson(saved.rows[0]));
+    } catch (err) {
+        if (nameTaken(err)) return res.status(409).json({ error: "Folder exists", code: "FOLDER_EXISTS" });
+        serverError(res, err);
+    }
+});
+
+app.put("/api/tester/note-folders/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Folder");
+    const { field, values } = cleanFolder(req.body ?? {}, true);
+    if (field) return invalidInput(res, field);
+    const columns = Object.keys(values);
+    if (columns.length === 0) return invalidInput(res, "name");
+    try {
+        const result = await pool.query(
+            `UPDATE note_folders SET ${columns.map((column, i) => `${column} = $${i + 3}`).join(", ")}
+            WHERE id = $1 AND user_id = $2 RETURNING *`,
+            [id, req.user.userId, ...columns.map(column => values[column])]
+        );
+        if (result.rows.length === 0) return notFound(res, "Folder");
+        res.json(folderJson(result.rows[0]));
+    } catch (err) {
+        if (nameTaken(err)) return res.status(409).json({ error: "Folder exists", code: "FOLDER_EXISTS" });
+        serverError(res, err);
+    }
+});
+
+// deleting a folder keeps its notes (loose then)
+app.delete("/api/tester/note-folders/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Folder");
+    try {
+        const result = await pool.query("DELETE FROM note_folders WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
+        if (result.rows.length === 0) return notFound(res, "Folder");
         res.json({ deleted: id });
     } catch (err) {
         serverError(res, err);
     }
 });
 
-// ---------- profile pictures (testers first) ----------
-// One square picture per account (user_avatars), made small by the app (WebP / JPEG / PNG, at
-// most AVATAR_DATA_MAX characters as a data: URL). Testers can set one (PUT /api/tester/avatar);
-// anybody can take theirs away (DELETE /api/profile/avatar), admins anybody's
+// empties the trash: { deleted: how many notes }
+app.delete("/api/tester/notebook/trash", async (req, res) => {
+    try {
+        const result = await pool.query("DELETE FROM notebook_notes WHERE user_id = $1 AND trashed_at IS NOT NULL", [req.user.userId]);
+        res.json({ deleted: result.rowCount });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- collections (testers first) ----------
+// Things that belong together, whatever they are: tasks, events and notes in one collection
+// (e.g. "Klausur Mathe": the exam, the tasks to learn for it, the formula sheet). One thing can
+// be in several collections; an entry goes when its task or note is deleted. Tasks are the ones I
+// can see (mine and the accepted shares), notes my own outside the trash.
+// { id, name, emoji, color, description, items: [{ kind: 'task' | 'note', id, addedAt }] }
+const COLLECTIONS_MAX = 100;
+const COLLECTION_ITEMS_MAX = 200;
+const COLLECTION_NAME_MAX = 60;
+const COLLECTION_DESCRIPTION_MAX = 500;
+const COLLECTION_KINDS = ["task", "note"];
+
+function cleanCollection(body, partial) {
+    const out = {};
+    if (!partial || body.name !== undefined) {
+        const name = cleanText(body.name, COLLECTION_NAME_MAX);
+        if (!name) return { field: "name" };
+        out.name = name;
+    }
+    if (body.emoji !== undefined) {
+        const emoji = cleanText(body.emoji, EMOJI_MAX);
+        if (emoji === undefined) return { field: "emoji" };
+        out.emoji = emoji;
+    }
+    if (body.color !== undefined) {
+        if (body.color !== null && cleanColor(body.color) === undefined) return { field: "color" };
+        out.color = body.color;
+    }
+    if (body.description !== undefined) {
+        const description = cleanText(body.description, COLLECTION_DESCRIPTION_MAX);
+        if (description === undefined) return { field: "description" };
+        out.description = description ?? "";
+    }
+    return { values: out };
+}
+
+// { kind, id } of a thing to put in, or null
+const cleanItem = (item) => (item && COLLECTION_KINDS.includes(item.kind) && idParam(item.id) ? { kind: item.kind, id: idParam(item.id) } : null);
+
+// whether I may put this thing in a collection
+async function itemMine(item, userId) {
+    if (item.kind === "task") return taskVisible(item.id, userId);
+    const check = await pool.query("SELECT 1 FROM notebook_notes WHERE id = $1 AND user_id = $2 AND trashed_at IS NULL", [item.id, userId]);
+    return check.rows.length > 0;
+}
+
+// my collections (or the one with this id), each with what is in it
+async function loadCollections(userId, id = null) {
+    const rows = (await pool.query(
+        `SELECT * FROM collections WHERE user_id = $1 ${id ? "AND id = $2" : ""} ORDER BY updated_at DESC`,
+        id ? [userId, id] : [userId]
+    )).rows;
+    if (rows.length === 0) return [];
+    const items = (await pool.query(
+        `SELECT collection_id, task_id, note_id, added_at FROM collection_items
+        WHERE collection_id = ANY($1::int[])
+            AND (task_id IS NULL OR task_id IN (${accessibleTaskIds("$2")}))
+            AND (note_id IS NULL OR note_id IN (SELECT id FROM notebook_notes WHERE user_id = $2 AND trashed_at IS NULL))
+        ORDER BY added_at, id`,
+        [rows.map(row => row.id), userId]
+    )).rows;
+    return rows.map(row => ({
+        id: row.id,
+        name: row.name,
+        emoji: row.emoji,
+        color: row.color,
+        description: row.description,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        items: items.filter(item => item.collection_id === row.id)
+            .map(item => ({ kind: item.task_id ? "task" : "note", id: item.task_id ?? item.note_id, addedAt: item.added_at })),
+    }));
+}
+const oneCollection = async (userId, id) => (await loadCollections(userId, id))[0] ?? null;
+
+const addItem = (collectionId, item) => pool.query(
+    `INSERT INTO collection_items (collection_id, ${item.kind}_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+    [collectionId, item.id]
+);
+
+// For testers collections take the place of groups. Their first look at their collections takes
+// their groups over, once (users.groups_imported_at): one collection per group with its tasks,
+// name, colour and description (none for a group whose name a collection has already). The
+// groups themselves stay as they were, for when the test is over.
+async function importGroupsOnce(userId) {
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        const claimed = await client.query(
+            "UPDATE users SET groups_imported_at = now() WHERE id = $1 AND groups_imported_at IS NULL RETURNING id", [userId]);
+        if (claimed.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return;
+        }
+        const groups = (await client.query(
+            `SELECT id, name, color, description FROM groups
+            WHERE user_id = $1 AND name <> 'all'
+                AND NOT EXISTS (SELECT 1 FROM collections WHERE collections.user_id = $1 AND lower(collections.name) = lower(groups.name))
+            ORDER BY id`,
+            [userId]
+        )).rows;
+        let count = (await client.query("SELECT count(*)::int AS n FROM collections WHERE user_id = $1", [userId])).rows[0].n;
+        for (const group of groups) {
+            if (count >= COLLECTIONS_MAX) break;
+            const name = cleanText(group.name.trim().slice(0, COLLECTION_NAME_MAX), COLLECTION_NAME_MAX);
+            if (!name) continue;
+            const description = cleanText((group.description ?? "").trim().slice(0, COLLECTION_DESCRIPTION_MAX), COLLECTION_DESCRIPTION_MAX) ?? "";
+            const saved = await client.query(
+                "INSERT INTO collections (user_id, name, color, description) VALUES ($1, $2, $3, $4) RETURNING id",
+                [userId, name, cleanColor(group.color) ?? null, description]
+            );
+            await client.query(
+                `INSERT INTO collection_items (collection_id, task_id)
+                SELECT $1, task_id FROM task_groups
+                WHERE group_id = $2 AND task_id IN (${accessibleTaskIds("$3")})
+                ORDER BY task_id LIMIT ${COLLECTION_ITEMS_MAX}
+                ON CONFLICT DO NOTHING`,
+                [saved.rows[0].id, group.id, userId]
+            );
+            count += 1;
+        }
+        await client.query("COMMIT");
+    } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+    } finally {
+        client.release();
+    }
+}
+
+app.get("/api/tester/collections", async (req, res) => {
+    try {
+        await importGroupsOnce(req.user.userId);
+        res.json(await loadCollections(req.user.userId));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// { name, emoji?, color?, description?, items?: [{ kind, id }] } (e.g. started from an event: with it in)
+app.post("/api/tester/collections", async (req, res) => {
+    const body = req.body ?? {};
+    const { field, values } = cleanCollection(body, false);
+    if (field) return invalidInput(res, field);
+    if (body.items !== undefined && (!Array.isArray(body.items) || body.items.length > COLLECTION_ITEMS_MAX)) return invalidInput(res, "items");
+    const items = (body.items ?? []).map(cleanItem);
+    if (items.some(item => !item)) return invalidInput(res, "items");
+    try {
+        for (const item of items) if (!await itemMine(item, req.user.userId)) return notFound(res, item.kind === "task" ? "Task" : "Note");
+        const count = await pool.query("SELECT count(*)::int AS n FROM collections WHERE user_id = $1", [req.user.userId]);
+        if (count.rows[0].n >= COLLECTIONS_MAX) return res.status(409).json({ error: "Too many collections", code: "COLLECTION_LIMIT" });
+        const saved = await pool.query(
+            "INSERT INTO collections (user_id, name, emoji, color, description) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            [req.user.userId, values.name, values.emoji ?? null, values.color ?? null, values.description ?? ""]
+        );
+        const id = saved.rows[0].id;
+        for (const item of items) await addItem(id, item);
+        res.status(201).json(await oneCollection(req.user.userId, id));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.put("/api/tester/collections/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Collection");
+    const { field, values } = cleanCollection(req.body ?? {}, true);
+    if (field) return invalidInput(res, field);
+    const columns = Object.keys(values);
+    try {
+        const result = await pool.query(
+            `UPDATE collections SET ${[...columns.map((column, i) => `${column} = $${i + 3}`), "updated_at = now()"].join(", ")}
+            WHERE id = $1 AND user_id = $2 RETURNING id`,
+            [id, req.user.userId, ...columns.map(column => values[column])]
+        );
+        if (result.rows.length === 0) return notFound(res, "Collection");
+        res.json(await oneCollection(req.user.userId, id));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// deleting a collection keeps its tasks and notes
+app.delete("/api/tester/collections/:id", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Collection");
+    try {
+        const result = await pool.query("DELETE FROM collections WHERE id = $1 AND user_id = $2 RETURNING id", [id, req.user.userId]);
+        if (result.rows.length === 0) return notFound(res, "Collection");
+        res.json({ deleted: id });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// puts a task / event / note in: { kind, id } → the collection (201; 200 when it was in already)
+app.post("/api/tester/collections/:id/items", async (req, res) => {
+    const id = idParam(req.params.id);
+    if (!id) return notFound(res, "Collection");
+    const item = cleanItem(req.body);
+    if (!item) return invalidInput(res, "item");
+    try {
+        const collection = await oneCollection(req.user.userId, id);
+        if (!collection) return notFound(res, "Collection");
+        if (!await itemMine(item, req.user.userId)) return notFound(res, item.kind === "task" ? "Task" : "Note");
+        if (collection.items.some(entry => entry.kind === item.kind && entry.id === item.id)) return res.json(collection);
+        if (collection.items.length >= COLLECTION_ITEMS_MAX) return res.status(409).json({ error: "Collection is full", code: "COLLECTION_FULL" });
+        await addItem(id, item);
+        await pool.query("UPDATE collections SET updated_at = now() WHERE id = $1", [id]);
+        res.status(201).json(await oneCollection(req.user.userId, id));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// takes a thing out (the thing itself stays) → the collection
+app.delete("/api/tester/collections/:id/items/:kind/:itemId", async (req, res) => {
+    const id = idParam(req.params.id);
+    const item = cleanItem({ kind: req.params.kind, id: req.params.itemId });
+    if (!id || !item) return notFound(res, "Collection");
+    try {
+        const removed = await pool.query(
+            `DELETE FROM collection_items USING collections
+            WHERE collection_items.collection_id = collections.id AND collections.id = $1 AND collections.user_id = $2
+                AND collection_items.${item.kind}_id = $3
+            RETURNING collection_items.id`,
+            [id, req.user.userId, item.id]
+        );
+        if (removed.rows.length === 0) return notFound(res, "Entry");
+        await pool.query("UPDATE collections SET updated_at = now() WHERE id = $1", [id]);
+        res.json(await oneCollection(req.user.userId, id));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- the arcade ----------
+// Small games for everybody signed in, also while waiting for beta access (so no requirePro).
+// Each run's score is sent with its mode: ranked (it counts for the leaderboard, everybody sees
+// display and user name with it) or not (only my own best). arcade_scores keeps per account, game
+// and difficulty the personal best and the ranked best. Scores come from the app, so they are only
+// checked to be plausible (ARCADE_GAMES' max); the leaderboard is for fun, not for prizes.
+//   GET    /api/arcade/me                                   my bests [{ game, level, best, rankedBest, plays }]
+//   POST   /api/arcade/scores { game, level, score, ranked } → { best, rankedBest, rank }
+//   GET    /api/arcade/leaderboard?game=&level=             { top: [{ rank, user, score, me }], me: { rank, score } | null }
+//   DELETE /api/arcade/ranked                               off every leaderboard (personal bests stay)
+const ARCADE_GAMES = {
+    guess: { levels: ["easy", "normal", "hard"], max: 500 },
+    scramble: { levels: ["easy", "normal", "hard"], max: 500 },
+    sequence: { levels: ["easy", "normal", "hard"], max: 500 },
+    reflex: { levels: ["normal"], max: 10000 }, // endless: a run lasts until a light is missed
+    pattern: { levels: ["normal"], max: 200 },
+};
+const ARCADE_TOP = 25;
+
+const arcadeLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: limitFromEnv("RATE_LIMIT_ARCADE", 60),
+    skip: (req) => req.method === "OPTIONS",
+    keyGenerator: (req) => `arcade:${req.user.userId}`,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many scores, slow down", code: "RATE_LIMITED" },
+});
+
+const arcadeGameOf = (game, level) => {
+    const known = typeof game === "string" && Object.hasOwn(ARCADE_GAMES, game) ? ARCADE_GAMES[game] : null;
+    return known && known.levels.includes(level) ? known : null;
+};
+
+// My place on a board: ahead of me are better scores and equal ones reached earlier
+async function arcadeRank(game, level, userId) {
+    const result = await pool.query(
+        `SELECT 1 + (SELECT count(*) FROM arcade_scores AS other
+            WHERE other.game = mine.game AND other.level = mine.level AND other.ranked_best IS NOT NULL
+                AND (other.ranked_best > mine.ranked_best
+                    OR (other.ranked_best = mine.ranked_best AND other.ranked_at < mine.ranked_at)))::int AS rank,
+            mine.ranked_best
+        FROM arcade_scores AS mine
+        WHERE mine.user_id = $1 AND mine.game = $2 AND mine.level = $3 AND mine.ranked_best IS NOT NULL`,
+        [userId, game, level]
+    );
+    return result.rows[0] ? { rank: result.rows[0].rank, score: result.rows[0].ranked_best } : null;
+}
+
+app.use("/api/arcade", authenticateToken);
+
+app.get("/api/arcade/me", async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT game, level, best, ranked_best, plays FROM arcade_scores WHERE user_id = $1 ORDER BY game, level",
+            [req.user.userId]
+        );
+        res.json(result.rows.map(row => ({ game: row.game, level: row.level, best: row.best, rankedBest: row.ranked_best, plays: row.plays })));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.post("/api/arcade/scores", arcadeLimiter, async (req, res) => {
+    const { game, level = "normal", score, ranked = false } = req.body ?? {};
+    const known = arcadeGameOf(game, level);
+    if (!known) return invalidInput(res, "game");
+    if (!Number.isInteger(score) || score < 0 || score > known.max) return invalidInput(res, "score");
+    if (typeof ranked !== "boolean") return invalidInput(res, "ranked");
+    try {
+        const saved = await pool.query(
+            `INSERT INTO arcade_scores (user_id, game, level, best, ranked_best, ranked_at, plays)
+            VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN $4::int END, CASE WHEN $5 THEN now() END, 1)
+            ON CONFLICT (user_id, game, level) DO UPDATE SET
+                best = GREATEST(arcade_scores.best, EXCLUDED.best),
+                ranked_at = CASE WHEN $5 AND (arcade_scores.ranked_best IS NULL OR $4 > arcade_scores.ranked_best)
+                    THEN now() ELSE arcade_scores.ranked_at END,
+                ranked_best = CASE WHEN $5 THEN GREATEST(COALESCE(arcade_scores.ranked_best, 0), $4) ELSE arcade_scores.ranked_best END,
+                plays = arcade_scores.plays + 1,
+                updated_at = now()
+            RETURNING best, ranked_best`,
+            [req.user.userId, game, level, score, ranked]
+        );
+        const mine = await arcadeRank(game, level, req.user.userId);
+        res.json({ best: saved.rows[0].best, rankedBest: saved.rows[0].ranked_best, rank: mine?.rank ?? null });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.get("/api/arcade/leaderboard", async (req, res) => {
+    const game = req.query.game;
+    const level = req.query.level ?? "normal";
+    if (!arcadeGameOf(game, level)) return invalidInput(res, "game");
+    try {
+        const result = await pool.query(
+            `SELECT users.id, users.username, users.display_name, arcade_scores.ranked_best
+            FROM arcade_scores JOIN users ON users.id = arcade_scores.user_id
+            WHERE arcade_scores.game = $1 AND arcade_scores.level = $2 AND arcade_scores.ranked_best IS NOT NULL
+            ORDER BY arcade_scores.ranked_best DESC, arcade_scores.ranked_at ASC
+            LIMIT $3`,
+            [game, level, ARCADE_TOP]
+        );
+        res.json({
+            top: result.rows.map((row, i) => ({ rank: i + 1, user: publicUser(row), score: row.ranked_best, me: row.id === req.user.userId })),
+            me: await arcadeRank(game, level, req.user.userId),
+        });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+app.delete("/api/arcade/ranked", async (req, res) => {
+    try {
+        await pool.query("UPDATE arcade_scores SET ranked_best = NULL, ranked_at = NULL WHERE user_id = $1", [req.user.userId]);
+        res.json({ ranked: false });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// ---------- profile pictures ----------
+// One picture per account (user_avatars), cut to a circle and made small by the app (WebP / JPEG /
+// PNG, at most AVATAR_DATA_MAX characters as a data: URL). Anybody can set one
+// (PUT /api/profile/avatar; testers first used /api/tester/avatar, which still answers) and take theirs away (DELETE /api/profile/avatar), admins anybody's
 // (DELETE /api/admin/users/:id/avatar). A picture is seen by its owner and the people who also
 // see the owner's online status: friends, people in open shared sessions and families.
 // The app asks which of the people it shows have one (GET /api/avatars?ids=…, answers
@@ -6368,7 +7785,8 @@ async function visibleAvatarOwners(viewerId, ids) {
     return new Set(ids.filter(id => audience.has(id)));
 }
 
-app.put("/api/tester/avatar", async (req, res) => {
+// PUT /api/profile/avatar (everybody; /api/tester/avatar stays for older app versions)
+async function setAvatar(req, res) {
     const picture = readImageData(req.body?.data, AVATAR_DATA_MAX, ["webp", "jpeg", "png"]);
     if (!picture) return invalidInput(res, "data");
     try {
@@ -6383,7 +7801,9 @@ app.put("/api/tester/avatar", async (req, res) => {
     } catch (err) {
         serverError(res, err);
     }
-});
+}
+app.put("/api/profile/avatar", setAvatar);
+app.put("/api/tester/avatar", setAvatar);
 
 app.delete("/api/profile/avatar", async (req, res) => {
     try {
@@ -6468,6 +7888,9 @@ startFocusSchedule(pool, limitFromEnv("FOCUS_CHECK_MS", 5 * 1000));
 // events that are over are ticked off, also checked once a minute (first right away)
 closePastEvents();
 setInterval(closePastEvents, limitFromEnv("EVENT_CHECK_MS", 60 * 1000)).unref();
+// the usage statistics' "already counted" marks of periods that are over, at start and then once an
+// hour (the totals stay)
+startUsageCleanup(pool, limitFromEnv("USAGE_CLEANUP_MS", 60 * 60 * 1000));
 server.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
 });

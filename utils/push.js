@@ -13,8 +13,12 @@
 //             of day counts from my all-day time, users.allday_reminder_time)
 //   digest    the morning overview of the day (DIGEST_FROM in my time zone)
 //   messages  direct messages
-//   social    friend requests, invites, tasks shared with / given to me, news from the team;
-//             for admins also new beta requests
+//   social    friend requests, invites, tasks shared with / given to me (in a session or a
+//             family), news from the team; for admins also new beta requests
+//   groups    somebody else added entries to a family / session I'm in; messages in their chats
+//   study     a study goal (exam, assignment, …) is behind its plan (testers only): at most one a day,
+//             08:00-19:00 in my time zone, see pushStudyBehind
+// "plan" also brings the reminders of my families' entries (to every joined member).
 // Only accounts with app access get anything (closed beta). A device the push service no longer
 // knows (404 / 410) is forgotten.
 //
@@ -22,9 +26,11 @@
 // their messages through Firebase Cloud Messaging (utils/fcm.js, FIREBASE_SERVICE_ACCOUNT_FILE).
 
 const webpush = require("web-push");
-const { APP_ACCESS_SQL } = require("./access");
+const { APP_ACCESS_SQL, TESTER_ACCESS_SQL } = require("./access");
 const { DEFAULT_TIMEZONE } = require("./reminderMails");
 const { FCM_ENABLED, isFcmEndpoint, sendFcm } = require("./fcm");
+const { loadPlanInput, statusOf } = require("./studyLoad");
+const { shouldNotify, pushText } = require("./studyStatus");
 
 const PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 const PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
@@ -37,14 +43,17 @@ else if (process.env.NODE_ENV === "production") {
     console.warn("VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY are not set: no push notifications are sent. Make a pair with `npx web-push generate-vapid-keys`.");
 }
 
-const KINDS = ["plan", "digest", "messages", "social"];
+const KINDS = ["plan", "digest", "messages", "social", "groups", "study"];
 const MAX_DEVICES = 10;
 // a reminder more than this late (server was down, phone offline) isn't worth it any more
 const LATE_LIMIT = "1 hour";
 const DIGEST_FROM = "07:30";
 const DIGEST_UNTIL = "11:00";
 // how long the push service keeps a message for a phone that is offline (seconds)
-const TTL = { plan: 60 * 60, digest: 3 * 60 * 60, messages: 24 * 60 * 60, social: 24 * 60 * 60 };
+const TTL = { plan: 60 * 60, digest: 3 * 60 * 60, messages: 24 * 60 * 60, social: 24 * 60 * 60, groups: 24 * 60 * 60, study: 3 * 60 * 60 };
+
+// Where a group notice leads: a family's page or a session's
+const placeUrl = (place) => (place.kind === "family" ? `/family/${place.id}` : `/together/${place.id}`);
 
 const lang = (language) => (language === "en" ? "en" : "de");
 const clip = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
@@ -123,6 +132,32 @@ const TEXTS = {
             ? { title: "A task for you", body: `${who} gave you “${clip(name, 80)}” in “${session}”.`, url: `/together/${sessionId}`, tag: `assigned-${sessionId}` }
             : { title: "Eine Aufgabe für dich", body: `${who} hat dir „${clip(name, 80)}“ in „${session}“ gegeben.`, url: `/together/${sessionId}`, tag: `assigned-${sessionId}` };
     },
+    familyAssigned({ from, name, family, familyId }, language) {
+        const who = from.displayName || from.username;
+        return language === "en"
+            ? { title: "A task for you", body: `${who} gave you “${clip(name, 80)}” in “${family}”.`, url: `/family/${familyId}`, tag: `assigned-family-${familyId}` }
+            : { title: "Eine Aufgabe für dich", body: `${who} hat dir „${clip(name, 80)}“ in „${family}“ gegeben.`, url: `/family/${familyId}`, tag: `assigned-family-${familyId}` };
+    },
+    // somebody else put entries into a family / session of mine: place { kind, id, name };
+    // count: how many in a row (the device shows only the newest of a place)
+    entriesAdded({ from, place, count, name }, language) {
+        const who = from.displayName || from.username;
+        const en = language === "en";
+        const body = count > 1
+            ? (en ? `${who} added ${count} entries.` : `${who} hat ${count} Einträge eingetragen.`)
+            : (en ? `${who} added “${clip(name, 80)}”.` : `${who} hat „${clip(name, 80)}“ eingetragen.`);
+        return { title: clip(en ? `“${place.name}”` : `„${place.name}“`, 120), body, url: placeUrl(place), tag: `entries-${place.kind}-${place.id}`, renotify: true };
+    },
+    // a message in a family's / session's chat
+    chat({ from, place, body }) {
+        const who = from.displayName || from.username;
+        return { title: clip(`${who} · ${place.name}`, 120), body: clip(body, 180), url: placeUrl(place), tag: `chat-${place.kind}-${place.id}`, renotify: true };
+    },
+    // a reminder of a family's entry (to every member): like entry, with the family's name
+    familyEntry(task, language) {
+        const message = TEXTS.entry(task, language);
+        return { ...message, body: `${language === "en" ? `“${task.family_name}”` : `„${task.family_name}“`} · ${message.body}`, url: `/family/${task.family_id}`, tag: `family-task-${task.id}` };
+    },
     // for the admins: somebody asks to get into the closed beta
     betaRequest({ from, reason }, language) {
         const who = from.displayName || from.username;
@@ -168,7 +203,9 @@ async function deliver(pool, device, kind, message) {
 
 // Sends a message of `kind` to every device of these accounts that wants that kind.
 // build(language, userId) makes the message. Never throws (a push is never worth an error).
-async function pushToUsers(pool, userIds, kind, build) {
+// { skipAlarms }: not to devices that ring reminders themselves (push_subscriptions.alarms, the
+// Android app with exact alarms allowed), so a reminder doesn't come twice there.
+async function pushToUsers(pool, userIds, kind, build, { skipAlarms = false } = {}) {
     const ids = [...new Set(userIds.filter(Boolean))];
     if (ids.length === 0 || !KINDS.includes(kind)) return 0;
     try {
@@ -176,7 +213,8 @@ async function pushToUsers(pool, userIds, kind, build) {
             `SELECT push_subscriptions.id, push_subscriptions.user_id, push_subscriptions.endpoint,
                 push_subscriptions.p256dh, push_subscriptions.auth, users.language
             FROM push_subscriptions JOIN users ON users.id = push_subscriptions.user_id
-            WHERE push_subscriptions.user_id = ANY($1::int[]) AND push_subscriptions.${kind} AND ${APP_ACCESS_SQL}`,
+            WHERE push_subscriptions.user_id = ANY($1::int[]) AND push_subscriptions.${kind} AND ${APP_ACCESS_SQL}
+                ${skipAlarms ? "AND NOT push_subscriptions.alarms" : ""}`,
             [ids]
         );
         const sent = await Promise.all(devices.rows.map((device) => deliver(pool, device, kind, build(lang(device.language), device.user_id))));
@@ -241,6 +279,56 @@ async function pushDueEntries(pool) {
     return due.rows.length;
 }
 
+// The same for a family's entries (family_tasks.reminders), in the family owner's time zone and
+// all-day time, to every joined member with a device that wants "plan". Each reminder time goes
+// out once (push_sent_for, SKIP LOCKED), like an own task's.
+const PICK_DUE_FAMILY_ENTRIES = `
+    UPDATE family_tasks SET push_sent_for = ready.push_at
+    FROM (
+        SELECT family_tasks.id, times.push_at, times.minutes,
+            family_tasks.due - (times.push_at AT TIME ZONE starts.timezone)::date AS days_ahead
+        FROM family_tasks
+        JOIN families ON families.id = family_tasks.family_id
+        JOIN users ON users.id = families.owner_id
+        CROSS JOIN LATERAL (
+            SELECT (family_tasks.due + COALESCE(family_tasks.due_time, users.allday_reminder_time)) AT TIME ZONE COALESCE(users.timezone, '${DEFAULT_TIMEZONE}') AS starts_at,
+                COALESCE(users.timezone, '${DEFAULT_TIMEZONE}') AS timezone
+        ) AS starts
+        CROSS JOIN LATERAL (
+            SELECT starts.starts_at - make_interval(mins => reminder.minutes) AS push_at, reminder.minutes
+            FROM unnest(family_tasks.reminders) AS reminder(minutes)
+            WHERE starts.starts_at - make_interval(mins => reminder.minutes) <= now()
+                AND now() < starts.starts_at - make_interval(mins => reminder.minutes) + interval '${LATE_LIMIT}'
+            ORDER BY push_at DESC
+            LIMIT 1
+        ) AS times
+        WHERE (NOT family_tasks.done OR family_tasks.kind = 'event') AND family_tasks.due IS NOT NULL
+            AND family_tasks.due BETWEEN current_date - 2 AND current_date + 9
+            AND EXISTS (
+                SELECT 1 FROM family_members JOIN push_subscriptions ON push_subscriptions.user_id = family_members.user_id
+                WHERE family_members.family_id = family_tasks.family_id AND family_members.status = 'joined' AND push_subscriptions.plan
+            )
+            AND now() < starts.starts_at + interval '15 minutes'
+            AND (family_tasks.push_sent_for IS NULL OR family_tasks.push_sent_for < times.push_at OR family_tasks.push_sent_for > starts.starts_at)
+        FOR UPDATE OF family_tasks SKIP LOCKED
+    ) AS ready
+    WHERE family_tasks.id = ready.id
+    RETURNING family_tasks.id, family_tasks.family_id, family_tasks.name, family_tasks.kind, family_tasks.location,
+        ready.minutes AS reminder_minutes, ready.days_ahead, to_char(family_tasks.due_time, 'HH24:MI') AS due_time,
+        (SELECT name FROM families WHERE families.id = family_tasks.family_id) AS family_name`;
+
+async function pushFamilyEntries(pool) {
+    const due = await pool.query(PICK_DUE_FAMILY_ENTRIES);
+    for (const entry of due.rows) {
+        const members = await pool.query(
+            "SELECT user_id FROM family_members WHERE family_id = $1 AND status = 'joined'",
+            [entry.family_id]
+        );
+        await pushToUsers(pool, members.rows.map(row => row.user_id), "plan", (language) => TEXTS.familyEntry(entry, language));
+    }
+    return due.rows.length;
+}
+
 // The morning overview: once a day between DIGEST_FROM and DIGEST_UNTIL in my time zone, what
 // is open today (tasks, events, overdue). The day is marked first, so it comes once even with
 // nothing to say (then nothing is sent).
@@ -276,6 +364,57 @@ async function pushDigests(pool) {
     return picked.rows.length;
 }
 
+// Study goals that are behind their plan: at most one push per user and day, 08:00-19:00 in my time
+// zone (shouldNotify decides), and only when the deficit is new or grew by a whole session. One push
+// for all goals that qualify; their behind_notified_minutes / behind_notified_on are set when it went
+// out, a goal that is not behind any more is reset to 0. Testers with an active goal and a device that
+// wants "study". `now` is for the tests. Returns how many users were notified.
+async function pushStudyBehind(pool, now = new Date()) {
+    const users = await pool.query(
+        `SELECT users.id, users.language FROM users
+        WHERE ${TESTER_ACCESS_SQL}
+            AND EXISTS (SELECT 1 FROM goals WHERE goals.user_id = users.id AND goals.status = 'active')
+            AND EXISTS (SELECT 1 FROM push_subscriptions WHERE push_subscriptions.user_id = users.id AND push_subscriptions.study)`
+    );
+    let notified = 0;
+    for (const user of users.rows) {
+        try {
+            const loaded = await loadPlanInput(pool, user.id, now);
+            const { today, nowMinutes, sessionMinutes } = loaded.clock;
+            const marks = new Map((await pool.query(
+                "SELECT id, behind_notified_minutes, behind_notified_on = $2::date AS today FROM goals WHERE user_id = $1",
+                [user.id, today]
+            )).rows.map((row) => [row.id, row]));
+            const rows = statusOf(loaded).map(({ g, status }) => ({
+                id: g.goal.id, name: g.goal.name, behindMinutes: status.behindMinutes,
+                notifiedMinutes: marks.get(g.goal.id)?.behind_notified_minutes ?? 0,
+            }));
+            const sentToday = rows.some((row) => marks.get(row.id)?.today);
+            const recovered = rows.filter((row) => row.behindMinutes === 0 && row.notifiedMinutes !== 0).map((row) => row.id);
+            if (recovered.length) {
+                await pool.query("UPDATE goals SET behind_notified_minutes = 0 WHERE user_id = $1 AND id = ANY($2::int[])", [user.id, recovered]);
+            }
+            const due = rows.filter((row) => shouldNotify({ deficit: row.behindMinutes, notifiedMinutes: row.notifiedMinutes, sentToday, nowMinutes, sessionMinutes }));
+            if (due.length === 0) continue;
+            const sent = await pushToUsers(pool, [user.id], "study", (language) => ({
+                ...pushText(due.map((row) => ({ name: row.name, behindMinutes: row.behindMinutes })), language),
+                url: "/study?replan=1", tag: "study",
+            }));
+            if (sent === 0) continue; // nowhere to deliver: try again later
+            for (const row of due) {
+                await pool.query(
+                    "UPDATE goals SET behind_notified_minutes = $3, behind_notified_on = $4::date WHERE id = $1 AND user_id = $2",
+                    [row.id, user.id, row.behindMinutes, today]
+                );
+            }
+            notified++;
+        } catch (err) {
+            console.error(`Study push for user ${user.id} failed:`, err);
+        }
+    }
+    return notified;
+}
+
 // Checks every `everyMs` (first check right away); returns a function that stops it
 function startPushSchedule(pool, everyMs = 60 * 1000) {
     let running = false;
@@ -284,7 +423,9 @@ function startPushSchedule(pool, everyMs = 60 * 1000) {
         running = true;
         try {
             await pushDueEntries(pool);
+            await pushFamilyEntries(pool);
             await pushDigests(pool);
+            await pushStudyBehind(pool);
         } catch (err) {
             console.error("Push check failed:", err);
         } finally {
@@ -299,5 +440,5 @@ function startPushSchedule(pool, everyMs = 60 * 1000) {
 
 module.exports = {
     PUSH_ENABLED: ENABLED, PUSH_PUBLIC_KEY: PUBLIC_KEY, PUSH_FCM_ENABLED: FCM_ENABLED, PUSH_KINDS: KINDS, PUSH_MAX_DEVICES: MAX_DEVICES, PUSH_TEXTS: TEXTS,
-    pushToUsers, pushLater, deliver, startPushSchedule, pushDueEntries, pushDigests,
+    pushToUsers, pushLater, deliver, startPushSchedule, pushDueEntries, pushFamilyEntries, pushDigests, pushStudyBehind,
 };

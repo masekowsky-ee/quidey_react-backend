@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "pro": "node scripts/pro.js",
-    "test": "node --test --test-concurrency=1 \"test/**/*.test.mjs\""
+    "test": "node --test --test-concurrency=1 \"scripts/test/**/*.test.mjs\""
   },
   "repository": {
     "type": "git",
@@ -21,6 +21,7 @@
   },
   "homepage": "https://github.com/masekowsky-ee/quidey_react-backend#readme",
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
