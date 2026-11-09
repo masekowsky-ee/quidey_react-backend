@@ -91,7 +91,7 @@ app.use(cors({
 // the rate limit: nobody without an account can make the server read megabytes.
 const smallJson = express.json({ limit: "100kb" });
 // (Stripe's webhook reads its body raw: the signature is over the exact bytes)
-app.use((req, res, next) => (req.path.startsWith("/api/notebook") || req.path === "/api/billing/stripe-webhook" ? next() : smallJson(req, res, next)));
+app.use((req, res, next) => (req.path.startsWith("/api/notebook") || req.path === "/api/ai/scan" || req.path === "/api/billing/stripe-webhook" ? next() : smallJson(req, res, next)));
 
 // Slows down password guessing: 10 failed attempts per IP per 15 minutes on login and register.
 // Successful requests and CORS preflights (OPTIONS) don't count.
@@ -244,6 +244,7 @@ app.use("/api/routines", authenticateToken);
 app.use("/api/notebook", authenticateToken);
 // usage statistics: every signed-in account, also while waiting for beta access (not behind requirePro)
 app.use("/api/usage", authenticateToken);
+app.use("/api/ai", authenticateToken);
 
 // Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
 // Checked against the account on every request (not stored in the token; see loadAccount), so
@@ -261,7 +262,7 @@ function requirePro(req, res, next) {
 // the beacon (/api/usage) it allows
 const OPEN_WITHOUT_ACCESS = new Set(["/api/profile/usage-consent"]);
 app.use(
-    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families", "/api/push", "/api/focus", "/api/routines", "/api/notebook", "/api/avatars"],
+    ["/api/tasks", "/api/groups", "/api/sessions", "/api/notes", "/api/task-groups", "/api/friends", "/api/shared-sessions", "/api/task-shares", "/api/profiles", "/api/profile", "/api/event-types", "/api/stats", "/api/feed", "/api/progress", "/api/families", "/api/push", "/api/focus", "/api/routines", "/api/notebook", "/api/avatars", "/api/ai"],
     (req, res, next) => (OPEN_WITHOUT_ACCESS.has((req.baseUrl + req.path).replace(/\/+$/, "")) ? next() : requirePro(req, res, next))
 );
 
@@ -293,6 +294,11 @@ app.use("/api", rateLimit({
 app.use("/api/tester/study", require("./study")({ pool, realtime, loadTask }));
 
 app.use("/api/notebook", express.json({ limit: "4mb" }));
+
+// The AI features with their daily allowances (ai.js): signed in, with app access, past the rate
+// limit; a scan's document is bigger than other requests, so only it gets a larger body limit here
+app.use("/api/ai/scan", express.json({ limit: "15mb" }));
+app.use("/api/ai", require("./ai")({ pool }));
 
 // ---------- input checks ----------
 // Ids from the URL: a positive integer, or null (answered with 404 instead of a database error)

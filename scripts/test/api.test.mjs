@@ -30,6 +30,13 @@ const googleToken = (claims) => jwt.sign(
     { algorithm: "RS256", keyid: GOOGLE_KID, expiresIn: "5m" }
 );
 const PW = "Sup3r-secret-pass!";
+// what the fake AI answers per job (utils/ai.js): a line read by the AI, a scanned document
+const AI_FAKE = {
+    "parse-entry": {
+        kind: "event", name: "Study", date: "2026-11-19", time: "13:00", endTime: "15:00", durationMinutes: null,
+        color: "blue", eventType: "school", remindersMinutesBefore: [15, 99999], priority: null,
+    },
+};
 const conn = (database) => ({
     user: process.env.DB_USER, password: process.env.DB_PASSWORD,
     host: process.env.DB_HOST, port: Number(process.env.DB_PORT) || 5432, database,
@@ -111,6 +118,8 @@ before(async () => {
             // the Android app's pushes are only logged too; Pro on sale, but no payments set up
             FIREBASE_SERVICE_ACCOUNT_FILE: "", STRIPE_SECRET_KEY: "", PLAY_SERVICE_ACCOUNT_FILE: "", ACCESS_MODE: "beta", PRO_BILLING: "on",
             GOOGLE_CLIENT_IDS: GOOGLE_CLIENT,
+            // the AI answers from fixed replies (utils/ai.js), never the real API; "AI_FAIL" in the input fails
+            ANTHROPIC_API_KEY: "", AI_FAKE: JSON.stringify(AI_FAKE),
             GOOGLE_TEST_CERTS: JSON.stringify({ [GOOGLE_KID]: GOOGLE_KEY.publicKey.export({ type: "spki", format: "pem" }) }),
         },
     });
@@ -4992,5 +5001,58 @@ describe("admin usage", () => {
         const big = await call("GET", "/api/admin/usage/raw", null, boss.token);
         assert.equal(big.status, 400);
         assert.equal(big.data.code, "USAGE_RANGE_TOO_BIG");
+    });
+});
+
+describe("AI help: daily limits and reading a quick-entry line", () => {
+    test("everybody starts the day with 1 scan and 5 AI helps", async () => {
+        const ana = await member("quotaana");
+        const r = await call("GET", "/api/ai/quota", null, ana.token);
+        assert.equal(r.status, 200);
+        assert.deepEqual({ scan: r.data.scan, aiLine: r.data.aiLine }, { scan: { used: 0, max: 1 }, aiLine: { used: 0, max: 5 } });
+        assert.ok(Date.parse(r.data.resetsAt) > Date.now());
+    });
+
+    test("a line read by the AI comes back checked: the type found among my own, nothing out of range", async () => {
+        const ben = await member("quotaben");
+        const type = await call("POST", "/api/event-types", { name: "Schule" }, ben.token);
+        await call("POST", "/api/event-types", { name: "School" }, ben.token);
+        const r = await call("POST", "/api/ai/parse-entry", { text: "Study 19.11. 13:00 - 15:00 blue type: school, reminder 15 mins prior." }, ben.token);
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        const types = (await call("GET", "/api/event-types", null, ben.token)).data;
+        const school = (Array.isArray(types) ? types : types.eventTypes ?? types.types).find(t => t.name === "School");
+        assert.deepEqual(r.data.entry, {
+            kind: "event", name: "Study", due: "2026-11-19", time: "13:00", durationMinutes: 120,
+            color: "blue", eventTypeId: school.id, reminders: [15], prio: null,
+        });
+        assert.equal(type.status, 201);
+        assert.deepEqual(r.data.quota.aiLine, { used: 1, max: 5 });
+    });
+
+    test("the sixth AI help of the day is refused with when it comes back", async () => {
+        const cleo = await member("quotacleo");
+        for (let i = 0; i < 5; i++) assert.equal((await call("POST", "/api/ai/parse-entry", { text: `Lernen ${i}` }, cleo.token)).status, 200);
+        const sixth = await call("POST", "/api/ai/parse-entry", { text: "Lernen 6" }, cleo.token);
+        assert.equal(sixth.status, 429);
+        assert.equal(sixth.data.code, "QUOTA_REACHED");
+        assert.equal(sixth.data.kind, "aiLine");
+        assert.ok(Date.parse(sixth.data.resetsAt) > Date.now());
+    });
+
+    test("a failed AI answer doesn't use up a help", async () => {
+        const dora = await member("quotadora");
+        const r = await call("POST", "/api/ai/parse-entry", { text: "AI_FAIL bitte" }, dora.token);
+        assert.equal(r.status, 502);
+        assert.equal(r.data.code, "AI_FAILED");
+        assert.equal((await call("GET", "/api/ai/quota", null, dora.token)).data.aiLine.used, 0);
+    });
+
+    test("an empty or overlong line and accounts without access are refused", async () => {
+        const emil = await member("quotaemil");
+        assert.equal((await call("POST", "/api/ai/parse-entry", { text: "  " }, emil.token)).status, 400);
+        assert.equal((await call("POST", "/api/ai/parse-entry", { text: "x".repeat(501) }, emil.token)).status, 400);
+        const nobeta = await member("quotanobeta", { pro: false });
+        assert.equal((await call("GET", "/api/ai/quota", null, nobeta.token)).status, 403);
+        assert.equal((await call("GET", "/api/ai/quota")).status, 401);
     });
 });

@@ -2616,6 +2616,17 @@ CREATE TABLE IF NOT EXISTS public.usage_people (
   PRIMARY KEY (scope, period, metric, platform, language, plan)
 );
 
+-- 046: daily allowances for the AI features (see migrations/046_daily_quota.sql)
+CREATE TABLE IF NOT EXISTS public.daily_quota (
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    day date NOT NULL,
+    kind text NOT NULL,
+    used integer DEFAULT 0 NOT NULL,
+    CONSTRAINT daily_quota_pkey PRIMARY KEY (user_id, day, kind),
+    CONSTRAINT daily_quota_kind_check CHECK ((kind = ANY (ARRAY['scan'::text, 'ai_line'::text]))),
+    CONSTRAINT daily_quota_used_check CHECK ((used >= 0))
+);
+
 --
 -- PostgreSQL database dump complete
 --
