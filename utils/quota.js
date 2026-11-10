@@ -1,5 +1,5 @@
 // Daily allowances for the AI features (later part of Quidey Pro): how often an account may use each
-// on one day of its own time zone (users.timezone). Counted in daily_quota (migration 046).
+// on one day of its own time zone (users.timezone). Counted in daily_quota (migration 048).
 //
 // take(db, userId, kind) books one use, all in one statement, so two requests at once can't both get
 // the last one: → { ok, used, max, day, resetsAt }. giveBack(...) returns it when the work failed.
