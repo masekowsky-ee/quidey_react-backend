@@ -2616,7 +2616,7 @@ CREATE TABLE IF NOT EXISTS public.usage_people (
   PRIMARY KEY (scope, period, metric, platform, language, plan)
 );
 
--- 046: daily allowances for the AI features (see migrations/046_daily_quota.sql)
+-- 048: daily allowances for the AI features (see migrations/048_daily_quota.sql)
 CREATE TABLE IF NOT EXISTS public.daily_quota (
     user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
     day date NOT NULL,

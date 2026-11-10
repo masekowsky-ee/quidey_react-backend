@@ -1,4 +1,4 @@
--- 046: daily allowances for the AI features (utils/quota.js): how much of each an account used on a
+-- 048: daily allowances for the AI features (utils/quota.js): how much of each an account used on a
 -- day of its own time zone. One row per account, day and kind; old days are deleted after a week.
 CREATE TABLE IF NOT EXISTS public.daily_quota (
     user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,

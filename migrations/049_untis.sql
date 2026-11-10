@@ -1,4 +1,4 @@
--- 047: the timetable from WebUntis (utils/untis.js, untis.js; branch pro-features).
+-- 049: the timetable from WebUntis (utils/untis.js, untis.js; branch pro-features).
 -- untis_accounts: one per account; secret = the WebUntis password or the iCal link, encrypted
 -- (AES-256-GCM, key UNTIS_SECRET). untis_lessons: the fetched lessons in the school's local time.
 -- Both go with the account, and disconnecting deletes them.
