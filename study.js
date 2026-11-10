@@ -1,5 +1,5 @@
-// Study goals (testers): subjects, goals with their parts, study settings.
-// Mounted at /api/tester/study, behind authenticateToken + requireTester. Every id is checked
+// Study goals: subjects, goals with their parts, study settings.
+// Mounted at /api/tester/study (the address from its test), behind authenticateToken + requirePro. Every id is checked
 // against the caller (user_id); somebody else's id answers 404.
 
 const express = require('express');
@@ -67,6 +67,25 @@ const ATTACHED = `(EXISTS (SELECT 1 FROM notebook_notes WHERE notebook_notes.tas
     OR EXISTS (SELECT 1 FROM collection_items WHERE collection_items.task_id = tasks.id)
     OR EXISTS (SELECT 1 FROM task_shares WHERE task_shares.task_id = tasks.id))`;
 
+// POST /replan's `moves`: sessions of the preview put somewhere else, [{ key, date, time }] (time
+// 'HH:MM' or null). Missing: none. null when invalid (a key twice, a bad day or time, too many).
+function cleanMoves(value) {
+    if (value === undefined || value === null) return [];
+    if (!Array.isArray(value) || value.length > 500) return null;
+    const seen = new Set();
+    const moves = [];
+    for (const m of value) {
+        if (!m || typeof m !== 'object') return null;
+        const key = m.key;
+        const date = cleanDate(m.date);
+        const time = m.time === null || m.time === undefined || m.time === '' ? null : TIME.test(m.time) ? m.time : undefined;
+        if (!Number.isInteger(key) || key < 0 || seen.has(key) || !date || time === undefined) return null;
+        seen.add(key);
+        moves.push({ key, date, time });
+    }
+    return moves;
+}
+
 // Thrown inside inTransaction to roll back and hand `value` to the caller instead of an error.
 class Rollback {
     constructor(value) { this.value = value; }
@@ -86,30 +105,40 @@ const toHHMM = (minutes) => `${String(Math.floor(minutes / 60)).padStart(2, '0')
 // What applying would change, per goal (spec §3): each part's replaceable sessions are matched with
 // its new ones in date order. Same day, time and length: unchanged; otherwise moved; new ones left over are
 // new, old ones left over dropped. Missed sessions are dropped too.
+// `sessions` is the whole plan per goal, unchanged ones included, in date order: `key` is the session's
+// place in the planner's result (POST /replan's `moves` name it), `change` 'same' | 'moved' | 'new'.
 function previewOf(goals, sessions, result, hash) {
+    const keyed = result.sessions.map((s, key) => ({ ...s, key }));
     return {
         inputHash: hash,
         shortfall: result.shortfall,
         goals: goals.map(({ goal, parts }) => {
             const summary = { moved: 0, added: 0, dropped: 0, unchanged: 0 };
             const changes = [];
+            const planned = [];
             for (const part of parts) {
                 const old = sessions.filter((s) => s.partId === part.id && s.status === 'replaceable').sort(bySlot);
-                const next = result.sessions.filter((s) => s.partId === part.id).sort(bySlot);
+                const next = keyed.filter((s) => s.partId === part.id).sort(bySlot);
                 const partName = part.name;
+                const add = (to, change, from) => planned.push({
+                    key: to.key, partId: part.id, partName, ...slot(to), minutes: to.minutes, change, ...(from ? { from: slot(from) } : {}),
+                });
                 for (let i = 0; i < Math.max(old.length, next.length); i++) {
                     const from = old[i];
                     const to = next[i];
                     if (from && to) {
                         if (from.date === to.date && (from.time ?? null) === (to.time ?? null) && from.minutes === to.minutes) {
                             summary.unchanged++;
+                            add(to, 'same');
                         } else {
                             summary.moved++;
                             changes.push({ type: 'moved', partName, from: slot(from), to: slot(to), minutes: to.minutes });
+                            add(to, 'moved', from);
                         }
                     } else if (to) {
                         summary.added++;
                         changes.push({ type: 'new', partName, to: slot(to), minutes: to.minutes });
+                        add(to, 'new');
                     } else {
                         summary.dropped++;
                         changes.push({ type: 'dropped', partName, from: slot(from), minutes: from.minutes });
@@ -122,7 +151,8 @@ function previewOf(goals, sessions, result, hash) {
             }
             // by the day they are about: where a session goes, or where it was
             changes.sort((a, b) => bySlot(a.to || a.from, b.to || b.from));
-            return { goalId: goal.id, name: goal.name, summary, changes };
+            planned.sort(bySlot);
+            return { goalId: goal.id, name: goal.name, summary, changes, sessions: planned };
         }),
     };
 }
@@ -774,6 +804,8 @@ module.exports = ({ pool, realtime, loadTask }) => {
         const userId = req.user.userId;
         const hash = req.body && req.body.inputHash;
         if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) return invalid(res, 'inputHash');
+        const moves = cleanMoves(req.body.moves);
+        if (!moves) return invalid(res, 'moves');
         let outcome;
         try {
             outcome = await inTransaction(async (client) => {
@@ -805,15 +837,21 @@ module.exports = ({ pool, realtime, loadTask }) => {
                     'SELECT id, color FROM subjects WHERE user_id = $1', [userId]
                 )).rows.map((r) => [r.id, r.color]));
                 const parts = new Map(current.goals.flatMap(({ goal, parts: list }) => list.map((p) => [p.id, { name: p.name, color: colors.get(goal.subjectId) ?? null }])));
-                const rows = current.result.sessions.map((s) => ({ ...s, ...parts.get(s.partId) }));
+                // a session moved in the preview goes where it was put, pinned: the next replan leaves it there
+                if (moves.some((m) => m.key >= current.result.sessions.length)) throw new Rollback({ badMoves: true });
+                const moved = new Map(moves.map((m) => [m.key, m]));
+                const rows = current.result.sessions.map((s, key) => {
+                    const m = moved.get(key);
+                    return { ...s, ...parts.get(s.partId), ...(m ? { date: m.date, time: m.time, pinned: true } : { pinned: false }) };
+                });
                 if (rows.length) {
                     await client.query(
                         `INSERT INTO tasks (kind, user_id, name, color, due, due_time, duration_minutes, goal_part_id, plan_pinned, reminders)
-                        SELECT 'task', $1, name, color, due, due_time, minutes, part_id, false, '{}'
-                        FROM unnest($2::text[], $3::text[], $4::date[], $5::time[], $6::int[], $7::int[])
-                            AS s(name, color, due, due_time, minutes, part_id)`,
+                        SELECT 'task', $1, name, color, due, due_time, minutes, part_id, pinned, '{}'
+                        FROM unnest($2::text[], $3::text[], $4::date[], $5::time[], $6::int[], $7::int[], $8::boolean[])
+                            AS s(name, color, due, due_time, minutes, part_id, pinned)`,
                         [userId, rows.map((r) => r.name), rows.map((r) => r.color), rows.map((r) => r.date),
-                            rows.map((r) => r.time), rows.map((r) => r.minutes), rows.map((r) => r.partId)]
+                            rows.map((r) => r.time), rows.map((r) => r.minutes), rows.map((r) => r.partId), rows.map((r) => r.pinned)]
                     );
                 }
                 // only the goals just planned (goals of an archived subject keep theirs)
@@ -823,6 +861,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         } catch (err) {
             return planInputFailed(res, err);
         }
+        if (outcome.badMoves) return invalid(res, 'moves');
         if (outcome.stale) return res.status(409).json({ error: 'The plan has changed', code: 'plan_changed', preview: outcome.stale });
         changed(userId);
         res.json({ ok: true });

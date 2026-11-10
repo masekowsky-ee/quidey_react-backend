@@ -267,9 +267,8 @@ app.use(
     (req, res, next) => (OPEN_WITHOUT_ACCESS.has((req.baseUrl + req.path).replace(/\/+$/, "")) ? next() : requirePro(req, res, next))
 );
 
-// Features not released to everyone yet: only testers (and admins). Every route under
-// /api/tester/... is protected by this; for a single route elsewhere use
-// app.get("/api/x", authenticateToken, requireTester, handler).
+// Only testers (and admins): the Testbereich's ratings (/api/tester/feedback); for a single route
+// elsewhere use app.get("/api/x", authenticateToken, requireTester, handler).
 function requireTester(req, res, next) {
     if (!hasTesterAccess(req.account)) {
         return res.status(403).json({ error: "Only for testers", code: "TESTER_REQUIRED" });
@@ -277,7 +276,13 @@ function requireTester(req, res, next) {
     next();
 }
 
-app.use("/api/tester", authenticateToken, requireTester);
+// /api/tester/... once held the features in test (study goals, notes folders, collections,
+// reminders, the old avatar address); they are everybody's now (2026-11-10) and keep their
+// addresses for the apps out there: like every other part of the app, only with app access.
+// The Testbereich's ratings stay with the testers.
+app.use("/api/tester", authenticateToken, (req, res, next) => (
+    req.path === "/feedback" || req.path.startsWith("/feedback/") ? requireTester(req, res, next) : requirePro(req, res, next)
+));
 
 // Overall limit per account (or per IP before signing in): plenty for the app, which polls
 // every few seconds, but stops scripts from hammering the API
@@ -291,7 +296,7 @@ app.use("/api", rateLimit({
     message: { error: "Too many requests, please slow down", code: "RATE_LIMITED" },
 }));
 
-// Study goals (testers): below the overall limit, behind /api/tester's authenticateToken + requireTester above
+// Study goals: below the overall limit, behind /api/tester's authenticateToken + requirePro above
 app.use("/api/tester/study", require("./study")({ pool, realtime, loadTask }));
 
 app.use("/api/notebook", express.json({ limit: "4mb" }));
@@ -814,14 +819,16 @@ app.get("/api/sessions/:id/tasks", async (req, res) => {
 //   isTester (sees features not released to everyone yet; admins always do),
 //   adminPendingCount (admins only: open beta requests), betaRequest: { status, reason, createdAt } | null,
 //   allDayReminderTime: "HH:MM", when tasks without a time are reminded (see PUT /api/users/reminder-time),
-//   tourSeen: false while a new account hasn't closed the intro tour yet (see PUT /api/users/tour-seen) }
+//   tourSeen: false while a new account hasn't closed the intro tour yet (see PUT /api/users/tour-seen),
+//   savedColors: ["#rrggbb"], the colours of my own the pickers offer (see PUT /api/users/colors),
+//   tipsSeen: [id] / tipsOff: the app's feature tips I have seen / hidden (see /api/users/tips) }
 app.get("/api/me" , authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT users.id, users.username, users.is_pro, users.pro_until, users.is_admin, users.is_tester, users.has_password,
                 users.google_sub IS NOT NULL AS google_linked,
                 to_char(users.allday_reminder_time, 'HH24:MI') AS allday_reminder_time,
-                users.tour_seen_at IS NOT NULL AS tour_seen,
+                users.tour_seen_at IS NOT NULL AS tour_seen, users.saved_colors, users.tips_seen, users.tips_off,
                 users.usage_consent, users.usage_consent_at, users.usage_consent_version,
                 beta_access_requests.status, beta_access_requests.reason, beta_access_requests.created_at,
                 CASE WHEN users.is_admin
@@ -845,6 +852,9 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
             betaRequest: row.status ? { status: row.status, reason: row.reason, createdAt: row.created_at } : null,
             allDayReminderTime: row.allday_reminder_time,
             tourSeen: row.tour_seen,
+            savedColors: row.saved_colors ?? [],
+            tipsSeen: row.tips_seen ?? [],
+            tipsOff: Boolean(row.tips_off),
             accessMode: ACCESS_MODE,
             // whether Quidey Pro can be bought (PRO_BILLING); the apps show it only then
             proSales: PRO_BILLING,
@@ -2515,6 +2525,26 @@ app.put("/api/users/locale", async (req, res) => {
     }
 });
 
+// The colours of my own the colour pickers offer beside the eight: { colors: ["#rrggbb"] }, the
+// whole list (newest first, at most 16, each once). Answers { savedColors }.
+const SAVED_COLORS_MAX = 16;
+app.put("/api/users/colors", async (req, res) => {
+    const list = req.body?.colors;
+    if (!Array.isArray(list) || list.length > SAVED_COLORS_MAX) return invalidInput(res, "colors");
+    const colors = [];
+    for (const value of list) {
+        const hex = typeof value === "string" ? value.toLowerCase() : null;
+        if (!hex || !HEX_COLOR.test(hex)) return invalidInput(res, "colors");
+        if (!colors.includes(hex)) colors.push(hex);
+    }
+    try {
+        await pool.query("UPDATE users SET saved_colors = $1 WHERE id = $2", [colors, req.user.userId]);
+        res.json({ savedColors: colors });
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
 // When tasks without a time of day are reminded: { time: "HH:MM" } in my time zone. Their
 // reminders count from it ("at the start" = that time on the day, "1 day before" = the day
 // before), for pushes, mails and in the app. Answers { allDayReminderTime }.
@@ -2530,6 +2560,53 @@ app.put("/api/users/reminder-time", async (req, res) => {
 });
 
 // The intro tour was closed (finished or skipped): it doesn't open by itself again, on no device
+// The app's feature tips (small tooltips at its controls): which I have seen, and whether I hid them.
+// Every route answers { tipsSeen, tipsOff }. A tip id is the app's (letters, digits, - and _).
+const TIP_ID = /^[A-Za-z0-9_-]{1,40}$/;
+const TIPS_MAX = 300;
+const tipsView = (row) => ({ tipsSeen: row.tips_seen, tipsOff: row.tips_off });
+
+// { ids: [id] } seen now, added to the ones seen before (on any device)
+app.post("/api/users/tips/seen", async (req, res) => {
+    const ids = req.body?.ids;
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 50 || !ids.every((id) => typeof id === "string" && TIP_ID.test(id))) {
+        return invalidInput(res, "ids");
+    }
+    try {
+        const result = await pool.query(
+            `UPDATE users SET tips_seen = ARRAY(SELECT DISTINCT unnest(tips_seen || $1::text[]))
+            WHERE id = $2 AND cardinality(ARRAY(SELECT DISTINCT unnest(tips_seen || $1::text[]))) <= $3
+            RETURNING tips_seen, tips_off`,
+            [ids, req.user.userId, TIPS_MAX]
+        );
+        if (result.rows.length === 0) return invalidInput(res, "ids");
+        res.json(tipsView(result.rows[0]));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// { off: boolean }: "Tipps ausblenden" (true) or back on
+app.put("/api/users/tips", async (req, res) => {
+    if (typeof req.body?.off !== "boolean") return invalidInput(res, "off");
+    try {
+        const result = await pool.query("UPDATE users SET tips_off = $1 WHERE id = $2 RETURNING tips_seen, tips_off", [req.body.off, req.user.userId]);
+        res.json(tipsView(result.rows[0]));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
+// Settings → "Tipps wieder zeigen": every tip once more
+app.delete("/api/users/tips", async (req, res) => {
+    try {
+        const result = await pool.query("UPDATE users SET tips_seen = '{}', tips_off = false WHERE id = $1 RETURNING tips_seen, tips_off", [req.user.userId]);
+        res.json(tipsView(result.rows[0]));
+    } catch (err) {
+        serverError(res, err);
+    }
+});
+
 app.put("/api/users/tour-seen", async (req, res) => {
     try {
         await pool.query("UPDATE users SET tour_seen_at = COALESCE(tour_seen_at, now()) WHERE id = $1", [req.user.userId]);
@@ -5976,7 +6053,7 @@ app.get("/api/stats", async (req, res) => {
                     LEFT JOIN shared_sessions ON d.place = 'session' AND shared_sessions.id = d.place_id) AS done`,
             [userId, from, to]
         )).rows[0];
-        const collections = hasTesterAccess(req.account) ? (await pool.query(
+        const collections = (await pool.query(
             `WITH me AS (SELECT COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = $1),
             focus_in AS (
                 SELECT sessions.id FROM sessions, me
@@ -5993,7 +6070,7 @@ app.get("/api/stats", async (req, res) => {
             HAVING sum(session_tasks.time_ms) > 0
             ORDER BY ms DESC LIMIT 6`,
             [userId, from, to]
-        )).rows : null;
+        )).rows;
         const days = (list) => list.map(d => ({ day: d.day, ms: Number(d.ms), count: Number(d.n) }));
         const focusDays = days(row.focus_days);
         const eventDays = days(row.event_days);
@@ -6011,7 +6088,7 @@ app.get("/api/stats", async (req, res) => {
                 types: row.event_types.map(type => ({ id: type.id, name: type.name, color: type.color, ms: Number(type.ms), count: Number(type.count) })),
             },
             groups: row.groups.map(group => ({ name: group.name, color: group.color, ms: Number(group.ms) })),
-            ...(collections ? { collections: collections.map(c => ({ id: c.id, name: c.name, emoji: c.emoji, color: c.color, ms: Number(c.ms) })) } : {}),
+            collections: collections.map(c => ({ id: c.id, name: c.name, emoji: c.emoji, color: c.color, ms: Number(c.ms) })),
             tasksDone: row.tasks_done,
             together: { teamMs: Number(together.team_ms), places: together.places, done: together.done },
         });
@@ -7004,10 +7081,6 @@ function cleanTags(list) {
     return tags;
 }
 
-// The notes area is in test: only testers may set these (everybody else's notes keep them empty)
-const NOTE_TESTER_COLUMNS = ["folder_id", "tags", "color", "archived", "trashed_at"];
-const usesTesterNoteFields = (values) => NOTE_TESTER_COLUMNS.some(column => column in values);
-const testersOnly = (res) => res.status(403).json({ error: "Only for testers", code: "TESTER_REQUIRED" });
 // a change of these says the note was edited (updated_at); moving it around doesn't
 const NOTE_CONTENT_COLUMNS = ["title", "body", "attachments", "task_id", "tags", "color"];
 
@@ -7078,7 +7151,6 @@ app.get("/api/notebook/:id", async (req, res) => {
 app.post("/api/notebook", async (req, res) => {
     const { field, values } = cleanNote(req.body ?? {}, false);
     if (field) return invalidInput(res, field);
-    if (usesTesterNoteFields(values) && !hasTesterAccess(req.account)) return testersOnly(res);
     try {
         if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");
         if (!await folderMine(values.folder_id, req.user.userId)) return notFound(res, "Folder");
@@ -7102,7 +7174,6 @@ app.put("/api/notebook/:id", async (req, res) => {
     if (!id) return notFound(res, "Note");
     const { field, values } = cleanNote(req.body ?? {}, true);
     if (field) return invalidInput(res, field);
-    if (usesTesterNoteFields(values) && !hasTesterAccess(req.account)) return testersOnly(res);
     const columns = Object.keys(values);
     try {
         if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");

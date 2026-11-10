@@ -532,6 +532,36 @@ describe("task colours and reminders by mail", () => {
         assert.deepEqual((await call("PUT", `/api/tasks/${kept.id}`, { name: "Bleibt", prio: 50, description: "", due: base.due }, ann.token)).data.reminders, [5]);
     });
 
+    test("feature tips: seen ones kept per account and added up, hidden, shown again", async () => {
+        assert.ok(Array.isArray((await call("GET", "/api/me", null, ann.token)).data.tipsSeen));
+        await call("DELETE", "/api/users/tips", null, ann.token);
+        const me = (await call("GET", "/api/me", null, ann.token)).data;
+        assert.deepEqual([me.tipsSeen, me.tipsOff], [[], false]);
+        assert.deepEqual((await call("POST", "/api/users/tips/seen", { ids: ["navHome", "add"] }, ann.token)).data, { tipsSeen: ["add", "navHome"], tipsOff: false });
+        const more = (await call("POST", "/api/users/tips/seen", { ids: ["add", "notesNew"] }, ann.token)).data;
+        assert.deepEqual([...more.tipsSeen].sort(), ["add", "navHome", "notesNew"]);
+        for (const ids of [undefined, [], ["bad id"], [1], "add", Array.from({ length: 51 }, (_, i) => `t${i}`)]) {
+            assert.equal((await call("POST", "/api/users/tips/seen", { ids }, ann.token)).data.field, "ids", JSON.stringify(ids));
+        }
+        assert.deepEqual((await call("PUT", "/api/users/tips", { off: true }, ann.token)).data.tipsOff, true);
+        assert.equal((await call("PUT", "/api/users/tips", { off: "yes" }, ann.token)).data.field, "off");
+        assert.equal((await call("GET", "/api/me", null, ann.token)).data.tipsOff, true);
+        assert.deepEqual((await call("DELETE", "/api/users/tips", null, ann.token)).data, { tipsSeen: [], tipsOff: false });
+        assert.equal((await call("POST", "/api/users/tips/seen", { ids: ["add"] })).status, 401);
+    });
+
+    test("my own colours for the pickers: kept per account, checked, at most 16", async () => {
+        assert.deepEqual((await call("GET", "/api/me", null, ann.token)).data.savedColors, []);
+        const r = await call("PUT", "/api/users/colors", { colors: ["#2A9D8F", "#e76f51", "#2a9d8f"] }, ann.token);
+        assert.deepEqual([r.status, r.data], [200, { savedColors: ["#2a9d8f", "#e76f51"] }]);
+        assert.deepEqual((await call("GET", "/api/me", null, ann.token)).data.savedColors, ["#2a9d8f", "#e76f51"]);
+        for (const colors of [undefined, "#2a9d8f", ["red"], ["#12345"], [null], Array.from({ length: 17 }, (_, i) => `#0000${String(i).padStart(2, "0")}`)]) {
+            assert.equal((await call("PUT", "/api/users/colors", { colors }, ann.token)).data.field, "colors", JSON.stringify(colors));
+        }
+        assert.equal((await call("PUT", "/api/users/colors", { colors: [] })).status, 401);
+        assert.deepEqual((await call("PUT", "/api/users/colors", { colors: [] }, ann.token)).data, { savedColors: [] });
+    });
+
     test("tasks without a time are reminded at my all-day time", async () => {
         assert.equal((await call("GET", "/api/me", null, ann.token)).data.allDayReminderTime, "12:00");
         assert.equal((await call("PUT", "/api/users/reminder-time", { time: "25:00" }, ann.token)).data.field, "time");
@@ -1186,19 +1216,23 @@ describe("testers", () => {
         assert.equal((await call("GET", "/api/me", null, tom.token)).data.isPro, false);
     });
 
-    test("routes under /api/tester are only for testers and admins", async () => {
+    test("routes under /api/tester: the old test features for everybody with app access, the ratings for testers", async () => {
         const boss = await member("routeboss", { admin: true });
         const rita = await member("routerita", { pro: false });
         const pia = await member("routepia");
         await sql("UPDATE users SET is_tester = true WHERE username = 'routerita'");
 
         assert.equal((await call("GET", "/api/tester/anything")).status, 401);
-        const refused = await call("GET", "/api/tester/anything", null, pia.token);
-        assert.equal(refused.status, 403, "pro alone isn't enough");
-        assert.equal(refused.data.code, "TESTER_REQUIRED");
-        // past the check (there is no such route yet)
+        // past the check (there is no such route): pro is enough now, as for the rest of the app
+        assert.equal((await call("GET", "/api/tester/anything", null, pia.token)).status, 404);
         assert.equal((await call("GET", "/api/tester/anything", null, rita.token)).status, 404);
         assert.equal((await call("GET", "/api/tester/anything", null, boss.token)).status, 404);
+        // without app access: no
+        const outside = await member("routeout", { pro: false });
+        assert.equal((await call("GET", "/api/tester/anything", null, outside.token)).data.code, "PRO_REQUIRED");
+        // the Testbereich's ratings stay with the testers
+        assert.equal((await call("GET", "/api/tester/feedback", null, pia.token)).data.code, "TESTER_REQUIRED");
+        assert.equal((await call("GET", "/api/tester/feedback", null, rita.token)).status, 200);
     });
 
     test("testers rate and comment on what they test; admins see it together", async () => {
@@ -2731,8 +2765,11 @@ describe("sub-groups in sessions and families (everybody)", () => {
         const tomsSession = (await call("POST", T, { name: "Auch", group_id: groupId }, tom.token)).data;
         assert.equal(tomsSession.tasks.find(t => t.name === "Auch").groupId, groupId);
         assert.equal((await call("GET", `/api/shared-sessions/${sessionId}`, null, tom.token)).data.tasks.find(t => t.id === task.id).groupId, groupId);
-        // the old tester address still answers testers, nobody else
-        assert.equal((await call("POST", `/api/tester/shared-sessions/${sessionId}/groups`, { name: "Alt" }, tom.token)).data.code, "TESTER_REQUIRED");
+        // the old tester address answers everybody in the session now
+        const old = await call("POST", `/api/tester/shared-sessions/${sessionId}/groups`, { name: "Alt" }, tom.token);
+        assert.equal(old.status, 201, JSON.stringify(old.data));
+        const oldId = old.data.groups?.find(g => g.name === "Alt")?.id ?? old.data.id;
+        assert.equal((await call("DELETE", `/api/tester/shared-sessions/${sessionId}/groups/${oldId}`, null, tom.token)).status, 200);
         // only this session's groups
         assert.equal((await call("POST", T, { name: "Falsch", group_id: 999999 }, tia.token)).data.field, "group_id");
 
@@ -2956,13 +2993,13 @@ describe("notes area and collections (testers)", () => {
         await sql("UPDATE users SET is_tester = false WHERE id = $1", [plain.id]);
     });
 
-    test("folders, tags, colour, archive; only testers set them", async () => {
+    test("folders, tags, colour, archive; for everybody", async () => {
         let r = await call("POST", "/api/tester/note-folders", { name: "Mathe", emoji: "📐" }, tess.token);
         assert.equal(r.status, 201, JSON.stringify(r.data));
         const folder = r.data;
         assert.equal((await call("POST", "/api/tester/note-folders", { name: "mathe" }, tess.token)).data.code, "FOLDER_EXISTS");
         assert.equal((await call("POST", "/api/tester/note-folders", { name: " " }, tess.token)).data.field, "name");
-        assert.equal((await call("GET", "/api/tester/note-folders", null, plain.token)).data.code, "TESTER_REQUIRED");
+        assert.deepEqual((await call("GET", "/api/tester/note-folders", null, plain.token)).data, [], "not a tester: folders all the same");
 
         r = await call("POST", "/api/notebook", { title: "Analysis", body: "x", folderId: folder.id, tags: ["#klausur", "Klausur", "lernzettel"], color: "blue" }, tess.token);
         assert.equal(r.status, 201, JSON.stringify(r.data));
@@ -2980,7 +3017,7 @@ describe("notes area and collections (testers)", () => {
         assert.equal((await call("POST", "/api/notebook", { body: "x", attachments: [{ kind: "link", url: "https://a.de/\u0000" }] }, tess.token)).data.field, "attachments");
         assert.equal((await call("POST", "/api/tester/note-folders", { name: "a\u0000b" }, tess.token)).data.field, "name");
         assert.equal((await call("POST", "/api/notebook", { body: "x", folderId: folder.id }, other.token)).status, 404, "not somebody else's folder");
-        assert.equal((await call("POST", "/api/notebook", { body: "x", tags: ["a"] }, plain.token)).data.code, "TESTER_REQUIRED");
+        assert.deepEqual((await call("POST", "/api/notebook", { body: "x", tags: ["a"] }, plain.token)).data.tags, ["a"], "tags for everybody");
         assert.equal((await call("POST", "/api/notebook", { body: "plain note" }, plain.token)).status, 201, "the notebook itself stays for everybody");
 
         const before = note.updatedAt;
@@ -3036,7 +3073,7 @@ describe("notes area and collections (testers)", () => {
         assert.equal((await call("POST", `/api/tester/collections/${col.id}/items`, { kind: "folder", id: 1 }, tess.token)).data.field, "item");
         assert.equal((await call("POST", `/api/tester/collections/${col.id}/items`, { kind: "task", id: learn }, other.token)).status, 404, "not somebody else's collection");
         assert.equal((await call("POST", "/api/tester/collections", { name: "x", items: [{ kind: "task", id: foreign }] }, tess.token)).status, 404);
-        assert.equal((await call("GET", "/api/tester/collections", null, plain.token)).data.code, "TESTER_REQUIRED");
+        assert.equal((await call("GET", "/api/tester/collections", null, plain.token)).status, 200, "for everybody");
 
         // one thing in two collections
         const second = (await call("POST", "/api/tester/collections", { name: "Diese Woche", items: [{ kind: "task", id: learn }] }, tess.token)).data;
@@ -3094,7 +3131,7 @@ describe("notes area and collections (testers)", () => {
         let stats = (await call("GET", "/api/stats", null, gina.token)).data;
         assert.deepEqual(stats.collections.map(c => [c.id, c.ms]), [[learn.id, 1200000]]);
         stats = (await call("GET", "/api/stats", null, plain.token)).data;
-        assert.equal(stats.collections, undefined, "not for everybody else");
+        assert.ok(Array.isArray(stats.collections), "for everybody");
     });
 });
 
@@ -3144,7 +3181,7 @@ describe("upload safety and profile pictures", () => {
 
     test("everybody sets a profile picture (testers' old address still works)", async () => {
         assert.equal((await call("PUT", "/api/profile/avatar", { data: WEBP }, pal.token)).status, 200);
-        assert.equal((await call("PUT", "/api/tester/avatar", { data: WEBP }, pal.token)).data.code, "TESTER_REQUIRED");
+        assert.equal((await call("PUT", "/api/tester/avatar", { data: WEBP }, pal.token)).status, 200, "the old address too");
         assert.equal((await call("PUT", "/api/profile/avatar", { data: WEBP }, outsider.token)).data.code, "PRO_REQUIRED");
         assert.deepEqual(Object.keys((await call("GET", `/api/avatars?ids=${pal.id}`, null, pia.token)).data), [String(pal.id)]);
         await call("DELETE", "/api/profile/avatar", null, pal.token);
@@ -3504,9 +3541,9 @@ describe("Reminders (testers): once or on weekdays, pushed except to devices tha
         await sql("UPDATE users SET is_tester = true WHERE id = ANY($1)", [[rita.id, rolf.id]]);
     });
 
-    test("only testers, and the input is checked", async () => {
+    test("for everybody, and the input is checked", async () => {
         const soon = new Date(Date.now() + 3600e3).toISOString();
-        assert.equal((await call("GET", R, null, plain.token)).data.code, "TESTER_REQUIRED");
+        assert.equal((await call("GET", R, null, plain.token)).status, 200);
         assert.equal((await call("POST", R, { text: "", at: soon }, rita.token)).data.field, "text");
         assert.equal((await call("POST", R, { text: "x" }, rita.token)).data.field, "at");
         assert.equal((await call("POST", R, { text: "x", at: "bald" }, rita.token)).data.field, "at");
@@ -3640,8 +3677,8 @@ describe("study goals", () => {
         `INSERT INTO tasks (name, kind, user_id, due, duration_minutes, goal_part_id, done) VALUES ('S', 'task', $1, $2, 45, $3, $4) RETURNING id`,
         [user.id, due, partId, !!extra.done]))[0].id;
 
-    test("testers only", async () => {
-        assert.equal((await call("GET", `${S}/subjects`, null, plain.token)).data.code, "TESTER_REQUIRED");
+    test("for everybody with app access", async () => {
+        assert.equal((await call("GET", `${S}/subjects`, null, plain.token)).status, 200);
     });
 
     test("study routes count against the overall /api rate limit", async () => {
@@ -3990,6 +4027,39 @@ describe("study plan", () => {
         const firsts = (await sessionsOf(me)).filter(s => parts.has(s.goal_part_id));
         assert.equal(firsts.length, 6);
         assert.ok(firsts.every(s => s.due >= daysFromToday(3)));
+    });
+
+    test("the preview lists the whole plan with keys; a session moved there is written there, pinned", async () => {
+        const me = await tester();
+        const sub = await subject(me);
+        await goal(me, sub.id);
+        const p = await preview(me);
+        const [pg] = p.goals;
+        assert.equal(pg.sessions.length, 6);
+        assert.ok(pg.sessions.every(s => s.change === "new" && Number.isInteger(s.key) && s.minutes === 45), JSON.stringify(pg.sessions));
+        assert.deepEqual(pg.sessions.map(s => s.key).sort(), [0, 1, 2, 3, 4, 5]);
+
+        const [first] = pg.sessions;
+        const bad = async (moves) => (await call("POST", `${S}/replan`, { inputHash: p.inputHash, moves }, me.token)).data.code;
+        assert.equal(await bad([{ key: first.key, date: "2026-02-30", time: null }]), "invalid_input");
+        assert.equal(await bad([{ key: first.key, date: daysFromToday(3), time: "25:00" }]), "invalid_input");
+        assert.equal(await bad([{ key: 99, date: daysFromToday(3), time: null }]), "invalid_input");
+        assert.equal(await bad([{ key: 0, date: daysFromToday(3) }, { key: 0, date: daysFromToday(4) }]), "invalid_input");
+        assert.equal((await sessionsOf(me)).length, 0, "nothing written by a refused apply");
+
+        const target = daysFromToday(9);
+        const r = await call("POST", `${S}/replan`, { inputHash: p.inputHash, moves: [{ key: first.key, date: target, time: "17:30" }] }, me.token);
+        assert.deepEqual([r.status, r.data], [200, { ok: true }]);
+        const planned = await sessionsOf(me);
+        assert.equal(planned.length, 6);
+        const pinned = planned.filter(s => s.plan_pinned);
+        assert.equal(pinned.length, 1);
+        assert.deepEqual([pinned[0].due, pinned[0].due_time, pinned[0].goal_part_id], [target, "17:30", first.partId]);
+
+        // the pinned one is the user's now: the planner plans around it and never names it
+        const again = await preview(me);
+        assert.equal(again.goals[0].sessions.length, 5);
+        assert.ok(again.goals[0].sessions.every(s => !(s.date === target && s.time === "17:30")));
     });
 
     test("a session ticked off after the preview: replan answers 409 with a fresh preview and changes nothing", async () => {
@@ -4670,7 +4740,7 @@ describe("study push (kind study)", () => {
         assert.equal(pushes(me).length, 0);
     });
 
-    test("nothing for a device with study off, nor for an account that is not a tester", async () => {
+    test("nothing for a device with study off, nor for an account without app access", async () => {
         const off = await tester();
         const goalOff = await makeGoal(off);
         await device(off, 1, { study: false });
@@ -4680,7 +4750,7 @@ describe("study push (kind study)", () => {
         const goalPlain = await makeGoal(plain);
         await device(plain, 1);
         await missed(plain, goalPlain.parts[0].id, await plusDays(await today(), -1));
-        await sql("UPDATE users SET is_tester = false WHERE id = $1", [plain.id]);
+        await sql("UPDATE users SET is_tester = false, is_pro = false, is_admin = false WHERE id = $1", [plain.id]);
 
         await pushStudyBehind(pool, await at(await today(), "09:00"));
         assert.equal(pushes(off).length, 0);

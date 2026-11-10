@@ -94,3 +94,45 @@ test("044 adds the consent columns and the usage tables, runs twice without harm
         await admin.end();
     }
 });
+
+test("047 keeps the tips seen per account; who saw the old tour has the basics seen, others none", { skip: NO_DB }, async () => {
+    const conn = (database) => ({
+        user: process.env.DB_USER, password: process.env.DB_PASSWORD,
+        host: process.env.DB_HOST, port: Number(process.env.DB_PORT) || 5432, database,
+    });
+    const name = `quidey_mig047_${process.pid}`;
+    const admin = new pg.Client(conn("postgres"));
+    await admin.connect();
+    await admin.query(`CREATE DATABASE ${name}`);
+    const db = new pg.Client(conn(name));
+    try {
+        await db.connect();
+        await db.query(readFileSync(join(ROOT, "schema.sql"), "utf8"));
+        await db.query("SET search_path = public");
+        // back to the schema before 047
+        await db.query("ALTER TABLE users DROP COLUMN IF EXISTS tips_seen, DROP COLUMN IF EXISTS tips_off");
+        const add = async (username, tourSeen) => (await db.query(
+            `INSERT INTO users (username, password_hash, email, tour_seen_at) VALUES ($1, 'x', $1 || '@example.com', $2) RETURNING id`,
+            [username, tourSeen ? new Date() : null])).rows[0].id;
+        const old = await add("mig047old", true);
+        const fresh = await add("mig047new", false);
+
+        const migration = readFileSync(join(DIR, "047_feature_tips.sql"), "utf8");
+        await db.query(migration);
+        await db.query(migration); // a second run changes nothing
+
+        const seen = async (id) => (await db.query("SELECT tips_seen, tips_off FROM users WHERE id = $1", [id])).rows[0];
+        const oldRow = await seen(old);
+        assert.ok(oldRow.tips_seen.includes("navHome") && oldRow.tips_seen.includes("calendarDrag"), JSON.stringify(oldRow));
+        assert.ok(!oldRow.tips_seen.includes("notesNew") && !oldRow.tips_seen.includes("studyGoal"), "new features stay to be seen");
+        assert.equal(new Set(oldRow.tips_seen).size, oldRow.tips_seen.length, "each once, also after a second run");
+        assert.equal(oldRow.tips_off, false);
+        assert.deepEqual(await seen(fresh), { tips_seen: [], tips_off: false });
+        await assert.rejects(db.query("UPDATE users SET tips_seen = $1 WHERE id = $2",
+            [Array.from({ length: 301 }, (_, i) => `t${i}`), fresh]), /tips_seen_check|check constraint/i);
+    } finally {
+        await db.end().catch(() => {});
+        await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+        await admin.end();
+    }
+});
