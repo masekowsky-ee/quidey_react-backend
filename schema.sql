@@ -2617,6 +2617,26 @@ CREATE TABLE IF NOT EXISTS public.usage_people (
 );
 
 --
+-- 046: colours of one's own kept for the colour pickers (see migrations/046_saved_colours.sql)
+--
+
+ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS saved_colors text[] DEFAULT '{}'::text[] NOT NULL;
+ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_saved_colors_check;
+ALTER TABLE public.users ADD CONSTRAINT users_saved_colors_check CHECK ((cardinality(saved_colors) <= 16));
+
+--
+-- 047: feature tips seen per account (see migrations/047_feature_tips.sql; a fresh database has no
+-- accounts, so the basics marked seen there don't apply here)
+--
+
+ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS tips_seen text[] DEFAULT '{}'::text[] NOT NULL,
+  ADD COLUMN IF NOT EXISTS tips_off boolean DEFAULT false NOT NULL;
+ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_tips_seen_check;
+ALTER TABLE public.users ADD CONSTRAINT users_tips_seen_check CHECK ((cardinality(tips_seen) <= 300));
+
+--
 -- PostgreSQL database dump complete
 --
 

@@ -506,6 +506,36 @@ describe("task colours and reminders by mail", () => {
         assert.deepEqual((await call("PUT", `/api/tasks/${kept.id}`, { name: "Bleibt", prio: 50, description: "", due: base.due }, ann.token)).data.reminders, [5]);
     });
 
+    test("feature tips: seen ones kept per account and added up, hidden, shown again", async () => {
+        assert.ok(Array.isArray((await call("GET", "/api/me", null, ann.token)).data.tipsSeen));
+        await call("DELETE", "/api/users/tips", null, ann.token);
+        const me = (await call("GET", "/api/me", null, ann.token)).data;
+        assert.deepEqual([me.tipsSeen, me.tipsOff], [[], false]);
+        assert.deepEqual((await call("POST", "/api/users/tips/seen", { ids: ["navHome", "add"] }, ann.token)).data, { tipsSeen: ["add", "navHome"], tipsOff: false });
+        const more = (await call("POST", "/api/users/tips/seen", { ids: ["add", "notesNew"] }, ann.token)).data;
+        assert.deepEqual([...more.tipsSeen].sort(), ["add", "navHome", "notesNew"]);
+        for (const ids of [undefined, [], ["bad id"], [1], "add", Array.from({ length: 51 }, (_, i) => `t${i}`)]) {
+            assert.equal((await call("POST", "/api/users/tips/seen", { ids }, ann.token)).data.field, "ids", JSON.stringify(ids));
+        }
+        assert.deepEqual((await call("PUT", "/api/users/tips", { off: true }, ann.token)).data.tipsOff, true);
+        assert.equal((await call("PUT", "/api/users/tips", { off: "yes" }, ann.token)).data.field, "off");
+        assert.equal((await call("GET", "/api/me", null, ann.token)).data.tipsOff, true);
+        assert.deepEqual((await call("DELETE", "/api/users/tips", null, ann.token)).data, { tipsSeen: [], tipsOff: false });
+        assert.equal((await call("POST", "/api/users/tips/seen", { ids: ["add"] })).status, 401);
+    });
+
+    test("my own colours for the pickers: kept per account, checked, at most 16", async () => {
+        assert.deepEqual((await call("GET", "/api/me", null, ann.token)).data.savedColors, []);
+        const r = await call("PUT", "/api/users/colors", { colors: ["#2A9D8F", "#e76f51", "#2a9d8f"] }, ann.token);
+        assert.deepEqual([r.status, r.data], [200, { savedColors: ["#2a9d8f", "#e76f51"] }]);
+        assert.deepEqual((await call("GET", "/api/me", null, ann.token)).data.savedColors, ["#2a9d8f", "#e76f51"]);
+        for (const colors of [undefined, "#2a9d8f", ["red"], ["#12345"], [null], Array.from({ length: 17 }, (_, i) => `#0000${String(i).padStart(2, "0")}`)]) {
+            assert.equal((await call("PUT", "/api/users/colors", { colors }, ann.token)).data.field, "colors", JSON.stringify(colors));
+        }
+        assert.equal((await call("PUT", "/api/users/colors", { colors: [] })).status, 401);
+        assert.deepEqual((await call("PUT", "/api/users/colors", { colors: [] }, ann.token)).data, { savedColors: [] });
+    });
+
     test("tasks without a time are reminded at my all-day time", async () => {
         assert.equal((await call("GET", "/api/me", null, ann.token)).data.allDayReminderTime, "12:00");
         assert.equal((await call("PUT", "/api/users/reminder-time", { time: "25:00" }, ann.token)).data.field, "time");
@@ -3964,6 +3994,39 @@ describe("study plan", () => {
         const firsts = (await sessionsOf(me)).filter(s => parts.has(s.goal_part_id));
         assert.equal(firsts.length, 6);
         assert.ok(firsts.every(s => s.due >= daysFromToday(3)));
+    });
+
+    test("the preview lists the whole plan with keys; a session moved there is written there, pinned", async () => {
+        const me = await tester();
+        const sub = await subject(me);
+        await goal(me, sub.id);
+        const p = await preview(me);
+        const [pg] = p.goals;
+        assert.equal(pg.sessions.length, 6);
+        assert.ok(pg.sessions.every(s => s.change === "new" && Number.isInteger(s.key) && s.minutes === 45), JSON.stringify(pg.sessions));
+        assert.deepEqual(pg.sessions.map(s => s.key).sort(), [0, 1, 2, 3, 4, 5]);
+
+        const [first] = pg.sessions;
+        const bad = async (moves) => (await call("POST", `${S}/replan`, { inputHash: p.inputHash, moves }, me.token)).data.code;
+        assert.equal(await bad([{ key: first.key, date: "2026-02-30", time: null }]), "invalid_input");
+        assert.equal(await bad([{ key: first.key, date: daysFromToday(3), time: "25:00" }]), "invalid_input");
+        assert.equal(await bad([{ key: 99, date: daysFromToday(3), time: null }]), "invalid_input");
+        assert.equal(await bad([{ key: 0, date: daysFromToday(3) }, { key: 0, date: daysFromToday(4) }]), "invalid_input");
+        assert.equal((await sessionsOf(me)).length, 0, "nothing written by a refused apply");
+
+        const target = daysFromToday(9);
+        const r = await call("POST", `${S}/replan`, { inputHash: p.inputHash, moves: [{ key: first.key, date: target, time: "17:30" }] }, me.token);
+        assert.deepEqual([r.status, r.data], [200, { ok: true }]);
+        const planned = await sessionsOf(me);
+        assert.equal(planned.length, 6);
+        const pinned = planned.filter(s => s.plan_pinned);
+        assert.equal(pinned.length, 1);
+        assert.deepEqual([pinned[0].due, pinned[0].due_time, pinned[0].goal_part_id], [target, "17:30", first.partId]);
+
+        // the pinned one is the user's now: the planner plans around it and never names it
+        const again = await preview(me);
+        assert.equal(again.goals[0].sessions.length, 5);
+        assert.ok(again.goals[0].sessions.every(s => !(s.date === target && s.time === "17:30")));
     });
 
     test("a session ticked off after the preview: replan answers 409 with a fresh preview and changes nothing", async () => {
