@@ -1,5 +1,5 @@
-// Study goals (testers): subjects, goals with their parts, study settings.
-// Mounted at /api/tester/study, behind authenticateToken + requireTester. Every id is checked
+// Study goals: subjects, goals with their parts, study settings.
+// Mounted at /api/tester/study (the address from its test), behind authenticateToken + requirePro. Every id is checked
 // against the caller (user_id); somebody else's id answers 404.
 
 const express = require('express');

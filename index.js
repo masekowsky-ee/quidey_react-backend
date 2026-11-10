@@ -265,9 +265,8 @@ app.use(
     (req, res, next) => (OPEN_WITHOUT_ACCESS.has((req.baseUrl + req.path).replace(/\/+$/, "")) ? next() : requirePro(req, res, next))
 );
 
-// Features not released to everyone yet: only testers (and admins). Every route under
-// /api/tester/... is protected by this; for a single route elsewhere use
-// app.get("/api/x", authenticateToken, requireTester, handler).
+// Only testers (and admins): the Testbereich's ratings (/api/tester/feedback); for a single route
+// elsewhere use app.get("/api/x", authenticateToken, requireTester, handler).
 function requireTester(req, res, next) {
     if (!hasTesterAccess(req.account)) {
         return res.status(403).json({ error: "Only for testers", code: "TESTER_REQUIRED" });
@@ -275,7 +274,13 @@ function requireTester(req, res, next) {
     next();
 }
 
-app.use("/api/tester", authenticateToken, requireTester);
+// /api/tester/... once held the features in test (study goals, notes folders, collections,
+// reminders, the old avatar address); they are everybody's now (2026-11-10) and keep their
+// addresses for the apps out there: like every other part of the app, only with app access.
+// The Testbereich's ratings stay with the testers.
+app.use("/api/tester", authenticateToken, (req, res, next) => (
+    req.path === "/feedback" || req.path.startsWith("/feedback/") ? requireTester(req, res, next) : requirePro(req, res, next)
+));
 
 // Overall limit per account (or per IP before signing in): plenty for the app, which polls
 // every few seconds, but stops scripts from hammering the API
@@ -289,7 +294,7 @@ app.use("/api", rateLimit({
     message: { error: "Too many requests, please slow down", code: "RATE_LIMITED" },
 }));
 
-// Study goals (testers): below the overall limit, behind /api/tester's authenticateToken + requireTester above
+// Study goals: below the overall limit, behind /api/tester's authenticateToken + requirePro above
 app.use("/api/tester/study", require("./study")({ pool, realtime, loadTask }));
 
 app.use("/api/notebook", express.json({ limit: "4mb" }));
@@ -6039,7 +6044,7 @@ app.get("/api/stats", async (req, res) => {
                     LEFT JOIN shared_sessions ON d.place = 'session' AND shared_sessions.id = d.place_id) AS done`,
             [userId, from, to]
         )).rows[0];
-        const collections = hasTesterAccess(req.account) ? (await pool.query(
+        const collections = (await pool.query(
             `WITH me AS (SELECT COALESCE(timezone, 'Europe/Berlin') AS tz FROM users WHERE id = $1),
             focus_in AS (
                 SELECT sessions.id FROM sessions, me
@@ -6056,7 +6061,7 @@ app.get("/api/stats", async (req, res) => {
             HAVING sum(session_tasks.time_ms) > 0
             ORDER BY ms DESC LIMIT 6`,
             [userId, from, to]
-        )).rows : null;
+        )).rows;
         const days = (list) => list.map(d => ({ day: d.day, ms: Number(d.ms), count: Number(d.n) }));
         const focusDays = days(row.focus_days);
         const eventDays = days(row.event_days);
@@ -6074,7 +6079,7 @@ app.get("/api/stats", async (req, res) => {
                 types: row.event_types.map(type => ({ id: type.id, name: type.name, color: type.color, ms: Number(type.ms), count: Number(type.count) })),
             },
             groups: row.groups.map(group => ({ name: group.name, color: group.color, ms: Number(group.ms) })),
-            ...(collections ? { collections: collections.map(c => ({ id: c.id, name: c.name, emoji: c.emoji, color: c.color, ms: Number(c.ms) })) } : {}),
+            collections: collections.map(c => ({ id: c.id, name: c.name, emoji: c.emoji, color: c.color, ms: Number(c.ms) })),
             tasksDone: row.tasks_done,
             together: { teamMs: Number(together.team_ms), places: together.places, done: together.done },
         });
@@ -7067,10 +7072,6 @@ function cleanTags(list) {
     return tags;
 }
 
-// The notes area is in test: only testers may set these (everybody else's notes keep them empty)
-const NOTE_TESTER_COLUMNS = ["folder_id", "tags", "color", "archived", "trashed_at"];
-const usesTesterNoteFields = (values) => NOTE_TESTER_COLUMNS.some(column => column in values);
-const testersOnly = (res) => res.status(403).json({ error: "Only for testers", code: "TESTER_REQUIRED" });
 // a change of these says the note was edited (updated_at); moving it around doesn't
 const NOTE_CONTENT_COLUMNS = ["title", "body", "attachments", "task_id", "tags", "color"];
 
@@ -7141,7 +7142,6 @@ app.get("/api/notebook/:id", async (req, res) => {
 app.post("/api/notebook", async (req, res) => {
     const { field, values } = cleanNote(req.body ?? {}, false);
     if (field) return invalidInput(res, field);
-    if (usesTesterNoteFields(values) && !hasTesterAccess(req.account)) return testersOnly(res);
     try {
         if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");
         if (!await folderMine(values.folder_id, req.user.userId)) return notFound(res, "Folder");
@@ -7165,7 +7165,6 @@ app.put("/api/notebook/:id", async (req, res) => {
     if (!id) return notFound(res, "Note");
     const { field, values } = cleanNote(req.body ?? {}, true);
     if (field) return invalidInput(res, field);
-    if (usesTesterNoteFields(values) && !hasTesterAccess(req.account)) return testersOnly(res);
     const columns = Object.keys(values);
     try {
         if (!await taskVisible(values.task_id, req.user.userId)) return notFound(res, "Task");

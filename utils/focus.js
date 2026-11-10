@@ -7,7 +7,7 @@
 // nobody would hear that the 25 minutes are over. Checked every FOCUS_CHECK_MS (a few seconds:
 // it should come on time); one that is more than LATE_LIMIT late is dropped without a push.
 //
-// Reminders (testers): once at `at`, or on each of their weekdays at at_time in my time zone; a
+// Reminders: once at `at`, or on each of their weekdays at at_time in my time zone; a
 // snooze rings at snoozed_until instead. Each time goes out once (fired_for), at most LATE_LIMIT
 // late; not to devices that ring them themselves (the Android app, push_subscriptions.alarms).
 //
@@ -15,7 +15,7 @@
 // (reminded_on), within an hour after the time.
 
 const { pushToUsers } = require("./push");
-const { APP_ACCESS_SQL, TESTER_ACCESS_SQL } = require("./access");
+const { APP_ACCESS_SQL } = require("./access");
 const { DEFAULT_TIMEZONE } = require("./reminderMails");
 
 const LATE_LIMIT = "10 minutes";
@@ -127,7 +127,7 @@ const PICK_REMINDERS = `
         WHERE reminders.done_at IS NULL
             AND due.at <= now() AND due.at > now() - interval '${LATE_LIMIT}'
             AND (reminders.fired_for IS NULL OR reminders.fired_for < due.at)
-            AND ${APP_ACCESS_SQL} AND ${TESTER_ACCESS_SQL}
+            AND ${APP_ACCESS_SQL}
         FOR UPDATE OF reminders SKIP LOCKED
     ) AS ready
     WHERE reminders.id = ready.id

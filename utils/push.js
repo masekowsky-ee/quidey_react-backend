@@ -16,7 +16,7 @@
 //   social    friend requests, invites, tasks shared with / given to me (in a session or a
 //             family), news from the team; for admins also new beta requests
 //   groups    somebody else added entries to a family / session I'm in; messages in their chats
-//   study     a study goal (exam, assignment, …) is behind its plan (testers only): at most one a day,
+//   study     a study goal (exam, assignment, …) is behind its plan: at most one a day,
 //             08:00-19:00 in my time zone, see pushStudyBehind
 // "plan" also brings the reminders of my families' entries (to every joined member).
 // Only accounts with app access get anything (closed beta). A device the push service no longer
@@ -26,7 +26,7 @@
 // their messages through Firebase Cloud Messaging (utils/fcm.js, FIREBASE_SERVICE_ACCOUNT_FILE).
 
 const webpush = require("web-push");
-const { APP_ACCESS_SQL, TESTER_ACCESS_SQL } = require("./access");
+const { APP_ACCESS_SQL } = require("./access");
 const { DEFAULT_TIMEZONE } = require("./reminderMails");
 const { FCM_ENABLED, isFcmEndpoint, sendFcm } = require("./fcm");
 const { loadPlanInput, statusOf } = require("./studyLoad");
@@ -367,12 +367,12 @@ async function pushDigests(pool) {
 // Study goals that are behind their plan: at most one push per user and day, 08:00-19:00 in my time
 // zone (shouldNotify decides), and only when the deficit is new or grew by a whole session. One push
 // for all goals that qualify; their behind_notified_minutes / behind_notified_on are set when it went
-// out, a goal that is not behind any more is reset to 0. Testers with an active goal and a device that
+// out, a goal that is not behind any more is reset to 0. Everybody with app access, an active goal and a device that
 // wants "study". `now` is for the tests. Returns how many users were notified.
 async function pushStudyBehind(pool, now = new Date()) {
     const users = await pool.query(
         `SELECT users.id, users.language FROM users
-        WHERE ${TESTER_ACCESS_SQL}
+        WHERE ${APP_ACCESS_SQL}
             AND EXISTS (SELECT 1 FROM goals WHERE goals.user_id = users.id AND goals.status = 'active')
             AND EXISTS (SELECT 1 FROM push_subscriptions WHERE push_subscriptions.user_id = users.id AND push_subscriptions.study)`
     );
