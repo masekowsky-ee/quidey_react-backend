@@ -198,6 +198,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         id: row.id, name: row.name, emoji: row.emoji, color: row.color, archived: row.archived, nextGoal,
         // made by the Untis sync: can be folded away (archived), not deleted
         fromUntis: Boolean(row.untis_name),
+        untisName: row.untis_name ?? null,
     });
 
     // Runs fn(client) in one transaction. fn may throw a Rollback to undo everything and return its value.
