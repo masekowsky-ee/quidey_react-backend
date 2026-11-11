@@ -27,6 +27,10 @@ const hasPro = (account) => Boolean(account.is_pro || (account.pro_until && new 
 
 const hasAppAccess = (account) => ACCESS_MODE === "open" || Boolean(hasPro(account) || account.is_tester || account.is_admin);
 
+// The AI features (utils/ai.js, ai.js, the study estimates, the homework time estimate): Pro (a gift or a
+// running subscription) and admins; testers get no AI unless they are Pro too.
+const hasAiAccess = (account) => Boolean(account && (hasPro(account) || account.is_admin));
+
 // Features not released to everyone yet: testers, and admins always.
 const hasTesterAccess = (account) => Boolean(account.is_tester || account.is_admin);
 
@@ -40,4 +44,4 @@ const APP_ACCESS_SQL = ACCESS_MODE === "open" ? "true" : `(${PRO_SQL} OR users.i
 // The same as hasTesterAccess, for SQL on the users table
 const TESTER_ACCESS_SQL = "(users.is_tester OR users.is_admin)";
 
-module.exports = { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasAppAccess, hasTesterAccess, hasNoLimits, PRO_SQL, APP_ACCESS_SQL, TESTER_ACCESS_SQL };
+module.exports = { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasAiAccess, hasAppAccess, hasTesterAccess, hasNoLimits, PRO_SQL, APP_ACCESS_SQL, TESTER_ACCESS_SQL };

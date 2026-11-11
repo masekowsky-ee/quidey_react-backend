@@ -11,6 +11,7 @@
 const express = require("express");
 const quota = require("./utils/quota");
 const { ask, available, AiError, aiErrorResponse } = require("./utils/ai");
+const { hasAiAccess } = require("./utils/access");
 
 const TASK_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
 const LINE_MAX = 500;
@@ -256,8 +257,15 @@ module.exports = function aiRouter({ pool }) {
     }
 
     // available: false when the AI isn't set up here (no ANTHROPIC_API_KEY): the app hides its buttons
+    // (and not for accounts without AI access: Pro and admins only, see utils/access.js)
     router.get("/quota", async (req, res) => {
-        res.json({ available: available(), ...await quota.status(pool, req.user.userId) });
+        res.json({ available: available() && hasAiAccess(req.account), ...await quota.status(pool, req.user.userId) });
+    });
+
+    // every other route is Pro only
+    router.use((req, res, next) => {
+        if (hasAiAccess(req.account)) return next();
+        res.status(403).json({ error: "The AI features are part of Quidey Pro", code: "PRO_REQUIRED" });
     });
 
     router.post("/parse-entry", async (req, res) => {

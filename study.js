@@ -9,6 +9,7 @@ const {
     reviewMinutes, makeAiClient, estimateParts, askAi, aiModel, pageCount, wantsAi,
 } = require('./utils/studyEstimate');
 const { plan } = require('./utils/studyPlanner');
+const { hasAiAccess } = require('./utils/access');
 const {
     getClock, loadSessions, loadGoals, goalView, goalProgress, loadPlanInput, statusOf, inputHash, ACTIVE_GOAL_SQL, isEnded,
 } = require('./utils/studyLoad');
@@ -692,7 +693,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
     });
 
     // ---------- settings ----------
-    async function settingsView(userId) {
+    async function settingsView(userId, account) {
         const clock = await getClock(pool, userId);
         const windows = (await pool.query(
             `SELECT weekday, to_char(start_time, 'HH24:MI') AS start, to_char(end_time, 'HH24:MI') AS "end"
@@ -704,12 +705,12 @@ module.exports = ({ pool, realtime, loadTask }) => {
             sessionMinutes: clock.sessionMinutes,
             dailyMaxMinutes: clock.dailyMaxMinutes,
             aiAuto: clock.aiAuto,
-            aiAvailable: makeAiClient() !== null,
+            aiAvailable: makeAiClient() !== null && hasAiAccess(account),
         };
     }
 
     router.get('/settings', async (req, res) => {
-        res.json(await settingsView(req.user.userId));
+        res.json(await settingsView(req.user.userId, req.account));
     });
 
     router.put('/settings', async (req, res) => {
@@ -761,7 +762,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         } finally {
             client.release();
         }
-        res.json(await settingsView(userId));
+        res.json(await settingsView(userId, req.account));
     });
 
     // ---------- plan: preview, apply, "Jetzt lernen", unpin ----------
@@ -948,7 +949,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
                 conflictTaskIds: status.conflictTaskIds, freedMinutes: g.goal.freedMinutes,
             })),
             notifiedMinutes: Object.fromEntries(rows.map(({ g }) => [g.goal.id, notified.get(g.goal.id) ?? 0])),
-            aiAvailable: makeAiClient() !== null,
+            aiAvailable: makeAiClient() !== null && hasAiAccess(req.account),
         });
     });
 
@@ -1015,7 +1016,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         let estimates = estimateParts({ parts: named, kind: body.kind, history });
 
         const clock = await getClock(pool, userId);
-        const client = wantsAi({ ai: body.ai ?? undefined, aiAuto: clock.aiAuto }) ? makeAiClient() : null;
+        const client = hasAiAccess(req.account) && wantsAi({ ai: body.ai ?? undefined, aiAuto: clock.aiAuto }) ? makeAiClient() : null;
         const open = estimates.flatMap((e, i) => (e.source === 'default' ? [i] : [])); // only what nothing else could estimate
         let aiUsed = false;
         let aiFailed = false;

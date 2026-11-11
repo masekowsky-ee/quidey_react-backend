@@ -5144,6 +5144,46 @@ describe("AI help: daily limits and reading a quick-entry line", () => {
     });
 });
 
+describe("AI features are for Pro (and admins), not for testers", () => {
+    const plan = async (name, { pro, tester = false, admin = false }) => {
+        const user = await member(name, { pro, admin });
+        if (tester) await sql("UPDATE users SET is_tester = true WHERE id = $1", [user.id]);
+        return user;
+    };
+
+    test("a tester without Pro sees no AI: the quota says unavailable, every AI route says PRO_REQUIRED", async () => {
+        const tess = await plan("aiprotess", { pro: false, tester: true });
+        const quota = await call("GET", "/api/ai/quota", null, tess.token);
+        assert.equal(quota.status, 200);
+        assert.equal(quota.data.available, false);
+        const line = await call("POST", "/api/ai/parse-entry", { text: "Study 19.11. 13:00" }, tess.token);
+        assert.equal(line.status, 403);
+        assert.equal(line.data.code, "PRO_REQUIRED");
+        const scan = await call("POST", "/api/ai/scan", { wants: ["notes"], source: { kind: "text", text: "Analysis" } }, tess.token);
+        assert.equal(scan.status, 403);
+        assert.equal(scan.data.code, "PRO_REQUIRED");
+    });
+
+    test("Pro (gift or running subscription) and admins have it", async () => {
+        const pia = await plan("aipropia", { pro: true });
+        const sub = await plan("aiprosub", { pro: false });
+        await sql("UPDATE users SET pro_until = now() + interval '30 days' WHERE id = $1", [sub.id]);
+        const adm = await plan("aiproadm", { pro: false, admin: true });
+        for (const user of [pia, sub, adm]) {
+            const quota = await call("GET", "/api/ai/quota", null, user.token);
+            assert.equal(quota.data.available, true);
+        }
+    });
+
+    test("Pro that ran out loses it again", async () => {
+        const old = await plan("aiproold", { pro: false });
+        await sql("UPDATE users SET pro_until = now() - interval '1 day' WHERE id = $1", [old.id]);
+        await sql("UPDATE users SET is_tester = true WHERE id = $1", [old.id]);
+        const quota = await call("GET", "/api/ai/quota", null, old.token);
+        assert.equal(quota.data.available, false);
+    });
+});
+
 describe("AI scan: a document, photos or a note into a plan, notes and entries", () => {
     const PDF = Buffer.from("%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n%%EOF").toString("base64");
     const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]).toString("base64");
