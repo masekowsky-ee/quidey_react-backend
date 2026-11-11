@@ -5566,6 +5566,23 @@ describe("Untis: the timetable in the calendar", () => {
         assert.equal((await goals()).length, 1);
     });
 
+    test("a subject made by Untis can be archived but not deleted", async () => {
+        const S = "/api/tester/study";
+        const val = await member("untisval");
+        await call("PUT", "/api/untis", LOGIN, val.token);
+        const subjects = (await call("GET", `${S}/subjects`, null, val.token)).data;
+        const deutsch = subjects.find(s => s.name === "Deutsch");
+        assert.equal(deutsch.fromUntis, true);
+        const mine = (await call("POST", `${S}/subjects`, { name: "Eigenes" }, val.token)).data;
+        assert.equal(mine.fromUntis, false);
+        const refused = await call("DELETE", `${S}/subjects/${deutsch.id}`, null, val.token);
+        assert.equal(refused.status, 400);
+        assert.equal(refused.data.code, "subject_from_untis");
+        assert.equal((await call("PATCH", `${S}/subjects/${deutsch.id}`, { archived: true }, val.token)).status, 200);
+        assert.equal((await call("GET", `${S}/subjects`, null, val.token)).data.find(s => s.id === deutsch.id).archived, true);
+        assert.equal((await call("DELETE", `${S}/subjects/${mine.id}`, null, val.token)).status, 200);
+    });
+
     test("a subject I already have (any case) is reused, and an exam I entered myself isn't made twice", async () => {
         const S = "/api/tester/study";
         const uli = await member("untisuli");

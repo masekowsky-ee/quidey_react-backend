@@ -196,6 +196,8 @@ module.exports = ({ pool, realtime, loadTask }) => {
 
     const subjectView = (row, nextGoal = null) => ({
         id: row.id, name: row.name, emoji: row.emoji, color: row.color, archived: row.archived, nextGoal,
+        // made by the Untis sync: can be folded away (archived), not deleted
+        fromUntis: Boolean(row.untis_name),
     });
 
     // Runs fn(client) in one transaction. fn may throw a Rollback to undo everything and return its value.
@@ -326,7 +328,10 @@ module.exports = ({ pool, realtime, loadTask }) => {
     router.delete('/subjects/:id', async (req, res) => {
         const userId = req.user.userId;
         const id = idParam(req.params.id);
-        if (!(await ownedSubject(pool, userId, id))) return notFound(res);
+        const owned = await ownedSubject(pool, userId, id);
+        if (!owned) return notFound(res);
+        // a subject the Untis timetable made stays (it would only come back): archive it instead
+        if (owned.untis_name) return fail(res, 400, 'subject_from_untis', 'A subject from Untis can be archived, not deleted');
         const clock = await getClock(pool, userId);
         const client = await pool.connect();
         let removed = 0;
