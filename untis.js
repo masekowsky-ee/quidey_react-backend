@@ -15,6 +15,8 @@
 const express = require("express");
 const { rateLimit } = require("express-rate-limit");
 const untis = require("./utils/untis");
+const { hasAiAccess } = require("./utils/access");
+const { available: aiAvailable, estimateHomeworkMinutes } = require("./utils/ai");
 
 const FRESH_MS = 15 * 60 * 1000;
 const MANUAL_GAP_MS = 60 * 1000;
@@ -103,12 +105,12 @@ module.exports = function untisRouter({ pool }) {
             if (!row) return;
             try {
                 await store(userId, await fetchFor(row, userId));
-                // homework → tasks (login only: the iCal link has none); its failure doesn't fail the timetable
+                // homework → suggestions (login only: the iCal link has none); its failure doesn't fail the timetable
                 if (row.mode === "login") {
                     // the school's subjects and exams in Lernen (a failure doesn't fail the timetable)
                     await subjectsAndExams(row, userId).catch((err) => console.error("[untis] subjects/exams", err.message));
                 }
-                if (row.mode === "login" && row.homework_to_tasks) await homeworkToTasks(row, userId).catch(() => {});
+                if (row.mode === "login" && row.homework_to_tasks) await homeworkSuggestions(row, userId).catch((err) => console.error("[untis] homework", err.message));
             } catch (err) {
                 const code = err instanceof untis.UntisError ? err.code : "UNTIS_FAILED";
                 await pool.query("UPDATE untis_accounts SET last_error = $2 WHERE user_id = $1", [userId, code]);
@@ -183,43 +185,93 @@ module.exports = function untisRouter({ pool }) {
         }
     }
 
-    // homework not yet made into a task: a task on its day, at the time of that subject's lesson, with the text
-    async function homeworkToTasks(row, userId) {
+    const AI_ESTIMATES_PER_SYNC = 10;
+
+    // homework not yet offered: a suggestion on its day, at the time of that subject's lesson, with the text and, for
+    // accounts with AI access, an estimated working time; taken or dismissed ones are never offered again
+    async function homeworkSuggestions(row, userId) {
         const { from, to } = await range(userId);
-        const [{ rows: [{ today }] }, { rows: known }] = await Promise.all([
+        const [{ rows: [{ today }] }, { rows: known }, { rows: [account] }] = await Promise.all([
             pool.query(`SELECT to_char((now() AT TIME ZONE COALESCE(timezone, 'Europe/Berlin'))::date, 'YYYY-MM-DD') AS today FROM users WHERE id = $1`, [userId]),
-            pool.query("SELECT homework_id FROM untis_homework_tasks WHERE user_id = $1", [userId]),
+            pool.query("SELECT untis_homework_id FROM untis_homework_suggestions WHERE user_id = $1", [userId]),
+            pool.query("SELECT is_pro, pro_until, is_admin FROM users WHERE id = $1", [userId]),
         ]);
-        const seen = new Set(known.map(r => String(r.homework_id)));
+        const seen = new Set(known.map(r => String(r.untis_homework_id)));
         const back = new Date(Date.parse(from) - 7 * 86400000).toISOString().slice(0, 10);
         const ahead = new Date(Date.parse(to) + 7 * 86400000).toISOString().slice(0, 10);
         const list = await untis.fetchHomework({ server: row.server, school: row.school, username: row.username, password: untis.open(row.secret) }, back, ahead);
+        const mayAsk = hasAiAccess(account) && aiAvailable();
+        let asked = 0;
         for (const hw of list) {
             if (hw.completed || seen.has(String(hw.id)) || hw.dueDay < today || !(hw.text || hw.remark)) continue;
             const lesson = hw.subject && (await pool.query(
                 "SELECT start_min FROM untis_lessons WHERE user_id = $1 AND day = $2 AND subject = $3 AND status <> 'cancelled' ORDER BY start_min LIMIT 1",
                 [userId, hw.dueDay, hw.subject])).rows[0];
-            const time = lesson ? `${String(Math.floor(lesson.start_min / 60)).padStart(2, "0")}:${String(lesson.start_min % 60).padStart(2, "0")}` : null;
-            const description = [hw.text, hw.remark].filter(Boolean).join("\n");
-            const client = await pool.connect();
-            try {
-                await client.query("BEGIN");
-                const claimed = await client.query("INSERT INTO untis_homework_tasks (user_id, homework_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING homework_id", [userId, hw.id]);
-                if (claimed.rowCount) {
-                    const { rows: [task] } = await client.query(
-                        "INSERT INTO tasks (name, due, due_time, description, user_id, kind) VALUES ($1, $2, $3, $4, $5, 'task') RETURNING id",
-                        [`${hw.subject || "Untis"}: Hausaufgabe`, hw.dueDay, time, description.slice(0, 2000), userId]);
-                    await client.query("UPDATE untis_homework_tasks SET task_id = $3 WHERE user_id = $1 AND homework_id = $2", [userId, hw.id, task.id]);
-                }
-                await client.query("COMMIT");
-            } catch (err) {
-                await client.query("ROLLBACK");
-                throw err;
-            } finally {
-                client.release();
+            const time = lesson ? hhmm(lesson.start_min) : null;
+            const subject = hw.subject && (await pool.query(
+                `SELECT s.id FROM untis_lessons l JOIN subjects s ON lower(s.name) = lower(COALESCE(NULLIF(l.subject_long, ''), l.subject)) OR lower(s.untis_name) = lower(COALESCE(NULLIF(l.subject_long, ''), l.subject))
+                 WHERE l.user_id = $1 AND l.subject = $2 AND s.user_id = $1 ORDER BY s.id LIMIT 1`, [userId, hw.subject])).rows[0];
+            let minutes = null;
+            if (mayAsk && asked < AI_ESTIMATES_PER_SYNC) {
+                asked += 1;
+                const days = Math.round((Date.parse(hw.dueDay) - Date.parse(today)) / 86400000);
+                minutes = await estimateHomeworkMinutes({ text: [hw.text, hw.remark].filter(Boolean).join(" "), subject: hw.subject, daysUntilDue: days });
             }
+            await pool.query(
+                `INSERT INTO untis_homework_suggestions (user_id, untis_homework_id, subject_id, subject_name, text, remark, due, due_time, estimate_minutes, estimate_source)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING`,
+                [userId, hw.id, subject?.id ?? null, hw.subject || "", hw.text, hw.remark, hw.dueDay, time, minutes, minutes == null ? null : "ai"]);
         }
     }
+
+    // the open suggestions, as the app lists them
+    router.get("/suggestions", async (req, res) => {
+        const { rows } = await pool.query(
+            `SELECT h.id, h.subject_id, COALESCE(s.name, NULLIF(h.subject_name, ''), 'Untis') AS subject_name, h.text, h.remark,
+                    to_char(h.due, 'YYYY-MM-DD') AS due, to_char(h.due_time, 'HH24:MI') AS due_time, h.estimate_minutes, h.estimate_source
+             FROM untis_homework_suggestions h LEFT JOIN subjects s ON s.id = h.subject_id
+             WHERE h.user_id = $1 AND h.state = 'open' ORDER BY h.due, h.id`, [req.user.userId]);
+        res.json(rows.map(r => ({
+            id: r.id, subjectId: r.subject_id, subjectName: r.subject_name, text: r.text, remark: r.remark,
+            due: r.due, dueTime: r.due_time, estimateMinutes: r.estimate_minutes, estimateSource: r.estimate_source,
+        })));
+    });
+
+    // takes one: the task on its day (the lesson's time, the text), with the minutes typed or estimated
+    router.post("/suggestions/:id/take", async (req, res) => {
+        const id = Number.parseInt(req.params.id, 10);
+        if (!Number.isInteger(id)) return fail(res, 404, "NOT_FOUND");
+        const minutes = req.body?.minutes;
+        if (minutes !== undefined && minutes !== null && !(Number.isInteger(minutes) && minutes >= 5 && minutes <= 600)) return fail(res, 400, "INVALID_INPUT", "minutes");
+        const client = await pool.connect();
+        try {
+            await client.query("BEGIN");
+            const { rows: [hw] } = await client.query(
+                `UPDATE untis_homework_suggestions SET state = 'taken' WHERE id = $1 AND user_id = $2 AND state = 'open'
+                 RETURNING subject_name, text, remark, to_char(due, 'YYYY-MM-DD') AS due, due_time, estimate_minutes, subject_id`, [id, req.user.userId]);
+            if (!hw) { await client.query("ROLLBACK"); return fail(res, 404, "NOT_FOUND"); }
+            const { rows: [named] } = await client.query("SELECT name FROM subjects WHERE id = $1", [hw.subject_id]);
+            const duration = Number.isInteger(minutes) ? minutes : hw.estimate_minutes;
+            const { rows: [task] } = await client.query(
+                "INSERT INTO tasks (name, due, due_time, description, duration_minutes, user_id, kind) VALUES ($1, $2, $3, $4, $5, $6, 'task') RETURNING id",
+                [`${hw.subject_name || named?.name || "Untis"}: Hausaufgabe`.slice(0, 200), hw.due, hw.due_time, [hw.text, hw.remark].filter(Boolean).join("\n").slice(0, 2000), duration, req.user.userId]);
+            await client.query("COMMIT");
+            res.json({ taskId: task.id });
+        } catch (err) {
+            await client.query("ROLLBACK").catch(() => {});
+            throw err;
+        } finally {
+            client.release();
+        }
+    });
+
+    router.post("/suggestions/:id/dismiss", async (req, res) => {
+        const id = Number.parseInt(req.params.id, 10);
+        const done = Number.isInteger(id) && await pool.query(
+            "UPDATE untis_homework_suggestions SET state = 'dismissed' WHERE id = $1 AND user_id = $2 AND state = 'open'", [id, req.user.userId]);
+        if (!done || done.rowCount === 0) return fail(res, 404, "NOT_FOUND");
+        res.status(204).end();
+    });
 
     router.put("/settings", async (req, res) => {
         const row = await account(req.user.userId);

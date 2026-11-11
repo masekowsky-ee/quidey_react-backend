@@ -57,3 +57,21 @@ test("the password is sealed and opened again, and can't be changed unseen", () 
     flipped[0] ^= 1;
     assert.throws(() => untis.open([iv, tag, flipped.toString("base64")].join(":")));
 });
+
+test("the homework estimate: the AI's minutes within range, null when it fails or there is no AI", async () => {
+    const ai = require("../../utils/ai.js");
+    const before = process.env.AI_FAKE;
+    try {
+        process.env.AI_FAKE = JSON.stringify({ "homework-minutes": { minutes: 45 } });
+        assert.equal(await ai.estimateHomeworkMinutes({ text: "Seite 12", subject: "Deutsch", daysUntilDue: 2 }), 45);
+        assert.equal(await ai.estimateHomeworkMinutes({ text: "AI_FAIL", subject: "Deutsch", daysUntilDue: 2 }), null);
+        process.env.AI_FAKE = JSON.stringify({ "homework-minutes": { minutes: 9999 } });
+        assert.equal(await ai.estimateHomeworkMinutes({ text: "Seite 12", subject: "Deutsch", daysUntilDue: 2 }), 240);
+        process.env.AI_FAKE = JSON.stringify({ "homework-minutes": { minutes: 1 } });
+        assert.equal(await ai.estimateHomeworkMinutes({ text: "Seite 12", subject: "Deutsch", daysUntilDue: 2 }), 5);
+        delete process.env.AI_FAKE;
+        assert.equal(await ai.estimateHomeworkMinutes({ text: "Seite 12", subject: "Deutsch", daysUntilDue: 2 }), null);
+    } finally {
+        if (before === undefined) delete process.env.AI_FAKE; else process.env.AI_FAKE = before;
+    }
+});

@@ -73,4 +73,22 @@ function aiErrorResponse(res, err) {
     return res.status(502).json({ error: "The AI didn't answer usefully, try again", code: err.code === "AI_TIMEOUT" ? "AI_TIMEOUT" : "AI_FAILED" });
 }
 
-module.exports = { ask, available, AiError, aiErrorResponse, MODEL };
+// How long a piece of homework takes (minutes, 5-240), from its text, the subject and the days until it is due;
+// null without an AI or when it fails. Nothing else of the account goes along (no grades, no name).
+async function estimateHomeworkMinutes({ text, subject, daysUntilDue }) {
+    if (!available()) return null;
+    try {
+        const raw = await ask("homework-minutes", {
+            system: "You estimate how many minutes a school student needs for one piece of homework. Answer with a whole number of minutes between 5 and 240, for an average student, only the work itself.",
+            content: [`Subject: ${String(subject || "").slice(0, 60)}`, `Due in ${Number.isInteger(daysUntilDue) ? daysUntilDue : "?"} days`, `Homework: ${String(text || "").slice(0, 1500)}`].join("\n"),
+            schema: { type: "object", properties: { minutes: { type: "integer" } }, required: ["minutes"], additionalProperties: false },
+            maxTokens: 200,
+            timeoutMs: 8000,
+        });
+        return Number.isFinite(raw?.minutes) ? Math.min(240, Math.max(5, Math.round(raw.minutes))) : null;
+    } catch {
+        return null;
+    }
+}
+
+module.exports = { ask, available, AiError, aiErrorResponse, estimateHomeworkMinutes, MODEL };

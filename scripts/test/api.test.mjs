@@ -39,6 +39,7 @@ const AI_FAKE = {
         kind: "event", name: "Study", date: "2026-11-19", time: "13:00", endTime: "15:00", durationMinutes: null,
         color: "blue", eventType: "school", remindersMinutesBefore: [15, 99999], priority: null,
     },
+    "homework-minutes": { minutes: 45 },
     scan: {
         plan: {
             name: "Biologie Klausur", kind: "exam", due: "2099-03-02", subject: "Biologie",
@@ -5391,27 +5392,58 @@ describe("Untis: the timetable in the calendar", () => {
         assert.deepEqual((await call("GET", "/api/untis", null, tom.token)).data, { available: true, connected: false });
     });
 
-    test("homework in Untis becomes a task with the day, the lesson's time and the text, once", async () => {
+    test("homework in Untis becomes a suggestion with the day, the lesson's time, the text and an AI time estimate, once", async () => {
         const wes = await member("untiswes");
         const status = (await call("PUT", "/api/untis", LOGIN, wes.token)).data;
         assert.equal(status.homeworkToTasks, true);
-        const tomorrow = daysFromToday(1);
-        const tasks = () => call("GET", "/api/tasks", null, wes.token).then(r => r.data.filter(t => t.name.startsWith("D:")));
-        const made = await tasks();
-        assert.equal(made.length, 1);
-        assert.equal(made[0].name, "D: Hausaufgabe");
-        assert.equal(String(made[0].due).slice(0, 10) === tomorrow || iso(new Date(made[0].due)) === tomorrow, true);
-        assert.equal(made[0].due_time, "08:00");
-        assert.equal(made[0].description, "Aufsatz Seite 12\nbitte tippen");
-        // fetched again: no second one; deleted by hand: not made again
-        await call("POST", "/api/untis/sync", null, wes.token);
+        const suggestions = () => call("GET", "/api/untis/suggestions", null, wes.token).then(r => r.data);
+        const open = await suggestions();
+        // not a task by itself, and only the one that isn't done yet
+        assert.equal((await call("GET", "/api/tasks", null, wes.token)).data.filter(t => t.name.startsWith("D:")).length, 0);
+        assert.equal(open.length, 1);
+        assert.deepEqual({ ...open[0], id: undefined, subjectId: undefined }, {
+            id: undefined, subjectId: undefined, subjectName: "Deutsch", text: "Aufsatz Seite 12", remark: "bitte tippen",
+            due: daysFromToday(1), dueTime: "08:00", estimateMinutes: 45, estimateSource: "ai",
+        });
+        assert.ok(open[0].subjectId);
+        // fetched again: no second one
         await sql("UPDATE untis_accounts SET last_sync_at = now() - interval '2 minutes' WHERE user_id = $1", [wes.id]);
         await call("POST", "/api/untis/sync", null, wes.token);
-        assert.equal((await tasks()).length, 1);
-        await call("DELETE", `/api/tasks/${made[0].id}`, null, wes.token);
-        await sql("UPDATE untis_accounts SET last_sync_at = now() - interval '2 minutes' WHERE user_id = $1", [wes.id]);
-        await call("POST", "/api/untis/sync", null, wes.token);
-        assert.equal((await tasks()).length, 0);
+        assert.equal((await suggestions()).length, 1);
+    });
+
+    test("taking a suggestion makes the task with the minutes; dismissed or taken ones don't come back", async () => {
+        const tia = await member("untistia");
+        await call("PUT", "/api/untis", LOGIN, tia.token);
+        const [item] = (await call("GET", "/api/untis/suggestions", null, tia.token)).data;
+        assert.equal((await call("POST", `/api/untis/suggestions/${item.id}/take`, { minutes: 3 }, tia.token)).status, 400);
+        const took = await call("POST", `/api/untis/suggestions/${item.id}/take`, { minutes: 30 }, tia.token);
+        assert.equal(took.status, 200);
+        const task = (await call("GET", "/api/tasks", null, tia.token)).data.find(t => t.id === took.data.taskId);
+        assert.equal(task.name, "D: Hausaufgabe");
+        assert.equal(task.due_time, "08:00");
+        assert.equal(task.duration_minutes, 30);
+        assert.equal(task.description, "Aufsatz Seite 12\nbitte tippen");
+        assert.equal((await call("GET", "/api/untis/suggestions", null, tia.token)).data.length, 0);
+        assert.equal((await call("POST", `/api/untis/suggestions/${item.id}/take`, {}, tia.token)).status, 404);
+        // nothing new after another fetch, even once the task is deleted
+        await call("DELETE", `/api/tasks/${task.id}`, null, tia.token);
+        await sql("UPDATE untis_accounts SET last_sync_at = now() - interval '2 minutes' WHERE user_id = $1", [tia.id]);
+        await call("POST", "/api/untis/sync", null, tia.token);
+        assert.equal((await call("GET", "/api/untis/suggestions", null, tia.token)).data.length, 0);
+    });
+
+    test("dismissing one keeps it away; without Pro the suggestion has no AI estimate", async () => {
+        const tess = await member("untistess", { pro: false });
+        await sql("UPDATE users SET is_tester = true WHERE id = $1", [tess.id]);
+        await call("PUT", "/api/untis", LOGIN, tess.token);
+        const [item] = (await call("GET", "/api/untis/suggestions", null, tess.token)).data;
+        assert.equal(item.estimateMinutes, null);
+        assert.equal(item.estimateSource, null);
+        assert.equal((await call("POST", `/api/untis/suggestions/${item.id}/dismiss`, null, tess.token)).status, 204);
+        await sql("UPDATE untis_accounts SET last_sync_at = now() - interval '2 minutes' WHERE user_id = $1", [tess.id]);
+        await call("POST", "/api/untis/sync", null, tess.token);
+        assert.equal((await call("GET", "/api/untis/suggestions", null, tess.token)).data.length, 0);
     });
 
     test("connecting makes every Untis subject with its own colour and the exams still to come; again changes nothing", async () => {
@@ -5456,7 +5488,7 @@ describe("Untis: the timetable in the calendar", () => {
         assert.deepEqual(goals.map(g => g.name).sort(), ["Deutsch Klausur", "mathematik: Klausur"]);
     });
 
-    test("switched off, no homework task is made", async () => {
+    test("switched off, no homework suggestion is made", async () => {
         const xan = await member("untisxan");
         const off = await call("PUT", "/api/untis/settings", { homeworkToTasks: false }, xan.token);
         assert.equal(off.status, 404);
@@ -5466,11 +5498,10 @@ describe("Untis: the timetable in the calendar", () => {
         const r = await call("PUT", "/api/untis/settings", { homeworkToTasks: false }, xan.token);
         assert.equal(r.status, 200);
         assert.equal(r.data.homeworkToTasks, false);
-        await sql("DELETE FROM tasks WHERE user_id = $1", [xan.id]);
-        await sql("DELETE FROM untis_homework_tasks WHERE user_id = $1", [xan.id]);
+        await sql("DELETE FROM untis_homework_suggestions WHERE user_id = $1", [xan.id]);
         await sql("UPDATE untis_accounts SET last_sync_at = now() - interval '2 minutes' WHERE user_id = $1", [xan.id]);
         await call("POST", "/api/untis/sync", null, xan.token);
-        assert.equal((await call("GET", "/api/tasks", null, xan.token)).data.filter(t => t.name.startsWith("D:")).length, 0);
+        assert.equal((await call("GET", "/api/untis/suggestions", null, xan.token)).data.length, 0);
         assert.equal((await call("PUT", "/api/untis/settings", { homeworkToTasks: "x" }, xan.token)).status, 400);
     });
 
