@@ -11,6 +11,7 @@ const {
 const { plan } = require('./utils/studyPlanner');
 const { hasAiAccess } = require('./utils/access');
 const { SCALES, toPoints, fromPoints, average } = require('./utils/grades');
+const { refuseOverLimit } = require('./utils/limits');
 const {
     getClock, loadSessions, loadGoals, goalView, goalProgress, loadPlanInput, statusOf, inputHash, ACTIVE_GOAL_SQL, isEnded,
 } = require('./utils/studyLoad');
@@ -269,6 +270,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
     router.post('/subjects', async (req, res) => {
         const { field, values } = cleanSubject(req.body || {}, false);
         if (field) return invalid(res, field);
+        if (await refuseOverLimit(pool, res, req.account, 'subjects')) return;
         let color = values.color ?? null;
         if (values.color === undefined) {
             const used = new Set((await pool.query('SELECT color FROM subjects WHERE user_id = $1 AND NOT archived', [req.user.userId])).rows.map((r) => r.color));
@@ -402,6 +404,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         if (shape === undefined) return invalid(res, 'shape');
         const subjectId = idParam(body.subjectId);
         if (!(await ownedSubject(pool, userId, subjectId))) return notFound(res);
+        if (await refuseOverLimit(pool, res, req.account, 'goals', { subjectId })) return;
         if (body.shape === undefined) {
             const used = new Set((await pool.query(
                 "SELECT shape FROM goals WHERE subject_id = $1 AND user_id = $2 AND status = 'active'", [subjectId, userId]
@@ -453,7 +456,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         const userId = req.user.userId;
         const id = idParam(req.params.id);
         const current = (await pool.query(
-            "SELECT to_char(due, 'YYYY-MM-DD') AS due FROM goals WHERE id = $1 AND user_id = $2", [id, userId]
+            "SELECT to_char(due, 'YYYY-MM-DD') AS due, status, subject_id FROM goals WHERE id = $1 AND user_id = $2", [id, userId]
         )).rows[0];
         if (!current) return notFound(res);
         const body = req.body || {};
@@ -480,6 +483,8 @@ module.exports = ({ pool, realtime, loadTask }) => {
         }
         if (body.status !== undefined) {
             if (!STATUSES.includes(body.status)) return invalid(res, 'status');
+            // active again counts toward the free plan's one active goal per subject
+            if (body.status === 'active' && current.status !== 'active' && await refuseOverLimit(pool, res, req.account, 'goals', { subjectId: current.subject_id })) return;
             set('status', body.status);
         }
         if (body.due !== undefined) {

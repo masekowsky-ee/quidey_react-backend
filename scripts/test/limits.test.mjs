@@ -22,7 +22,7 @@ test("after the beta everybody gets in; the free plan has limits, Pro / testers 
     assert.equal(limited({ ...free, pro_until: new Date(Date.now() - 86400000) }), true, "an ended subscription");
     assert.equal(limited({ ...free, is_tester: true }), false);
     assert.equal(limited({ ...free, is_admin: true }), false);
-    assert.deepEqual(FREE_LIMITS, { tasks: 10, events: 5, groups: 3, sessions: 1, friends: 3 });
+    assert.deepEqual(FREE_LIMITS, { tasks: 10, events: 5, groups: 3, sessions: 1, friends: 3, subjects: 3, goals: 1 });
 });
 
 test("one more is fine below the limit, refused at it", async () => {
@@ -44,5 +44,5 @@ test("the refusal is a 403 LIMIT_REACHED with what and how many", async () => {
 });
 
 test("usage counts each thing", async () => {
-    assert.deepEqual(await usage(db(2), 1), { tasks: 2, events: 2, groups: 2, sessions: 2, friends: 2 });
+    assert.deepEqual(await usage(db(2), 1), { tasks: 2, events: 2, groups: 2, sessions: 2, friends: 2, subjects: 2 });
 });

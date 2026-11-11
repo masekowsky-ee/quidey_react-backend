@@ -255,6 +255,7 @@ module.exports = function untisRouter({ pool }) {
             const { rows: [task] } = await client.query(
                 "INSERT INTO tasks (name, due, due_time, description, duration_minutes, user_id, kind) VALUES ($1, $2, $3, $4, $5, $6, 'task') RETURNING id",
                 [`${hw.subject_name || named?.name || "Untis"}: Hausaufgabe`.slice(0, 200), hw.due, hw.due_time, [hw.text, hw.remark].filter(Boolean).join("\n").slice(0, 2000), duration, req.user.userId]);
+            await client.query("UPDATE untis_homework_suggestions SET task_id = $2 WHERE id = $1", [id, task.id]);
             await client.query("COMMIT");
             res.json({ taskId: task.id });
         } catch (err) {

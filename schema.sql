@@ -2740,3 +2740,9 @@ CREATE TABLE IF NOT EXISTS public.untis_homework_suggestions (
     UNIQUE (user_id, untis_homework_id)
 );
 CREATE INDEX IF NOT EXISTS untis_homework_suggestions_open ON public.untis_homework_suggestions (user_id, state);
+
+-- 052: the trial version (see migrations/052_trial.sql)
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS trial_at timestamp with time zone;
+
+-- the task a homework suggestion became (tasks from Untis homework don't count toward the task limit)
+ALTER TABLE public.untis_homework_suggestions ADD COLUMN IF NOT EXISTS task_id integer REFERENCES public.tasks(id) ON DELETE SET NULL;

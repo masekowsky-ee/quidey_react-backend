@@ -25,7 +25,14 @@ const requireProBilling = (req, res, next) => {
 
 const hasPro = (account) => Boolean(account.is_pro || (account.pro_until && new Date(account.pro_until) > new Date()));
 
-const hasAppAccess = (account) => ACCESS_MODE === "open" || Boolean(hasPro(account) || account.is_tester || account.is_admin);
+// The trial version: an account that chose "continue with the trial version" on the beta screen (users.trial_at)
+// gets into the app with the free plan's limits (utils/limits.js).
+const hasTrial = (account) => Boolean(account && account.trial_at);
+
+// Access without the trial: Pro, testers, admins (everybody in the 'open' mode)
+const hasFullAccess = (account) => ACCESS_MODE === "open" || Boolean(hasPro(account) || account.is_tester || account.is_admin);
+
+const hasAppAccess = (account) => hasFullAccess(account) || hasTrial(account);
 
 // The AI features (utils/ai.js, ai.js, the study estimates, the homework time estimate): Pro (a gift or a
 // running subscription) and admins; testers get no AI unless they are Pro too.
@@ -39,9 +46,9 @@ const hasNoLimits = (account) => Boolean(hasPro(account) || account.is_tester ||
 
 // The same as hasPro / hasAppAccess, for SQL on the users table
 const PRO_SQL = "(users.is_pro OR users.pro_until > now())";
-const APP_ACCESS_SQL = ACCESS_MODE === "open" ? "true" : `(${PRO_SQL} OR users.is_tester OR users.is_admin)`;
+const APP_ACCESS_SQL = ACCESS_MODE === "open" ? "true" : `(${PRO_SQL} OR users.is_tester OR users.is_admin OR users.trial_at IS NOT NULL)`;
 
 // The same as hasTesterAccess, for SQL on the users table
 const TESTER_ACCESS_SQL = "(users.is_tester OR users.is_admin)";
 
-module.exports = { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasAiAccess, hasAppAccess, hasTesterAccess, hasNoLimits, PRO_SQL, APP_ACCESS_SQL, TESTER_ACCESS_SQL };
+module.exports = { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasAiAccess, hasTrial, hasFullAccess, hasAppAccess, hasTesterAccess, hasNoLimits, PRO_SQL, APP_ACCESS_SQL, TESTER_ACCESS_SQL };

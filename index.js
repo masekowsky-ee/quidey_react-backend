@@ -17,7 +17,7 @@ const { PUSH_PUBLIC_KEY, PUSH_FCM_ENABLED, PUSH_KINDS, PUSH_MAX_DEVICES, PUSH_TE
 const http = require("node:http");
 const realtime = require("./realtime");
 const { toNotice, noticeEntryAdded, noticeFamilyAssigned, pushChat } = require("./utils/groupNotices");
-const { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
+const { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasFullAccess, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
 const { FREE_LIMITS, FREE_STATS_DAYS, limited, usage, refuseOverLimit } = require("./utils/limits");
 const { FCM_ENDPOINT, isFcmEndpoint } = require("./utils/fcm");
 const progress = require("./utils/progress");
@@ -175,7 +175,7 @@ async function loadAccount(userId) {
     const cached = accountCache.get(userId);
     if (cached && Date.now() - cached.at < ACCOUNT_CACHE_MS) return cached.account;
     const result = await pool.query(
-        "SELECT id, username, is_pro, pro_until, is_tester, is_admin, token_version FROM users WHERE id = $1",
+        "SELECT id, username, is_pro, pro_until, is_tester, is_admin, trial_at, token_version FROM users WHERE id = $1",
         [userId]
     );
     const account = result.rows[0] ?? null;
@@ -825,7 +825,7 @@ app.get("/api/sessions/:id/tasks", async (req, res) => {
 app.get("/api/me" , authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
-            `SELECT users.id, users.username, users.is_pro, users.pro_until, users.is_admin, users.is_tester, users.has_password,
+            `SELECT users.id, users.username, users.is_pro, users.pro_until, users.is_admin, users.is_tester, users.trial_at, users.has_password,
                 users.google_sub IS NOT NULL AS google_linked,
                 to_char(users.allday_reminder_time, 'HH24:MI') AS allday_reminder_time,
                 users.tour_seen_at IS NOT NULL AS tour_seen, users.saved_colors, users.tips_seen, users.tips_off,
@@ -856,6 +856,8 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
             tipsSeen: row.tips_seen ?? [],
             tipsOff: Boolean(row.tips_off),
             accessMode: ACCESS_MODE,
+            // chose "continue with the trial version" (free plan's limits; see POST /api/trial)
+            trial: Boolean(row.trial_at),
             // whether Quidey Pro can be bought (PRO_BILLING); the apps show it only then
             proSales: PRO_BILLING,
             // Pro: paid (pro_until ahead) or a gift (is_pro); limits/usage only on the free plan
@@ -873,6 +875,22 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
 });
 
 // Ask for beta access: { reason } (10-1000 characters). Only once per account.
+// "Continue with the trial version" on the beta screen: all features with the free plan's limits (utils/limits.js).
+// For accounts without full access; asking again changes nothing.
+app.post("/api/trial", authenticateToken, async (req, res) => {
+    try {
+        const { rows: [user] } = await pool.query("SELECT is_pro, pro_until, is_tester, is_admin FROM users WHERE id = $1", [req.user.userId]);
+        if (!user) return res.status(401).json({ error: "User not found" });
+        if (hasFullAccess(user)) return res.status(409).json({ error: "You already have access", code: "ALREADY_PRO" });
+        await pool.query("UPDATE users SET trial_at = COALESCE(trial_at, now()) WHERE id = $1", [req.user.userId]);
+        forgetAccount(req.user.userId);
+        res.json({ trial: true });
+    } catch (err) {
+        console.error("Trial error:", err);
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
 app.post("/api/beta-requests", authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
@@ -882,7 +900,7 @@ app.post("/api/beta-requests", authenticateToken, async (req, res) => {
     try {
         const user = await pool.query("SELECT is_pro, pro_until, is_tester, is_admin FROM users WHERE id = $1", [userId]);
         if (user.rows.length === 0) return res.status(401).json({ error: "User not found" });
-        if (hasAppAccess(user.rows[0])) return res.status(409).json({ error: "You already have access", code: "ALREADY_PRO" });
+        if (hasFullAccess(user.rows[0])) return res.status(409).json({ error: "You already have access", code: "ALREADY_PRO" });
 
         const result = await pool.query(
             `INSERT INTO beta_access_requests (user_id, reason) VALUES ($1, $2)

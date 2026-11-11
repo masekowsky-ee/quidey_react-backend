@@ -5215,6 +5215,100 @@ describe("Lernen as school life: grades and averages", () => {
     });
 });
 
+describe("trial version: all features with the free plan's limits, chosen on the beta screen", () => {
+    const S = "/api/tester/study";
+    const trialist = async (name) => {
+        const user = await member(name, { pro: false });
+        const chose = await call("POST", "/api/trial", {}, user.token);
+        assert.equal(chose.status, 200, JSON.stringify(chose.data));
+        return user;
+    };
+    const newTask = (user, i) => call("POST", "/api/tasks", { name: `T${i}`, due: daysFromToday(3), description: "" }, user.token);
+
+    test("without access nothing opens until the trial is chosen; then the app works with limits", async () => {
+        const tia = await member("trialtia", { pro: false });
+        assert.equal((await call("GET", "/api/tasks", null, tia.token)).status, 403);
+        const chose = await call("POST", "/api/trial", {}, tia.token);
+        assert.equal(chose.status, 200);
+        assert.equal((await call("GET", "/api/tasks", null, tia.token)).status, 200);
+        const me = (await call("GET", "/api/me", null, tia.token)).data;
+        assert.equal(me.trial, true);
+        assert.equal(me.limits.tasks, 10);
+        assert.equal(me.limits.subjects, 3);
+        assert.equal(me.limits.goals, 1);
+        assert.equal(me.usage.tasks, 0);
+    });
+
+    test("somebody with access can't start a trial", async () => {
+        const pia = await member("trialpia");
+        assert.equal((await call("POST", "/api/trial", {}, pia.token)).status, 409);
+        assert.equal((await call("GET", "/api/me", null, pia.token)).data.trial, false);
+    });
+
+    test("a tenth open task is fine, the eleventh is refused with LIMIT_REACHED", async () => {
+        const tom = await trialist("trialtom");
+        for (let i = 0; i < 10; i++) assert.equal((await newTask(tom, i)).status, 201);
+        const over = await newTask(tom, 11);
+        assert.equal(over.status, 403);
+        assert.deepEqual({ code: over.data.code, limit: over.data.limit, max: over.data.max }, { code: "LIMIT_REACHED", limit: "tasks", max: 10 });
+    });
+
+    test("the study planner's sessions and tasks from Untis homework are not counted", async () => {
+        const uli = await trialist("trialuli");
+        const subject = (await call("POST", `${S}/subjects`, { name: "Mathe" }, uli.token)).data;
+        const goal = (await call("POST", `${S}/goals`, { subjectId: subject.id, kind: "exam", name: "K", due: daysFromToday(9), planMode: "days", parts: [{ name: "x", estimateMinutes: 60 }] }, uli.token)).data;
+        for (let i = 0; i < 4; i++) {
+            await sql("INSERT INTO tasks (user_id, name, due, kind, goal_part_id) VALUES ($1, $2, CURRENT_DATE + 2, 'task', $3)", [uli.id, `Lernen ${i}`, goal.parts[0].id]);
+        }
+        await call("PUT", "/api/untis", { mode: "login", server: "neilo.webuntis.com", school: "gym-muster", schoolLabel: "G", username: "lena", password: "richtig" }, uli.token);
+        const [hw] = (await call("GET", "/api/untis/suggestions", null, uli.token)).data;
+        assert.equal((await call("POST", `/api/untis/suggestions/${hw.id}/take`, {}, uli.token)).status, 200);
+        const me = (await call("GET", "/api/me", null, uli.token)).data;
+        assert.equal(me.usage.tasks, 0, "planner sessions and Untis homework are free");
+        for (let i = 0; i < 10; i++) assert.equal((await newTask(uli, i)).status, 201);
+        assert.equal((await newTask(uli, 11)).status, 403);
+    });
+
+    test("three subjects of my own, one active goal for each; Untis ones don't count", async () => {
+        const gus = await trialist("trialgus");
+        const names = ["A", "B", "C"];
+        const made = [];
+        for (const name of names) made.push((await call("POST", `${S}/subjects`, { name }, gus.token)).data);
+        const fourth = await call("POST", `${S}/subjects`, { name: "D" }, gus.token);
+        assert.equal(fourth.status, 403);
+        assert.deepEqual({ code: fourth.data.code, limit: fourth.data.limit, max: fourth.data.max }, { code: "LIMIT_REACHED", limit: "subjects", max: 3 });
+        const goalOf = (subject, name) => call("POST", `${S}/goals`, { subjectId: subject.id, kind: "exam", name, due: daysFromToday(9), planMode: "days", parts: [{ name: "x", estimateMinutes: 60 }] }, gus.token);
+        const first = await goalOf(made[0], "G1");
+        assert.equal(first.status, 201);
+        const second = await goalOf(made[0], "G2");
+        assert.equal(second.status, 403);
+        assert.deepEqual({ limit: second.data.limit, max: second.data.max }, { limit: "goals", max: 1 });
+        assert.equal((await goalOf(made[1], "G3")).status, 201);
+        // finished, a new one fits; reactivating the old one would make two
+        assert.equal((await call("PATCH", `${S}/goals/${first.data.id}`, { status: "done" }, gus.token)).status, 200);
+        assert.equal((await goalOf(made[0], "G4")).status, 201);
+        const back = await call("PATCH", `${S}/goals/${first.data.id}`, { status: "active" }, gus.token);
+        assert.equal(back.status, 403);
+        assert.equal(back.data.limit, "goals");
+        // Untis makes its subjects and exams freely
+        await call("PUT", "/api/untis", { mode: "login", server: "neilo.webuntis.com", school: "gym-muster", schoolLabel: "G", username: "lena", password: "richtig" }, gus.token);
+        const subjects = (await call("GET", `${S}/subjects`, null, gus.token)).data;
+        assert.equal(subjects.length, 6);
+        assert.equal((await call("POST", `${S}/subjects`, { name: "Extra" }, gus.token)).status, 403);
+    });
+
+    test("a trial account can still apply for beta; with beta access the limits are gone", async () => {
+        const bea = await trialist("trialbea");
+        assert.equal((await call("POST", "/api/beta-requests", { reason: "I want to test everything" }, bea.token)).status, 201);
+        // approved by an admin (which also drops the server's cached account)
+        const boss = await member("trialboss", { admin: true });
+        assert.equal((await call("PATCH", `/api/admin/users/${bea.id}`, { isTester: true }, boss.token)).status, 200);
+        const me = (await call("GET", "/api/me", null, bea.token)).data;
+        assert.equal(me.limits, null);
+        for (let i = 0; i < 11; i++) assert.equal((await newTask(bea, i)).status, 201);
+    });
+});
+
 describe("AI features are for Pro (and admins), not for testers", () => {
     const plan = async (name, { pro, tester = false, admin = false }) => {
         const user = await member(name, { pro, admin });
