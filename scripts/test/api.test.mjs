@@ -5144,6 +5144,76 @@ describe("AI help: daily limits and reading a quick-entry line", () => {
     });
 });
 
+describe("Lernen as school life: grades and averages", () => {
+    const S = "/api/tester/study";
+    const setup = async (name) => {
+        const user = await member(name);
+        const subject = (await call("POST", `${S}/subjects`, { name: "Mathe" }, user.token)).data;
+        const make = async (kind, nameOfGoal) => (await call("POST", `${S}/goals`, {
+            subjectId: subject.id, kind, name: nameOfGoal, due: daysFromToday(5), planMode: "days", parts: [{ name: "x", estimateMinutes: 60 }],
+        }, user.token)).data;
+        const done = (goal) => call("PATCH", `${S}/goals/${goal.id}`, { status: "done" }, user.token);
+        const grade = (goal, value) => call("PATCH", `${S}/goals/${goal.id}`, { grade: value }, user.token);
+        const subjects = async () => (await call("GET", `${S}/subjects`, null, user.token)).data;
+        return { user, subject, make, done, grade, subjects };
+    };
+
+    test("a grade only goes on finished work, in range", async () => {
+        const t = await setup("gradegus");
+        const goal = await t.make("exam", "Klausur 1");
+        const early = await t.grade(goal, 12);
+        assert.equal(early.status, 400);
+        assert.equal(early.data.code, "goal_not_done");
+        await t.done(goal);
+        assert.equal((await t.grade(goal, 16)).data.code, "invalid_input");
+        assert.equal((await t.grade(goal, "12")).data.code, "invalid_input");
+        const ok = await t.grade(goal, 12);
+        assert.equal(ok.status, 200);
+        assert.equal(ok.data.grade, 12);
+        assert.ok(ok.data.gradedAt);
+        const cleared = await t.grade(goal, null);
+        assert.equal(cleared.data.grade, null);
+        assert.equal(cleared.data.gradedAt, null);
+    });
+
+    test("each subject gets an exam average and an average of all other work; none without grades", async () => {
+        const t = await setup("gradegreta");
+        assert.deepEqual((await t.subjects())[0].exam, { avg: null, n: 0 });
+        const e1 = await t.make("exam", "K1");
+        const e2 = await t.make("exam", "K2");
+        const a1 = await t.make("assignment", "Aufsatz");
+        const p1 = await t.make("presentation", "Referat");
+        for (const goal of [e1, e2, a1, p1]) await t.done(goal);
+        await t.grade(e1, 10);
+        await t.grade(e2, 12);
+        await t.grade(a1, 13);
+        await t.grade(p1, 9);
+        const [subject] = await t.subjects();
+        assert.deepEqual(subject.exam, { avg: 11, n: 2 });
+        assert.deepEqual(subject.other, { avg: 11, n: 2 });
+        await t.grade(p1, null);
+        assert.deepEqual((await t.subjects())[0].other, { avg: 13, n: 1 });
+    });
+
+    test("the scale is the account's: marks in, the same points stored, shown back as marks", async () => {
+        const t = await setup("gradegerd");
+        assert.equal((await call("GET", `${S}/settings`, null, t.user.token)).data.gradeScale, "points");
+        const set = await call("PUT", `${S}/settings`, { gradeScale: "marks" }, t.user.token);
+        assert.equal(set.data.gradeScale, "marks");
+        assert.equal((await call("PUT", `${S}/settings`, { gradeScale: "letters" }, t.user.token)).status, 400);
+        const goal = await t.make("exam", "K1");
+        await t.done(goal);
+        assert.equal((await t.grade(goal, 7)).data.code, "invalid_input");
+        const ok = await t.grade(goal, 2);
+        assert.equal(ok.data.grade, 2);
+        const [{ grade }] = await sql("SELECT grade::float8 AS grade FROM goals WHERE id = $1", [goal.id]);
+        assert.equal(grade, 11);
+        assert.deepEqual((await t.subjects())[0].exam, { avg: 2, n: 1 });
+        await call("PUT", `${S}/settings`, { gradeScale: "points" }, t.user.token);
+        assert.deepEqual((await t.subjects())[0].exam, { avg: 11, n: 1 });
+    });
+});
+
 describe("AI features are for Pro (and admins), not for testers", () => {
     const plan = async (name, { pro, tester = false, admin = false }) => {
         const user = await member(name, { pro, admin });

@@ -62,7 +62,7 @@ async function loadGoals(db, userId, { id = null, subjectId = null } = {}) {
     if (subjectId != null) { params.push(subjectId); where.push(`subject_id = $${params.length}`); }
     const goals = (await db.query(
         `SELECT id, subject_id, kind, name, to_char(due, 'YYYY-MM-DD') AS due, to_char(due_time, 'HH24:MI') AS due_time,
-            plan_mode, status, freed_minutes, shape,
+            plan_mode, status, freed_minutes, shape, grade::float8 AS grade, graded_at,
             (SELECT archived FROM subjects WHERE subjects.id = goals.subject_id) AS subject_archived
         FROM goals WHERE ${where.join(' AND ')} ORDER BY due, id`,
         params
@@ -81,6 +81,7 @@ async function loadGoals(db, userId, { id = null, subjectId = null } = {}) {
             goal: {
                 id: g.id, subjectId: g.subject_id, kind: g.kind, name: g.name, due: g.due, dueTime: g.due_time,
                 planMode: g.plan_mode, status: g.status, freedMinutes: g.freed_minutes, shape: g.shape ?? null,
+                gradePoints: g.grade, gradedAt: g.graded_at,
                 subjectArchived: g.subject_archived,
             },
             parts: own.map((p) => ({
@@ -109,6 +110,7 @@ function goalView({ goal, parts, sessions }) {
     return {
         id: goal.id, subjectId: goal.subjectId, kind: goal.kind, name: goal.name, due: goal.due,
         dueTime: goal.dueTime, planMode: goal.planMode, status: goal.status, shape: goal.shape ?? null,
+        gradePoints: goal.gradePoints ?? null, gradedAt: goal.gradedAt ?? null,
         parts: parts.map((p) => partView(p, sessions)),
         sessions: sessions.map((s) => ({
             taskId: s.taskId, partId: s.partId, due: s.date, dueTime: s.time,

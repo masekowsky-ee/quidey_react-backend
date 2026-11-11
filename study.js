@@ -10,6 +10,7 @@ const {
 } = require('./utils/studyEstimate');
 const { plan } = require('./utils/studyPlanner');
 const { hasAiAccess } = require('./utils/access');
+const { SCALES, toPoints, fromPoints, average } = require('./utils/grades');
 const {
     getClock, loadSessions, loadGoals, goalView, goalProgress, loadPlanInput, statusOf, inputHash, ACTIVE_GOAL_SQL, isEnded,
 } = require('./utils/studyLoad');
@@ -180,9 +181,16 @@ module.exports = ({ pool, realtime, loadTask }) => {
         return (await db.query('SELECT * FROM subjects WHERE id = $1 AND user_id = $2', [id, userId])).rows[0] || null;
     }
 
+    // the account's grade scale, and a goal as the app gets it: its grade in that scale
+    const scaleOf = async (userId) => (await pool.query('SELECT grade_scale FROM users WHERE id = $1', [userId])).rows[0]?.grade_scale ?? 'points';
+    const withGrade = (view, scale) => {
+        const { gradePoints, ...rest } = view;
+        return { ...rest, grade: gradePoints == null ? null : fromPoints(gradePoints, scale) };
+    };
+
     async function goalDetail(userId, id) {
         const [found] = await loadGoals(pool, userId, { id });
-        return found ? goalView(found) : null;
+        return found ? withGrade(goalView(found), await scaleOf(userId)) : null;
     }
 
     const subjectView = (row, nextGoal = null) => ({
@@ -215,12 +223,22 @@ module.exports = ({ pool, realtime, loadTask }) => {
         const clock = await getClock(pool, userId);
         // sorted by due; a goal whose day is over has ended (ruling 29)
         const goals = (await loadGoals(pool, userId)).filter((g) => g.goal.status === 'active' && !isEnded(g.goal, clock.today));
+        // grades: one mean of the exams' points and one of all other work's, shown in the account's scale
+        const scale = await scaleOf(userId);
+        const graded = (await pool.query(
+            "SELECT subject_id, (kind = 'exam') AS exam, grade::float8 AS grade FROM goals WHERE user_id = $1 AND status = 'done' AND grade IS NOT NULL", [userId]
+        )).rows;
+        const averageOf = (subjectId, exam) => {
+            const points = graded.filter((g) => g.subject_id === subjectId && g.exam === exam).map((g) => g.grade);
+            const mean = average(points);
+            return { avg: mean == null ? null : fromPoints(mean, scale), n: points.length };
+        };
         res.json(subjects.map((s) => {
             const next = goals.find((g) => g.goal.subjectId === s.id);
-            return subjectView(s, next ? {
+            return { ...subjectView(s, next ? {
                 id: next.goal.id, name: next.goal.name, kind: next.goal.kind, due: next.goal.due, shape: next.goal.shape,
                 ...goalProgress(next, clock),
-            } : null);
+            } : null), exam: averageOf(s.id, true), other: averageOf(s.id, false) };
         }));
     });
 
@@ -341,7 +359,8 @@ module.exports = ({ pool, realtime, loadTask }) => {
             subjectId = idParam(req.query.subject);
             if (subjectId == null) return invalid(res, 'subject');
         }
-        res.json((await loadGoals(pool, userId, { subjectId })).map(goalView));
+        const scale = await scaleOf(userId);
+        res.json((await loadGoals(pool, userId, { subjectId })).map((g) => withGrade(goalView(g), scale)));
     });
 
     router.get('/goals/:id', async (req, res) => {
@@ -477,6 +496,20 @@ module.exports = ({ pool, realtime, loadTask }) => {
             const subjectId = idParam(body.subjectId);
             if (!(await ownedSubject(pool, userId, subjectId))) return notFound(res);
             set('subject_id', subjectId);
+        }
+        if (body.grade !== undefined) {
+            // a grade, in the account's scale, only on finished work; null takes it back
+            if (body.grade !== null) {
+                const points = toPoints(body.grade, await scaleOf(userId));
+                if (points == null) return invalid(res, 'grade');
+                const status = body.status ?? (await pool.query('SELECT status FROM goals WHERE id = $1', [id])).rows[0].status;
+                if (status !== 'done') return fail(res, 400, 'goal_not_done', 'Only finished work can get a grade');
+                set('grade', points);
+                sets.push('graded_at = now()');
+            } else {
+                set('grade', null);
+                sets.push('graded_at = NULL');
+            }
         }
         if (sets.length === 0) return invalid(res, 'body');
         await pool.query(`UPDATE goals SET ${sets.join(', ')} WHERE id = $1 AND user_id = $2`, params);
@@ -705,6 +738,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
             sessionMinutes: clock.sessionMinutes,
             dailyMaxMinutes: clock.dailyMaxMinutes,
             aiAuto: clock.aiAuto,
+            gradeScale: (await pool.query('SELECT grade_scale FROM users WHERE id = $1', [userId])).rows[0].grade_scale,
             aiAvailable: makeAiClient() !== null && hasAiAccess(account),
         };
     }
@@ -741,6 +775,10 @@ module.exports = ({ pool, realtime, loadTask }) => {
         if (body.aiAuto !== undefined) {
             if (typeof body.aiAuto !== 'boolean') return invalid(res, 'aiAuto');
             set('study_ai_auto', body.aiAuto);
+        }
+        if (body.gradeScale !== undefined) {
+            if (!SCALES.includes(body.gradeScale)) return invalid(res, 'gradeScale');
+            set('grade_scale', body.gradeScale);
         }
         const client = await pool.connect();
         try {
