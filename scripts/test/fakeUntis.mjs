@@ -59,6 +59,18 @@ export async function startFakeUntis() {
                     lessons: [{ id: 101, subject: "D", lessonType: "Unterricht" }],
                 } });
             }
+            if (url.pathname === "/WebUntis/api/exams") {
+                calls.push({ method: "exams", cookie: req.headers.cookie ?? null, query: Object.fromEntries(url.searchParams) });
+                if (!String(req.headers.cookie ?? "").includes("JSESSIONID=S1")) return send({}, 401);
+                const t = new Date(); t.setDate(t.getDate() + 1);
+                const later = new Date(); later.setDate(later.getDate() + 10);
+                const past = new Date(); past.setDate(past.getDate() - 3);
+                return send({ data: { exams: [
+                    { id: 801, examDate: ymd(t), startTime: 800, endTime: 935, subject: "D", name: "Klassenarbeit" },
+                    { id: 802, examDate: ymd(later), startTime: 1000, endTime: 1130, subject: "M", name: "Klausur" },
+                    { id: 803, examDate: ymd(past), startTime: 800, endTime: 900, subject: "E", name: "Vokabeltest" },
+                ] } });
+            }
             if (url.pathname === "/WebUntis/Ical.do") {
                 calls.push({ method: "ical", key: url.searchParams.get("key") });
                 if (url.searchParams.get("key") !== "abc") return send("nope", 403, "text/plain");

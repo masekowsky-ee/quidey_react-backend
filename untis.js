@@ -104,6 +104,10 @@ module.exports = function untisRouter({ pool }) {
             try {
                 await store(userId, await fetchFor(row, userId));
                 // homework → tasks (login only: the iCal link has none); its failure doesn't fail the timetable
+                if (row.mode === "login") {
+                    // the school's subjects and exams in Lernen (a failure doesn't fail the timetable)
+                    await subjectsAndExams(row, userId).catch((err) => console.error("[untis] subjects/exams", err.message));
+                }
                 if (row.mode === "login" && row.homework_to_tasks) await homeworkToTasks(row, userId).catch(() => {});
             } catch (err) {
                 const code = err instanceof untis.UntisError ? err.code : "UNTIS_FAILED";
@@ -113,6 +117,70 @@ module.exports = function untisRouter({ pool }) {
         })().finally(() => syncing.delete(userId));
         syncing.set(userId, job);
         return job;
+    }
+
+    const SUBJECT_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
+
+    // every Untis subject as a Lernen subject (one I have under that name is reused, else made with the
+    // first colour not in use, cycling once all eight are), then the exams still to come as exam goals
+    async function subjectsAndExams(row, userId) {
+        const { rows: lessons } = await pool.query(
+            "SELECT DISTINCT subject, subject_long FROM untis_lessons WHERE user_id = $1 AND subject <> ''", [userId]);
+        const known = new Map(); // short name -> subject id
+        for (const lesson of lessons) {
+            const name = (lesson.subject_long || lesson.subject).slice(0, 60);
+            let { rows: [subject] } = await pool.query(
+                "SELECT id FROM subjects WHERE user_id = $1 AND (lower(name) = lower($2) OR lower(untis_name) = lower($2)) ORDER BY id LIMIT 1", [userId, name]);
+            if (!subject) {
+                const { rows: used } = await pool.query("SELECT color FROM subjects WHERE user_id = $1 AND NOT archived", [userId]);
+                const taken = new Set(used.map(r => r.color));
+                const color = SUBJECT_COLORS.find(c => !taken.has(c)) ?? SUBJECT_COLORS[used.length % SUBJECT_COLORS.length];
+                ({ rows: [subject] } = await pool.query(
+                    "INSERT INTO subjects (user_id, name, color, untis_name) VALUES ($1, $2, $3, $2) RETURNING id", [userId, name, color]));
+            } else {
+                await pool.query("UPDATE subjects SET untis_name = COALESCE(untis_name, $2) WHERE id = $1", [subject.id, name]);
+            }
+            known.set(lesson.subject, subject.id);
+        }
+
+        const { from, to } = await range(userId);
+        const [{ rows: [{ today }] }] = await Promise.all([
+            pool.query(`SELECT to_char((now() AT TIME ZONE COALESCE(timezone, 'Europe/Berlin'))::date, 'YYYY-MM-DD') AS today FROM users WHERE id = $1`, [userId]),
+        ]);
+        const ahead = new Date(Date.parse(to) + 120 * 86400000).toISOString().slice(0, 10);
+        const exams = await untis.fetchExams({ server: row.server, school: row.school, username: row.username, password: untis.open(row.secret) }, from, ahead);
+        const { rows: seen } = await pool.query("SELECT untis_id FROM untis_exams WHERE user_id = $1", [userId]);
+        const done = new Set(seen.map(r => String(r.untis_id)));
+        for (const exam of exams) {
+            if (done.has(String(exam.id)) || exam.day < today || !known.has(exam.subject)) continue;
+            const subjectId = known.get(exam.subject);
+            const client = await pool.connect();
+            try {
+                await client.query("BEGIN");
+                const claimed = await client.query("INSERT INTO untis_exams (user_id, untis_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING untis_id", [userId, exam.id]);
+                if (claimed.rowCount) {
+                    // one I entered myself (same subject, same day) is that exam
+                    const { rows: [mine] } = await client.query(
+                        "SELECT id FROM goals WHERE user_id = $1 AND subject_id = $2 AND kind = 'exam' AND due = $3 LIMIT 1", [userId, subjectId, exam.day]);
+                    let goalId = mine?.id;
+                    if (!goalId) {
+                        const { rows: [subject] } = await client.query("SELECT name FROM subjects WHERE id = $1", [subjectId]);
+                        ({ rows: [{ id: goalId }] } = await client.query(
+                            "INSERT INTO goals (user_id, subject_id, kind, name, due, due_time, plan_mode) VALUES ($1, $2, 'exam', $3, $4, $5, 'days') RETURNING id",
+                            [userId, subjectId, `${subject.name}: Klausur`.slice(0, 200), exam.day, exam.time]));
+                        await client.query(
+                            "INSERT INTO goal_parts (goal_id, name, position, estimate_minutes, estimate_source) VALUES ($1, 'Lernen', 0, 120, 'default')", [goalId]);
+                    }
+                    await client.query("UPDATE untis_exams SET goal_id = $3 WHERE user_id = $1 AND untis_id = $2", [userId, exam.id, goalId]);
+                }
+                await client.query("COMMIT");
+            } catch (err) {
+                await client.query("ROLLBACK");
+                throw err;
+            } finally {
+                client.release();
+            }
+        }
     }
 
     // homework not yet made into a task: a task on its day, at the time of that subject's lesson, with the text

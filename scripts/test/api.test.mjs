@@ -5414,6 +5414,48 @@ describe("Untis: the timetable in the calendar", () => {
         assert.equal((await tasks()).length, 0);
     });
 
+    test("connecting makes every Untis subject with its own colour and the exams still to come; again changes nothing", async () => {
+        const S = "/api/tester/study";
+        const una = await member("untisuna");
+        await call("PUT", "/api/untis", LOGIN, una.token);
+        const subjects = () => call("GET", `${S}/subjects`, null, una.token).then(r => r.data);
+        const goals = () => call("GET", `${S}/goals`, null, una.token).then(r => r.data);
+        const made = await subjects();
+        assert.deepEqual(made.map(s => s.name).sort(), ["Deutsch", "Englisch", "Mathematik"]);
+        assert.equal(new Set(made.map(s => s.color)).size, 3);
+        assert.ok(made.every(s => s.color));
+        const exams = await goals();
+        // the past one (E) isn't made; D tomorrow and M in ten days are
+        assert.deepEqual(exams.map(g => [g.name, g.kind, g.due]).sort(), [
+            ["Deutsch: Klausur", "exam", daysFromToday(1)], ["Mathematik: Klausur", "exam", daysFromToday(10)],
+        ].sort());
+        await sql("UPDATE untis_accounts SET last_sync_at = now() - interval '2 minutes' WHERE user_id = $1", [una.id]);
+        await call("POST", "/api/untis/sync", null, una.token);
+        assert.equal((await subjects()).length, 3);
+        assert.equal((await goals()).length, 2);
+        // an exam goal deleted by hand doesn't come back
+        await call("DELETE", `${S}/goals/${exams[0].id}`, null, una.token);
+        await sql("UPDATE untis_accounts SET last_sync_at = now() - interval '2 minutes' WHERE user_id = $1", [una.id]);
+        await call("POST", "/api/untis/sync", null, una.token);
+        assert.equal((await goals()).length, 1);
+    });
+
+    test("a subject I already have (any case) is reused, and an exam I entered myself isn't made twice", async () => {
+        const S = "/api/tester/study";
+        const uli = await member("untisuli");
+        const mathe = (await call("POST", `${S}/subjects`, { name: "mathematik", color: "teal" }, uli.token)).data;
+        const deutsch = (await call("POST", `${S}/subjects`, { name: "Deutsch" }, uli.token)).data;
+        await call("POST", `${S}/goals`, { subjectId: deutsch.id, kind: "exam", name: "Deutsch Klausur", due: daysFromToday(1), planMode: "days", parts: [{ name: "x", estimateMinutes: 60 }] }, uli.token);
+        await call("PUT", "/api/untis", LOGIN, uli.token);
+        const subjects = (await call("GET", `${S}/subjects`, null, uli.token)).data;
+        assert.equal(subjects.length, 3);
+        const reused = subjects.find(s => s.id === mathe.id);
+        assert.equal(reused.name, "mathematik");
+        assert.equal(reused.color, "teal");
+        const goals = (await call("GET", `${S}/goals`, null, uli.token)).data;
+        assert.deepEqual(goals.map(g => g.name).sort(), ["Deutsch Klausur", "mathematik: Klausur"]);
+    });
+
     test("switched off, no homework task is made", async () => {
         const xan = await member("untisxan");
         const off = await call("PUT", "/api/untis/settings", { homeworkToTasks: false }, xan.token);

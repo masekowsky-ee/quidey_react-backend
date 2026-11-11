@@ -161,6 +161,26 @@ async function fetchHomework({ server, school, username, password }, fromIso, to
     }
 }
 
+// ---------- exams ----------
+// The exams of the class between two days (WebUntis' web API, with the login's session):
+// [{ id, subject, day 'YYYY-MM-DD', time 'HH:MM' | null, name }]
+async function fetchExams({ server, school, username, password }, fromIso, toIso) {
+    const session = await login({ server, school, username, password });
+    try {
+        const klasse = session.klasseId ? `&klasseId=${encodeURIComponent(session.klasseId)}` : "";
+        const url = `${baseOf(server)}/WebUntis/api/exams?startDate=${untisDate(fromIso)}&endDate=${untisDate(toIso)}${klasse}`;
+        const res = await request(url, { headers: { Cookie: `JSESSIONID=${session.sessionId}; schoolname="_${Buffer.from(school).toString("base64")}"`, "X-Requested-With": "XMLHttpRequest" } });
+        if (!res.ok) throw new UntisError(res.status === 401 || res.status === 403 ? "UNTIS_NOT_ALLOWED" : "UNTIS_FAILED", `exams ${res.status}`);
+        const data = (await res.json().catch(() => null))?.data;
+        return (Array.isArray(data?.exams) ? data.exams : []).filter(e => Number.isInteger(e?.id) && Number.isInteger(e?.examDate)).map(e => ({
+            id: e.id, subject: clip(e.subject, 40), day: isoDate(e.examDate), name: clip(e.name, 120),
+            time: Number.isInteger(e.startTime) ? `${String(Math.floor(e.startTime / 100)).padStart(2, "0")}:${String(e.startTime % 100).padStart(2, "0")}` : null,
+        }));
+    } finally {
+        await rpc(server, school, "logout", {}, session.sessionId).catch(() => {});
+    }
+}
+
 // ---------- iCal ----------
 function validIcalUrl(value) {
     let url;
@@ -261,6 +281,6 @@ function open(sealed) {
 }
 
 module.exports = {
-    UntisError, validServer, validIcalUrl, searchSchools, login, fetchLessons, fetchHomework, fetchIcal,
+    UntisError, validServer, validIcalUrl, searchSchools, login, fetchLessons, fetchHomework, fetchExams, fetchIcal,
     parseIcal, periodToLesson, mergePeriods, canStorePasswords, seal, open,
 };
