@@ -134,7 +134,7 @@ before(async () => {
             FIREBASE_SERVICE_ACCOUNT_FILE: "", STRIPE_SECRET_KEY: "", PLAY_SERVICE_ACCOUNT_FILE: "", ACCESS_MODE: "beta", PRO_BILLING: "on",
             GOOGLE_CLIENT_IDS: GOOGLE_CLIENT,
             // the AI answers from fixed replies (utils/ai.js), never the real API; "AI_FAIL" in the input fails
-            ANTHROPIC_API_KEY: "", AI_FAKE: JSON.stringify(AI_FAKE),
+            ANTHROPIC_API_KEY: "", AI_FAKE: JSON.stringify(AI_FAKE), QUOTA_SCAN: "1", QUOTA_AI_LINE: "5",
             UNTIS_TEST_BASE: fakeUntis.base, UNTIS_SECRET: "a-test-secret-for-untis-that-is-long-enough",
             GOOGLE_TEST_CERTS: JSON.stringify({ [GOOGLE_KID]: GOOGLE_KEY.publicKey.export({ type: "spki", format: "pem" }) }),
         },
