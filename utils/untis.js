@@ -141,6 +141,26 @@ function mergePeriods(lessons) {
     return out;
 }
 
+// ---------- homework ----------
+// The homework of the last two weeks and the next four (WebUntis' web API, with the login's session):
+// [{ id, subject, dueDay 'YYYY-MM-DD', text, remark, completed }]
+async function fetchHomework({ server, school, username, password }, fromIso, toIso) {
+    const session = await login({ server, school, username, password });
+    try {
+        const url = `${baseOf(server)}/WebUntis/api/homeworks/lessons?startDate=${untisDate(fromIso)}&endDate=${untisDate(toIso)}`;
+        const res = await request(url, { headers: { Cookie: `JSESSIONID=${session.sessionId}; schoolname="_${Buffer.from(school).toString("base64")}"`, "X-Requested-With": "XMLHttpRequest" } });
+        if (!res.ok) throw new UntisError(res.status === 401 || res.status === 403 ? "UNTIS_NOT_ALLOWED" : "UNTIS_FAILED", `homework ${res.status}`);
+        const data = (await res.json().catch(() => null))?.data;
+        const subjects = new Map((Array.isArray(data?.lessons) ? data.lessons : []).map(lesson => [lesson.id, clip(lesson.subject, 40)]));
+        return (Array.isArray(data?.homeworks) ? data.homeworks : []).filter(h => Number.isInteger(h?.id) && Number.isInteger(h?.dueDate)).map(h => ({
+            id: h.id, subject: subjects.get(h.lessonId) || "", dueDay: isoDate(h.dueDate),
+            text: clip(h.text, 1500), remark: clip(h.remark, 500), completed: Boolean(h.completed),
+        }));
+    } finally {
+        await rpc(server, school, "logout", {}, session.sessionId).catch(() => {});
+    }
+}
+
 // ---------- iCal ----------
 function validIcalUrl(value) {
     let url;
@@ -241,6 +261,6 @@ function open(sealed) {
 }
 
 module.exports = {
-    UntisError, validServer, validIcalUrl, searchSchools, login, fetchLessons, fetchIcal,
+    UntisError, validServer, validIcalUrl, searchSchools, login, fetchLessons, fetchHomework, fetchIcal,
     parseIcal, periodToLesson, mergePeriods, canStorePasswords, seal, open,
 };

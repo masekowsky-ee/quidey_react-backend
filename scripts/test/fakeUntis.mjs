@@ -46,6 +46,19 @@ export async function startFakeUntis() {
                 }
                 return send({ error: { code: -32601, message: "no such method" } });
             }
+            if (url.pathname === "/WebUntis/api/homeworks/lessons") {
+                calls.push({ method: "homeworks", cookie: req.headers.cookie ?? null });
+                if (!String(req.headers.cookie ?? "").includes("JSESSIONID=S1")) return send({}, 401);
+                const t = new Date(); t.setDate(t.getDate() + 1);
+                const due = ymd(t);
+                return send({ data: {
+                    homeworks: [
+                        { id: 501, lessonId: 101, date: ymd(new Date()), dueDate: due, text: "Aufsatz Seite 12", remark: "bitte tippen", completed: false },
+                        { id: 502, lessonId: 101, date: ymd(new Date()), dueDate: due, text: "schon erledigt", remark: "", completed: true },
+                    ],
+                    lessons: [{ id: 101, subject: "D", lessonType: "Unterricht" }],
+                } });
+            }
             if (url.pathname === "/WebUntis/Ical.do") {
                 calls.push({ method: "ical", key: url.searchParams.get("key") });
                 if (url.searchParams.get("key") !== "abc") return send("nope", 403, "text/plain");

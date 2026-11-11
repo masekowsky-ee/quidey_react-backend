@@ -5281,6 +5281,47 @@ describe("Untis: the timetable in the calendar", () => {
         assert.deepEqual((await call("GET", "/api/untis", null, tom.token)).data, { available: true, connected: false });
     });
 
+    test("homework in Untis becomes a task with the day, the lesson's time and the text, once", async () => {
+        const wes = await member("untiswes");
+        const status = (await call("PUT", "/api/untis", LOGIN, wes.token)).data;
+        assert.equal(status.homeworkToTasks, true);
+        const tomorrow = daysFromToday(1);
+        const tasks = () => call("GET", "/api/tasks", null, wes.token).then(r => r.data.filter(t => t.name.startsWith("D:")));
+        const made = await tasks();
+        assert.equal(made.length, 1);
+        assert.equal(made[0].name, "D: Hausaufgabe");
+        assert.equal(String(made[0].due).slice(0, 10) === tomorrow || iso(new Date(made[0].due)) === tomorrow, true);
+        assert.equal(made[0].due_time, "08:00");
+        assert.equal(made[0].description, "Aufsatz Seite 12\nbitte tippen");
+        // fetched again: no second one; deleted by hand: not made again
+        await call("POST", "/api/untis/sync", null, wes.token);
+        await sql("UPDATE untis_accounts SET last_sync_at = now() - interval '2 minutes' WHERE user_id = $1", [wes.id]);
+        await call("POST", "/api/untis/sync", null, wes.token);
+        assert.equal((await tasks()).length, 1);
+        await call("DELETE", `/api/tasks/${made[0].id}`, null, wes.token);
+        await sql("UPDATE untis_accounts SET last_sync_at = now() - interval '2 minutes' WHERE user_id = $1", [wes.id]);
+        await call("POST", "/api/untis/sync", null, wes.token);
+        assert.equal((await tasks()).length, 0);
+    });
+
+    test("switched off, no homework task is made", async () => {
+        const xan = await member("untisxan");
+        const off = await call("PUT", "/api/untis/settings", { homeworkToTasks: false }, xan.token);
+        assert.equal(off.status, 404);
+        await call("PUT", "/api/untis", LOGIN, xan.token);
+        await call("DELETE", "/api/untis", null, xan.token);
+        await call("PUT", "/api/untis", { ...LOGIN }, xan.token);
+        const r = await call("PUT", "/api/untis/settings", { homeworkToTasks: false }, xan.token);
+        assert.equal(r.status, 200);
+        assert.equal(r.data.homeworkToTasks, false);
+        await sql("DELETE FROM tasks WHERE user_id = $1", [xan.id]);
+        await sql("DELETE FROM untis_homework_tasks WHERE user_id = $1", [xan.id]);
+        await sql("UPDATE untis_accounts SET last_sync_at = now() - interval '2 minutes' WHERE user_id = $1", [xan.id]);
+        await call("POST", "/api/untis/sync", null, xan.token);
+        assert.equal((await call("GET", "/api/tasks", null, xan.token)).data.filter(t => t.name.startsWith("D:")).length, 0);
+        assert.equal((await call("PUT", "/api/untis/settings", { homeworkToTasks: "x" }, xan.token)).status, 400);
+    });
+
     test("only with app access, and a long range is refused", async () => {
         const uma = await member("untisuma", { pro: false });
         assert.equal((await call("GET", "/api/untis", null, uma.token)).status, 403);

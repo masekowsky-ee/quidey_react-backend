@@ -52,7 +52,7 @@ module.exports = function untisRouter({ pool }) {
         return {
             available: untis.canStorePasswords(), connected: true, mode: row.mode,
             schoolLabel: row.school_label, username: row.username,
-            lastSyncAt: row.last_sync_at, lastError: row.last_error,
+            lastSyncAt: row.last_sync_at, lastError: row.last_error, homeworkToTasks: row.homework_to_tasks,
         };
     }
 
@@ -103,6 +103,8 @@ module.exports = function untisRouter({ pool }) {
             if (!row) return;
             try {
                 await store(userId, await fetchFor(row, userId));
+                // homework → tasks (login only: the iCal link has none); its failure doesn't fail the timetable
+                if (row.mode === "login" && row.homework_to_tasks) await homeworkToTasks(row, userId).catch(() => {});
             } catch (err) {
                 const code = err instanceof untis.UntisError ? err.code : "UNTIS_FAILED";
                 await pool.query("UPDATE untis_accounts SET last_error = $2 WHERE user_id = $1", [userId, code]);
@@ -112,6 +114,52 @@ module.exports = function untisRouter({ pool }) {
         syncing.set(userId, job);
         return job;
     }
+
+    // homework not yet made into a task: a task on its day, at the time of that subject's lesson, with the text
+    async function homeworkToTasks(row, userId) {
+        const { from, to } = await range(userId);
+        const [{ rows: [{ today }] }, { rows: known }] = await Promise.all([
+            pool.query(`SELECT to_char((now() AT TIME ZONE COALESCE(timezone, 'Europe/Berlin'))::date, 'YYYY-MM-DD') AS today FROM users WHERE id = $1`, [userId]),
+            pool.query("SELECT homework_id FROM untis_homework_tasks WHERE user_id = $1", [userId]),
+        ]);
+        const seen = new Set(known.map(r => String(r.homework_id)));
+        const back = new Date(Date.parse(from) - 7 * 86400000).toISOString().slice(0, 10);
+        const ahead = new Date(Date.parse(to) + 7 * 86400000).toISOString().slice(0, 10);
+        const list = await untis.fetchHomework({ server: row.server, school: row.school, username: row.username, password: untis.open(row.secret) }, back, ahead);
+        for (const hw of list) {
+            if (hw.completed || seen.has(String(hw.id)) || hw.dueDay < today || !(hw.text || hw.remark)) continue;
+            const lesson = hw.subject && (await pool.query(
+                "SELECT start_min FROM untis_lessons WHERE user_id = $1 AND day = $2 AND subject = $3 AND status <> 'cancelled' ORDER BY start_min LIMIT 1",
+                [userId, hw.dueDay, hw.subject])).rows[0];
+            const time = lesson ? `${String(Math.floor(lesson.start_min / 60)).padStart(2, "0")}:${String(lesson.start_min % 60).padStart(2, "0")}` : null;
+            const description = [hw.text, hw.remark].filter(Boolean).join("\n");
+            const client = await pool.connect();
+            try {
+                await client.query("BEGIN");
+                const claimed = await client.query("INSERT INTO untis_homework_tasks (user_id, homework_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING homework_id", [userId, hw.id]);
+                if (claimed.rowCount) {
+                    const { rows: [task] } = await client.query(
+                        "INSERT INTO tasks (name, due, due_time, description, user_id, kind) VALUES ($1, $2, $3, $4, $5, 'task') RETURNING id",
+                        [`${hw.subject || "Untis"}: Hausaufgabe`, hw.dueDay, time, description.slice(0, 2000), userId]);
+                    await client.query("UPDATE untis_homework_tasks SET task_id = $3 WHERE user_id = $1 AND homework_id = $2", [userId, hw.id, task.id]);
+                }
+                await client.query("COMMIT");
+            } catch (err) {
+                await client.query("ROLLBACK");
+                throw err;
+            } finally {
+                client.release();
+            }
+        }
+    }
+
+    router.put("/settings", async (req, res) => {
+        const row = await account(req.user.userId);
+        if (!row) return fail(res, 404, "NOT_CONNECTED");
+        if (typeof req.body?.homeworkToTasks !== "boolean") return fail(res, 400, "INVALID_INPUT", "homeworkToTasks");
+        await pool.query("UPDATE untis_accounts SET homework_to_tasks = $2 WHERE user_id = $1", [req.user.userId, req.body.homeworkToTasks]);
+        res.json(status(await account(req.user.userId)));
+    });
 
     router.get("/", async (req, res) => {
         res.json(status(await account(req.user.userId)));

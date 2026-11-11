@@ -2647,6 +2647,7 @@ ALTER TABLE public.users
 ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_tips_seen_check;
 ALTER TABLE public.users ADD CONSTRAINT users_tips_seen_check CHECK ((cardinality(tips_seen) <= 300));
 
+
 --
 -- PostgreSQL database dump complete
 --
@@ -2685,4 +2686,13 @@ CREATE TABLE IF NOT EXISTS public.untis_lessons (
 
 CREATE INDEX IF NOT EXISTS untis_lessons_user_day ON public.untis_lessons (user_id, day);
 
+-- 050: homework from Untis becomes tasks (see migrations/050_untis_homework.sql)
+ALTER TABLE public.untis_accounts ADD COLUMN IF NOT EXISTS homework_to_tasks boolean DEFAULT true NOT NULL;
 
+CREATE TABLE IF NOT EXISTS public.untis_homework_tasks (
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    homework_id bigint NOT NULL,
+    task_id integer REFERENCES public.tasks(id) ON DELETE SET NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    PRIMARY KEY (user_id, homework_id)
+);
