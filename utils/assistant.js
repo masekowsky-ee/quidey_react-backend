@@ -109,7 +109,9 @@ function readRequest(body) {
     const messages = [];
     for (const m of list) {
         if (!m || (m.role !== "user" && m.role !== "assistant") || typeof m.content !== "string") return { error: "messages" };
-        const content = m.content.trim();
+        // the user's own lines are limited; an answer of ours that came back long is shortened
+        let content = m.content.trim();
+        if (m.role === "assistant") content = content.slice(0, MESSAGE_MAX).trim();
         if (!content || content.length > MESSAGE_MAX) return { error: "messages" };
         messages.push({ role: m.role, content });
     }
@@ -237,6 +239,12 @@ async function proposals(uses, { db, userId, types, check }) {
 
 const textOf = (content) => content.filter(b => b.type === "text" && typeof b.text === "string").map(b => b.text.trim()).filter(Boolean).join("\n");
 
+// what the actions are, when the model said nothing about them
+const listOf = (actions) => actions.map(a => a.summary || a.entry?.name || a.subject || "").filter(Boolean).join("\n");
+
+// the reply as the app can send it back as history (a message of the chat is at most MESSAGE_MAX long)
+const clip = (message) => (message.length > MESSAGE_MAX ? `${message.slice(0, MESSAGE_MAX - 1).trimEnd()}…` : message);
+
 // ---------- the loop ----------
 
 async function runAssistant({ db, userId, messages, language, now = new Date() }) {
@@ -267,7 +275,7 @@ async function runAssistant({ db, userId, messages, language, now = new Date() }
             if (turn.stopReason === "refusal") return { message: text.refusal, actions: [], usage };
             const uses = turn.content.filter(b => b.type === "tool_use");
             if (turn.stopReason === "end_turn" || (turn.stopReason === "tool_use" && uses.length === 0)) {
-                return { message: textOf(turn.content) || text.empty, actions: [], usage };
+                return { message: clip(textOf(turn.content) || text.empty), actions: [], usage };
             }
             if (turn.stopReason !== "tool_use") throw new AiError("AI_FAILED", `stop: ${turn.stopReason}`);
 
@@ -278,10 +286,10 @@ async function runAssistant({ db, userId, messages, language, now = new Date() }
                 const said = textOf(turn.content);
                 const parts = [];
                 // with nothing left to show, what the model said may claim what didn't happen
-                if (actions.length || !dropped) parts.push(said || (question ? "" : text.proposal));
+                if (actions.length || !dropped) parts.push(said || (question ? "" : listOf(actions) || text.proposal));
                 if (dropped) parts.push(text.dropped(dropped));
                 if (question) parts.push(question);
-                return { message: parts.filter(Boolean).join("\n\n"), actions, usage };
+                return { message: clip(parts.filter(Boolean).join("\n\n")), actions, usage };
             }
 
             // the read tools, all answered in one message

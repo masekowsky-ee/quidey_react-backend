@@ -270,8 +270,9 @@ module.exports = function aiRouter({ pool }) {
     //        → { message, actions, quota }: the Max assistant (utils/assistant.js, where the actions
     //        are described). Max only (403 MAX_REQUIRED, before anything is counted); one "assistant"
     //        of the day (20, given back when the AI fails; 429 QUOTA_REACHED with resetsAt when none
-    //        is left). Up to 40 messages of up to 2000 characters, the last one the user's; only the
-    //        last 10 go to Anthropic. Nothing of the chat is kept here, only the day's token numbers.
+    //        is left). Up to 40 messages, the user's up to 2000 characters (longer answers are
+    //        shortened, and the message sent back is never longer), the last one the user's; only
+    //        the last 10 go to Anthropic. Nothing of the chat is kept here, only the day's token numbers.
     router.post("/assistant", (req, res, next) => {
         if (hasMax(req.account)) return next();
         res.status(403).json({ error: "The assistant is part of Quidey Max", code: "MAX_REQUIRED" });

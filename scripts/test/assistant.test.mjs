@@ -302,6 +302,26 @@ test("create_entry is checked like parse-entry; study_plan and delete pass throu
     assert.match(r.data.message, /couldn't|could not/i);
 });
 
+test("a long answer is clipped, and the chat with it as history still works", { skip: NO_DB }, async () => {
+    script = turns(textTurn("word ".repeat(1000)), textTurn("ok"));
+    const first = await ask(users.maxi, "List everything");
+    assert.equal(first.status, 200);
+    assert.ok(first.data.message.length <= 2000, String(first.data.message.length));
+    const history = [{ role: "user", content: "List everything" }, { role: "assistant", content: first.data.message }, { role: "user", content: "Thanks" }];
+    assert.equal((await call("POST", "/api/ai/assistant", { messages: history, language: "en" }, users.maxi)).status, 200);
+    // an over-long answer from an older app is shortened rather than refused
+    history[1].content = "x".repeat(5000);
+    assert.equal((await call("POST", "/api/ai/assistant", { messages: history, language: "en" }, users.maxi)).status, 200);
+    assert.ok(calls.at(-1).messages[1].content.length <= 2000);
+});
+
+test("a proposal without words: the message names what is proposed", { skip: NO_DB }, async () => {
+    script = turns(toolTurn(["delete_entry", { id: tasks.mine, summary: "Delete Mathe lernen" }]));
+    const r = await ask(users.maxi, "Delete maths");
+    assert.equal(r.status, 200);
+    assert.equal(r.data.message, "Delete Mathe lernen");
+});
+
 test("ask_user ends the loop with the question", { skip: NO_DB }, async () => {
     script = turns(toolTurn(["ask_user", { question: "Which day?" }]));
     const r = await ask(users.maxi, "Move it");
