@@ -1,17 +1,20 @@
 // The AI features (later part of Quidey Pro, for now with daily allowances, utils/quota.js).
 // Mounted at /api/ai, behind authenticateToken + requirePro.
 //
-//   GET  /api/ai/quota       → { available, scan: { used, max }, aiLine: { used, max }, resetsAt }
+//   GET  /api/ai/quota       → { available, scan: { used, max }, aiLine: { used, max }, assistant: { used, max }, resetsAt }
 //   POST /api/ai/parse-entry { text } → { entry, quota }: a quick-entry line the app's own rules
 //        didn't understand, read by Claude (utils/ai.js). Uses one "aiLine" of the day (given back
 //        when the AI fails). entry = { kind, name, due, time, durationMinutes, color, eventTypeId,
 //        reminders, prio }, checked here like any input.
 // Only the line, today's date and the names of my event types go to Anthropic; nothing is kept.
+//   POST /api/ai/assistant  (Max only, see below)
+//   POST /api/ai/scan       (see below)
 
 const express = require("express");
 const quota = require("./utils/quota");
 const { ask, available, AiError, aiErrorResponse } = require("./utils/ai");
-const { hasAiAccess } = require("./utils/access");
+const { hasAiAccess, hasMax } = require("./utils/access");
+const assistant = require("./utils/assistant");
 
 const TASK_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
 const LINE_MAX = 500;
@@ -243,11 +246,12 @@ module.exports = function aiRouter({ pool }) {
     sweep.unref?.();
 
     // runs a job on one of today's allowances: refused when none is left, given back when it fails
+    // (the job gets the booking, { day, ... })
     async function withQuota(req, res, kind, job) {
         const booked = await quota.take(pool, req.user.userId, kind);
         if (!booked.ok) return quota.refuse(res, kind, booked);
         try {
-            const result = await job();
+            const result = await job(booked);
             res.json({ ...result, quota: await quota.status(pool, req.user.userId) });
         } catch (err) {
             await quota.giveBack(pool, req.user.userId, kind, booked.day).catch(() => {});
@@ -260,6 +264,35 @@ module.exports = function aiRouter({ pool }) {
     // (and not for accounts without AI access: Pro and admins only, see utils/access.js)
     router.get("/quota", async (req, res) => {
         res.json({ available: available() && hasAiAccess(req.account), ...await quota.status(pool, req.user.userId) });
+    });
+
+    //   POST /api/ai/assistant { messages: [{ role: 'user' | 'assistant', content }], language: 'de' | 'en' }
+    //        → { message, actions, quota }: the Max assistant (utils/assistant.js, where the actions
+    //        are described). Max only (403 MAX_REQUIRED, before anything is counted); one "assistant"
+    //        of the day (20, given back when the AI fails; 429 QUOTA_REACHED with resetsAt when none
+    //        is left). Up to 40 messages of up to 2000 characters, the last one the user's; only the
+    //        last 10 go to Anthropic. Nothing of the chat is kept here, only the day's token numbers.
+    router.post("/assistant", (req, res, next) => {
+        if (hasMax(req.account)) return next();
+        res.status(403).json({ error: "The assistant is part of Quidey Max", code: "MAX_REQUIRED" });
+    }, async (req, res) => {
+        const body = assistant.readRequest(req.body);
+        if (body.error) return res.status(400).json({ error: "Up to 40 messages of 1 to 2000 characters, the last one yours, and the language", code: "INVALID_INPUT", field: body.error });
+        const userId = req.user.userId;
+        const record = (day, usage) => (usage && (usage.inputTokens || usage.outputTokens)
+            ? quota.recordUsage(pool, userId, day, usage).catch(() => {})
+            : null);
+        await withQuota(req, res, "assistant", async (booked) => {
+            let result;
+            try {
+                result = await assistant.runAssistant({ db: pool, userId, messages: body.messages, language: body.language });
+            } catch (err) {
+                await record(booked.day, err?.usage);
+                throw err;
+            }
+            await record(booked.day, result.usage);
+            return { message: result.message, actions: result.actions };
+        });
     });
 
     // every other route is Pro only
@@ -329,4 +362,7 @@ module.exports = function aiRouter({ pool }) {
 };
 
 module.exports.cleanEntry = cleanEntry;
+module.exports.ENTRY_SCHEMA = ENTRY_SCHEMA;
+module.exports.validDate = validDate;
+module.exports.validTime = validTime;
 module.exports.cleanScan = cleanScan;

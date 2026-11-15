@@ -3,8 +3,11 @@
 // checks again (the model's output is never trusted as it comes). Throws AiError with code
 // AI_UNAVAILABLE (no ANTHROPIC_API_KEY), AI_REFUSED, AI_TIMEOUT or AI_FAILED.
 //
+// converse({ system, messages, tools, ... }) is one turn of a tool loop (the Max assistant).
+//
 // Tests: AI_FAKE (JSON { [job]: answer }, never in production) answers without the API; an input
-// containing "AI_FAIL" fails, as the real call can.
+// containing "AI_FAIL" fails, as the real call can. useTestClient(fake) (never in production) puts
+// a fake client in place of the API's, for tests that play the model's turns in a tool loop.
 
 const MODEL = () => process.env.AI_MODEL || "claude-haiku-5-5";
 
@@ -16,7 +19,12 @@ class AiError extends Error {
 }
 
 let client;
+// tests only (never in production): a fake client whose messages.create plays the model's turns
+let testClient = null;
+const useTestClient = (fake) => { testClient = fake; };
+
 function realClient() {
+    if (testClient && process.env.NODE_ENV !== "production") return testClient;
     if (!process.env.ANTHROPIC_API_KEY) return null;
     if (!client) {
         const Anthropic = require("@anthropic-ai/sdk");
@@ -66,6 +74,37 @@ async function ask(job, { system, content, schema, maxTokens = 2000, timeoutMs =
     return message.parsed_output;
 }
 
+// One model turn with tools, for a tool loop (utils/assistant.js): the caller sends the whole
+// conversation and gets { content, stopReason, usage: { inputTokens, outputTokens } } back.
+// The caller checks stopReason (refusal, max_tokens, tool_use, end_turn) and passes content back
+// unchanged when it continues. Tool choice stays "auto" (forced tool use is refused by the model).
+// Throws AiError AI_UNAVAILABLE, AI_TIMEOUT or AI_FAILED.
+async function converse({ system, messages, tools, maxTokens = 2000, timeoutMs = 20000, effort = "low" }) {
+    const api = realClient();
+    if (!api) throw new AiError("AI_UNAVAILABLE");
+    let message;
+    try {
+        message = await api.messages.create({
+            model: MODEL(),
+            max_tokens: maxTokens,
+            system,
+            messages,
+            tools,
+            output_config: { effort },
+        }, { timeout: timeoutMs });
+    } catch (err) {
+        const Anthropic = require("@anthropic-ai/sdk");
+        const ns = Anthropic.default || Anthropic;
+        if (err instanceof ns.APIConnectionTimeoutError) throw new AiError("AI_TIMEOUT");
+        throw new AiError("AI_FAILED", err.message);
+    }
+    return {
+        content: Array.isArray(message?.content) ? message.content : [],
+        stopReason: message?.stop_reason ?? null,
+        usage: { inputTokens: Number(message?.usage?.input_tokens) || 0, outputTokens: Number(message?.usage?.output_tokens) || 0 },
+    };
+}
+
 // the HTTP answer for an AiError
 function aiErrorResponse(res, err) {
     if (err.code === "AI_UNAVAILABLE") return res.status(503).json({ error: "AI is not set up", code: "AI_UNAVAILABLE" });
@@ -91,4 +130,4 @@ async function estimateHomeworkMinutes({ text, subject, daysUntilDue }) {
     }
 }
 
-module.exports = { ask, available, AiError, aiErrorResponse, estimateHomeworkMinutes, MODEL };
+module.exports = { ask, converse, available, AiError, aiErrorResponse, estimateHomeworkMinutes, MODEL, useTestClient };
