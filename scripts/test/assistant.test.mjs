@@ -315,22 +315,22 @@ test("a turn that answers past the token budget still returns its answer", { ski
 
 test("the whole loop has a deadline: AI_TIMEOUT, the allowance kept once a call answered", { skip: NO_DB }, async () => {
     const before = process.env.ASSISTANT_DEADLINE_MS;
-    process.env.ASSISTANT_DEADLINE_MS = "400";
-    // each call takes 250 ms unless its signal aborts it first
+    process.env.ASSISTANT_DEADLINE_MS = "1500";
+    // each call takes 900 ms unless its signal aborts it first
     script = (params, n, options) => new Promise((resolve, reject) => {
-        const timer = setTimeout(() => resolve(toolTurn(["list_event_types", {}])), 250);
+        const timer = setTimeout(() => resolve(toolTurn(["list_event_types", {}])), 900);
         options?.signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); });
     });
     try {
         const started = Date.now();
         const r = await ask(users.maxi, "Hi");
-        assert.ok(Date.now() - started < 1500, "the deadline ended it");
+        assert.ok(Date.now() - started < 2500, "the deadline ended it");
         assert.equal(r.status, 502);
         assert.equal(r.data.code, "AI_TIMEOUT");
         assert.equal(calls.length, 2);
         assert.equal(await used(users.maxi), 1, "the first call answered: the message counts");
         // each call gets the time that is left, never more
-        assert.ok(callOptions[0].timeout <= 400, String(callOptions[0].timeout));
+        assert.ok(callOptions[0].timeout <= 1500, String(callOptions[0].timeout));
         assert.ok(callOptions[1].timeout < callOptions[0].timeout, `${callOptions[1].timeout} < ${callOptions[0].timeout}`);
         assert.ok(callOptions[1].signal, "an abort signal bounds the retries too");
     } finally {
