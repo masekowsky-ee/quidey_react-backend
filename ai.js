@@ -246,15 +246,16 @@ module.exports = function aiRouter({ pool }) {
     sweep.unref?.();
 
     // runs a job on one of today's allowances: refused when none is left, given back when it fails
-    // (the job gets the booking, { day, ... })
-    async function withQuota(req, res, kind, job) {
+    // (the job gets the booking, { day, ... }). keepWhen(err): true keeps it used although the job
+    // failed, because the failed work was already paid for (the assistant, once the model answered).
+    async function withQuota(req, res, kind, job, { keepWhen } = {}) {
         const booked = await quota.take(pool, req.user.userId, kind);
         if (!booked.ok) return quota.refuse(res, kind, booked);
         try {
             const result = await job(booked);
             res.json({ ...result, quota: await quota.status(pool, req.user.userId) });
         } catch (err) {
-            await quota.giveBack(pool, req.user.userId, kind, booked.day).catch(() => {});
+            if (!keepWhen?.(err)) await quota.giveBack(pool, req.user.userId, kind, booked.day).catch(() => {});
             if (err instanceof AiError) return aiErrorResponse(res, err);
             throw err;
         }
@@ -269,8 +270,9 @@ module.exports = function aiRouter({ pool }) {
     //   POST /api/ai/assistant { messages: [{ role: 'user' | 'assistant', content }], language: 'de' | 'en' }
     //        → { message, actions, quota }: the Max assistant (utils/assistant.js, where the actions
     //        are described). Max only (403 MAX_REQUIRED, before anything is counted); one "assistant"
-    //        of the day (20, given back when the AI fails; 429 QUOTA_REACHED with resetsAt when none
-    //        is left). Up to 40 messages, the user's up to 2000 characters (longer answers are
+    //        of the day (20; 429 QUOTA_REACHED with resetsAt when none is left). It is given back when
+    //        the AI fails before the model answered once; after that the message counts even if the
+    //        run fails (max_tokens, too many steps), so failing runs can't be repeated for free. Up to 40 messages, the user's up to 2000 characters (longer answers are
     //        shortened, and the message sent back is never longer), the last one the user's; only
     //        the last 10 go to Anthropic. Nothing of the chat is kept here, only the day's token numbers.
     router.post("/assistant", (req, res, next) => {
@@ -280,20 +282,20 @@ module.exports = function aiRouter({ pool }) {
         const body = assistant.readRequest(req.body);
         if (body.error) return res.status(400).json({ error: "Up to 40 messages of 1 to 2000 characters, the last one yours, and the language", code: "INVALID_INPUT", field: body.error });
         const userId = req.user.userId;
-        const record = (day, usage) => (usage && (usage.inputTokens || usage.outputTokens)
-            ? quota.recordUsage(pool, userId, day, usage).catch(() => {})
-            : null);
+        // the token numbers of every run in which the model answered (numbers only)
+        const record = (day, usage) => quota.recordUsage(pool, userId, day, usage).catch(() => {});
+        const answered = (err) => (err?.modelCalls ?? 0) > 0;
         await withQuota(req, res, "assistant", async (booked) => {
             let result;
             try {
                 result = await assistant.runAssistant({ db: pool, userId, messages: body.messages, language: body.language });
             } catch (err) {
-                await record(booked.day, err?.usage);
+                if (answered(err)) await record(booked.day, err.usage);
                 throw err;
             }
             await record(booked.day, result.usage);
             return { message: result.message, actions: result.actions };
-        });
+        }, { keepWhen: answered });
     });
 
     // every other route is Pro only

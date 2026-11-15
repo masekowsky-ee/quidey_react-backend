@@ -13,6 +13,7 @@
 //          | { type: 'study_plan', subject, examDate, topics }
 //   Every action is checked again here; an id that isn't one of the user's own tasks is dropped (and
 //   the message says something couldn't be done). At most 6 model calls and the last 10 messages.
+//   A thrown error carries usage (the tokens so far) and modelCalls (how many calls came back).
 // Nothing of the chat is kept; the caller adds the token numbers to the day's total (utils/quota.js).
 
 const { converse, AiError } = require("./ai");
@@ -61,7 +62,7 @@ function toolList() {
     const { ENTRY_SCHEMA } = require("../ai");
     const tool = (name, description, properties) => ({ name, description, strict: true, input_schema: object(properties) });
     tools = [
-        tool("get_schedule", "Read the user's tasks and events from one day to another (both YYYY-MM-DD, at most 62 days). Repeating entries are listed once with their repeat rule.",
+        tool("get_schedule", "Read the user's tasks and events from one day to another (both YYYY-MM-DD, at most 62 days). A repeating entry is listed once, on its next date, with its repeat rule (also when that date is before the range); work out its other days from the rule.",
             { from: { type: "string" }, to: { type: "string" } }),
         tool("find_entries", "Find the user's tasks and events whose name contains the words.",
             { query: { type: "string" } }),
@@ -155,10 +156,15 @@ async function readTool(name, input, { db, userId, types, check }) {
         if (!from || !to || to < from) return { error: "from and to must be dates YYYY-MM-DD, from not after to" };
         const limited = to > addDays(from, SCHEDULE_DAYS_MAX);
         if (limited) to = addDays(from, SCHEDULE_DAYS_MAX);
+        // what is due in the range, then the open entry of a series that started earlier (its rule
+        // reaches into the range). A done one of a series has a successor (repeat_from_id, see
+        // createNextRepeat in index.js) and is history, not a rule.
         const { rows } = await db.query(
             `SELECT ${ENTRY_COLUMNS} FROM tasks LEFT JOIN event_types ON event_types.id = tasks.event_type_id
-            WHERE ${VISIBLE} AND (tasks.due BETWEEN $2 AND $3 OR (tasks.repeat IS NOT NULL AND tasks.due <= $3))
-            ORDER BY tasks.due, tasks.due_time NULLS FIRST, tasks.id LIMIT ${SCHEDULE_ROWS_MAX + 1}`,
+            WHERE ${VISIBLE} AND (tasks.due BETWEEN $2 AND $3
+                OR (tasks.repeat IS NOT NULL AND tasks.due < $2 AND NOT tasks.done
+                    AND NOT EXISTS (SELECT 1 FROM tasks AS next WHERE next.repeat_from_id = tasks.id)))
+            ORDER BY tasks.due < $2, tasks.due, tasks.due_time NULLS FIRST, tasks.id LIMIT ${SCHEDULE_ROWS_MAX + 1}`,
             [userId, from, to]);
         return {
             from, to, entries: rows.slice(0, SCHEDULE_ROWS_MAX).map(entryForModel),
@@ -253,6 +259,7 @@ async function runAssistant({ db, userId, messages, language, now = new Date() }
     const check = { cleanEntry, validDate, validTime };
     const text = TEXT[language] ?? TEXT.en;
     const usage = { inputTokens: 0, outputTokens: 0 };
+    let answered = 0; // model calls that came back (the message is then paid for, see ai.js)
     try {
         const [{ rows: [me] }, { rows: types }] = await Promise.all([
             db.query(`SELECT COALESCE(timezone, 'Europe/Berlin') AS tz,
@@ -269,6 +276,7 @@ async function runAssistant({ db, userId, messages, language, now = new Date() }
 
         for (let n = 0; n < CALLS_MAX; n++) {
             const turn = await converse({ system, messages: conversation, tools: toolList(), maxTokens: MAX_TOKENS });
+            answered++;
             usage.inputTokens += turn.usage.inputTokens;
             usage.outputTokens += turn.usage.outputTokens;
 
@@ -307,8 +315,11 @@ async function runAssistant({ db, userId, messages, language, now = new Date() }
         }
         throw new AiError("AI_FAILED", "too many steps");
     } catch (err) {
-        // the tokens spent before it failed are still counted
-        if (err && typeof err === "object") err.usage = usage;
+        // the tokens spent before it failed are still counted, and how many calls came back
+        if (err && typeof err === "object") {
+            err.usage = usage;
+            err.modelCalls = answered;
+        }
         throw err;
     }
 }

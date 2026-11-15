@@ -90,6 +90,7 @@ before(async () => {
     await add("otto", { max: true });
     await add("pia", { pro: true });
     await add("fred", {});
+    await add("rita", { max: true });
     const day = in2days();
     const task = async (key, owner, name) => {
         const { rows: [t] } = await pool.query(
@@ -238,28 +239,73 @@ test("the 21st message of the day: 429 with resetsAt, no model call", { skip: NO
     assert.equal(calls.length, 0);
 });
 
-test("the AI fails: 502 in the AI error shape, the allowance given back, spent tokens still counted", { skip: NO_DB }, async () => {
-    script = turns(toolTurn(["list_event_types", {}]), new Error("boom"));
+test("the AI fails on the first call: 502 in the AI error shape, the allowance given back", { skip: NO_DB }, async () => {
+    script = turns(new Error("boom"));
     const r = await ask(users.maxi, "Hi");
     assert.equal(r.status, 502);
     assert.equal(r.data.code, "AI_FAILED");
     assert.equal(await used(users.maxi), 0);
+    assert.equal(await usageRow(users.maxi), undefined);
+});
+
+test("the AI fails after a call that answered: 502, the allowance stays used, the tokens counted", { skip: NO_DB }, async () => {
+    script = turns(toolTurn(["list_event_types", {}]), new Error("boom"));
+    const r = await ask(users.maxi, "Hi");
+    assert.equal(r.status, 502);
+    assert.equal(r.data.code, "AI_FAILED");
+    assert.equal(await used(users.maxi), 1);
     assert.deepEqual(await usageRow(users.maxi), { calls: 1, input: 100, output: 20 });
 });
 
-test("max_tokens counts as a failure", { skip: NO_DB }, async () => {
-    script = turns({ stop_reason: "max_tokens", content: [{ type: "text", text: "half" }], usage: usage(10, 10) });
+test("max_tokens after a call that answered: a failure, the allowance stays used", { skip: NO_DB }, async () => {
+    script = turns(toolTurn(["list_event_types", {}]), { stop_reason: "max_tokens", content: [{ type: "text", text: "half" }], usage: usage(10, 10) });
     const r = await ask(users.maxi, "Hi");
     assert.equal(r.status, 502);
-    assert.equal(await used(users.maxi), 0);
+    assert.equal(await used(users.maxi), 1);
+    assert.deepEqual(await usageRow(users.maxi), { calls: 1, input: 110, output: 30 });
 });
 
-test("the loop stops after 6 model calls", { skip: NO_DB }, async () => {
+test("the loop stops after 6 model calls, the allowance stays used", { skip: NO_DB }, async () => {
     script = () => toolTurn(["list_event_types", {}]);
     const r = await ask(users.maxi, "Hi");
     assert.equal(calls.length, 6);
     assert.equal(r.status, 502);
-    assert.equal(await used(users.maxi), 0);
+    assert.equal(await used(users.maxi), 1);
+});
+
+test("get_schedule: done copies of a repeating series are left out, the range comes first", { skip: NO_DB }, async () => {
+    const rita = users.rita;
+    // a daily series done 105 times: each done copy has a successor (repeat_from_id), the last one is live
+    let previous = null;
+    const stale = [];
+    for (let i = 105; i >= 1; i--) {
+        const { rows: [t] } = await pool.query(
+            `INSERT INTO tasks (name, due, user_id, repeat, done, repeat_from_id) VALUES ('Vokabeln', current_date - $1::int, $2, 'daily', true, $3) RETURNING id`,
+            [i, rita.id, previous]);
+        stale.push(t.id);
+        previous = t.id;
+    }
+    const day = in2days();
+    const { rows: [live] } = await pool.query(
+        "INSERT INTO tasks (name, due, user_id, repeat, repeat_from_id) VALUES ('Vokabeln', $1, $2, 'daily', $3) RETURNING id", [day, rita.id, previous]);
+    // a weekly one that is overdue (not done): its rule still reaches into the range
+    const { rows: [gym] } = await pool.query(
+        "INSERT INTO tasks (name, due, user_id, repeat) VALUES ('Gym', current_date - 10, $1, 'weekly') RETURNING id", [rita.id]);
+    const { rows: [inRange] } = await pool.query(
+        "INSERT INTO tasks (name, due, user_id) VALUES ('Referat', $1, $2) RETURNING id", [day, rita.id]);
+
+    script = turns(toolTurn(["get_schedule", { from: day, to: day }]), textTurn("ok"));
+    const r = await ask(rita, "What's on?");
+    assert.equal(r.status, 200);
+    const result = JSON.parse(toolResults(calls[1])[0].content);
+    const ids = result.entries.map(e => e.id);
+    assert.ok(ids.includes(live.id), "the live entry of the series");
+    assert.ok(ids.includes(inRange.id), "the entry in the range");
+    assert.ok(ids.includes(gym.id), "the overdue repeating entry");
+    assert.ok(!stale.some(id => ids.includes(id)), "a done copy of the series");
+    assert.equal(result.more, undefined);
+    // what is in the range comes before the repeating ones from earlier
+    assert.ok(ids.indexOf(inRange.id) < ids.indexOf(gym.id));
 });
 
 test("an id of another account's task (or none at all) is dropped and the reply says so", { skip: NO_DB }, async () => {
