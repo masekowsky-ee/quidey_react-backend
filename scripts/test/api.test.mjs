@@ -3490,7 +3490,9 @@ describe("Quidey Pro: billing", () => {
         assert.equal(status.active, false);
         assert.equal(status.stripe, false);
         assert.equal(status.play, false);
-        assert.deepEqual(status.prices, { currency: "EUR", monthly: 2.99, yearly: 25 });
+        assert.deepEqual(status.prices, { currency: "EUR", monthly: 2.99, yearly: 25, max: { monthly: 5.99, yearly: 49 } });
+        assert.equal(status.tier, null);
+        assert.equal(status.stripeMax, false);
         assert.match(status.playAccountId, /^[0-9a-f]{64}$/);
         assert.equal((await call("POST", "/api/billing/checkout", { plan: "monthly" }, out.token)).data.code, "BILLING_DISABLED");
         assert.equal((await call("POST", "/api/billing/play", { purchaseToken: "abcdefghijkl" }, out.token)).data.code, "BILLING_DISABLED");

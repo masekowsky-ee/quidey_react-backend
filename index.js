@@ -6455,7 +6455,7 @@ app.post("/api/push/test", pushTestLimiter, async (req, res) => {
 // without access may buy Pro to get in). The webhooks and the cancel button are public.
 const FRONTEND_URL = (process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/+$/, "");
 // shown in the app; the real prices live at Stripe / in the Play Console (keep them the same)
-const PRO_PRICES = { currency: "EUR", monthly: 2.99, yearly: 25 };
+const PRO_PRICES = { currency: "EUR", monthly: 2.99, yearly: 25, max: { monthly: 5.99, yearly: 49 } };
 
 const billingLimiter = rateLimit({
     windowMs: 60 * 1000,
@@ -6473,7 +6473,7 @@ const proChanged = (userId) => {
     realtime.toUser(userId, "pro:changed", {});
 };
 
-// My Pro: { active, gift, until, subscription, canManageStripe, stripe, play, prices, playAccountId }
+// My Pro / Max: { active, gift, until, tier, maxUntil, subscription, canManageStripe, stripe, stripeMax, play, prices, playAccountId }
 app.get("/api/billing", authenticateToken, requireProBilling, async (req, res) => {
     try {
         res.json({ ...(await billing.proStatus(pool, req.user.userId)), prices: PRO_PRICES, playAccountId: billing.playAccountId(req.user.userId) });
@@ -6482,17 +6482,25 @@ app.get("/api/billing", authenticateToken, requireProBilling, async (req, res) =
     }
 });
 
-// Stripe Checkout for { plan: 'monthly' | 'yearly' }: { url } to send the browser to
+// Stripe Checkout for { tier: 'pro' | 'max' (default pro), plan: 'monthly' | 'yearly' }: { url } to send
+// the browser to, or { upgraded: true } when a running Stripe Pro was changed to Max in place (prorated)
 app.post("/api/billing/checkout", authenticateToken, requireProBilling, billingLimiter, async (req, res) => {
     if (!billing.STRIPE_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
     const plan = req.body?.plan;
+    const tier = req.body?.tier ?? "pro";
     if (!billing.PLANS.includes(plan)) return invalidInput(res, "plan");
+    if (!billing.TIERS.includes(tier)) return invalidInput(res, "tier");
+    // an installation without the Max prices sells Pro only
+    if (tier === "max" && !billing.STRIPE_MAX_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
     try {
         const status = await billing.proStatus(pool, req.user.userId);
-        // a running subscription is changed in the portal, not bought twice
-        if (status.until && new Date(status.until) > new Date()) return res.status(409).json({ error: "You already have Pro", code: "ALREADY_SUBSCRIBED" });
+        // a running subscription is changed in the portal, not bought twice (Pro to Max is the exception)
+        const has = tier === "max" ? status.tier === "max" : Boolean(status.until && new Date(status.until) > new Date());
+        if (has) return res.status(409).json({ error: `You already have ${tier === "max" ? "Max" : "Pro"}`, code: "ALREADY_SUBSCRIBED" });
         const language = LANGUAGES.includes(req.body?.language) ? req.body.language : "de";
-        res.json({ url: await billing.stripeCheckout(pool, { userId: req.user.userId, plan, language, frontendUrl: FRONTEND_URL }) });
+        const result = await billing.stripeCheckout(pool, { userId: req.user.userId, tier, plan, language, frontendUrl: FRONTEND_URL });
+        if (result.upgraded) proChanged(req.user.userId);
+        res.json(result);
     } catch (err) {
         serverError(res, err);
     }
