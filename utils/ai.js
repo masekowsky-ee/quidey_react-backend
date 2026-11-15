@@ -1,7 +1,8 @@
 // Asking Claude (Haiku) for a structured answer: the AI features of the app (quick-entry lines, scans).
 // ask(job, { system, content, schema, maxTokens, timeoutMs }) → the parsed object, which the caller
 // checks again (the model's output is never trusted as it comes). Throws AiError with code
-// AI_UNAVAILABLE (no ANTHROPIC_API_KEY), AI_REFUSED, AI_TIMEOUT or AI_FAILED.
+// AI_UNAVAILABLE (no ANTHROPIC_API_KEY), AI_REFUSED, AI_TIMEOUT or AI_FAILED (the assistant's loop
+// also AI_TOO_LONG).
 //
 // converse({ system, messages, tools, ... }) is one turn of a tool loop (the Max assistant).
 //
@@ -78,8 +79,10 @@ async function ask(job, { system, content, schema, maxTokens = 2000, timeoutMs =
 // conversation and gets { content, stopReason, usage: { inputTokens, outputTokens } } back.
 // The caller checks stopReason (refusal, max_tokens, tool_use, end_turn) and passes content back
 // unchanged when it continues. Tool choice stays "auto" (forced tool use is refused by the model).
+// timeoutMs bounds one attempt; signal (an AbortSignal) bounds the whole call, retries included, and
+// an aborted call is an AI_TIMEOUT too.
 // Throws AiError AI_UNAVAILABLE, AI_TIMEOUT or AI_FAILED.
-async function converse({ system, messages, tools, maxTokens = 2000, timeoutMs = 20000, effort = "low" }) {
+async function converse({ system, messages, tools, maxTokens = 2000, timeoutMs = 20000, signal, effort = "low" }) {
     const api = realClient();
     if (!api) throw new AiError("AI_UNAVAILABLE");
     let message;
@@ -91,8 +94,9 @@ async function converse({ system, messages, tools, maxTokens = 2000, timeoutMs =
             messages,
             tools,
             output_config: { effort },
-        }, { timeout: timeoutMs });
+        }, { timeout: timeoutMs, ...(signal ? { signal } : {}) });
     } catch (err) {
+        if (signal?.aborted) throw new AiError("AI_TIMEOUT");
         const Anthropic = require("@anthropic-ai/sdk");
         const ns = Anthropic.default || Anthropic;
         if (err instanceof ns.APIConnectionTimeoutError) throw new AiError("AI_TIMEOUT");
@@ -109,6 +113,8 @@ async function converse({ system, messages, tools, maxTokens = 2000, timeoutMs =
 function aiErrorResponse(res, err) {
     if (err.code === "AI_UNAVAILABLE") return res.status(503).json({ error: "AI is not set up", code: "AI_UNAVAILABLE" });
     if (err.code === "AI_REFUSED") return res.status(422).json({ error: "The AI declined this", code: "AI_REFUSED" });
+    // the assistant's request needed more steps or input than one message may use (utils/assistant.js)
+    if (err.code === "AI_TOO_LONG") return res.status(502).json({ error: "The request was too broad, try a narrower one", code: "AI_TOO_LONG" });
     return res.status(502).json({ error: "The AI didn't answer usefully, try again", code: err.code === "AI_TIMEOUT" ? "AI_TIMEOUT" : "AI_FAILED" });
 }
 

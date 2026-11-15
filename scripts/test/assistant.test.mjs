@@ -32,6 +32,7 @@ const tasks = {};
 
 // ---------- the scripted model ----------
 let calls = [];
+let callOptions = [];
 let script = () => { throw new Error("no script"); };
 let toolId = 0;
 const usage = (i, o) => ({ input_tokens: i, output_tokens: o });
@@ -101,9 +102,10 @@ before(async () => {
     await task("mine", users.maxi, "Mathe lernen");
     await task("theirs", users.otto, "Otto geheim");
 
-    aiUtil.useTestClient({ messages: { create: async (params) => {
+    aiUtil.useTestClient({ messages: { create: async (params, options) => {
         calls.push(structuredClone(params));
-        return script(params, calls.length);
+        callOptions.push(options);
+        return script(params, calls.length, options);
     } } });
 
     const app = express();
@@ -135,6 +137,7 @@ after(async () => {
 beforeEach(async () => {
     if (NO_DB) return;
     calls = [];
+    callOptions = [];
     script = () => { throw new Error("no script"); };
     await pool.query("DELETE FROM daily_quota");
     await pool.query("DELETE FROM assistant_usage");
@@ -270,7 +273,86 @@ test("the loop stops after 6 model calls, the allowance stays used", { skip: NO_
     const r = await ask(users.maxi, "Hi");
     assert.equal(calls.length, 6);
     assert.equal(r.status, 502);
+    assert.equal(r.data.code, "AI_TOO_LONG");
     assert.equal(await used(users.maxi), 1);
+});
+
+test("at most 3 lookups per step: the others get an error result in the same message", { skip: NO_DB }, async () => {
+    const day = in2days();
+    const first = toolTurn(
+        ["get_schedule", { from: day, to: day }], ["find_entries", { query: "Mathe" }], ["list_event_types", {}],
+        ["get_schedule", { from: day, to: day }], ["find_entries", { query: "x" }]);
+    script = turns(first, textTurn("ok"));
+    const r = await ask(users.maxi, "Everything please");
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.message, "ok");
+    const results = toolResults(calls[1]);
+    // every tool_use answered, in its order, in the one user message after the assistant turn
+    assert.deepEqual(results.map(x => x.tool_use_id), first.content.filter(b => b.type === "tool_use").map(b => b.id));
+    assert.ok(calls[1].messages.at(-1).content.every(b => b.type === "tool_result"));
+    assert.deepEqual(results.map(x => Boolean(x.is_error)), [false, false, false, true, true]);
+    for (const refused of results.slice(3)) assert.match(refused.content, /too many lookups/i);
+    assert.ok(results[0].content.includes("Mathe lernen"));
+});
+
+test("the loop stops once the input tokens pass the budget; the allowance stays used", { skip: NO_DB }, async () => {
+    script = () => ({ ...toolTurn(["list_event_types", {}]), usage: usage(25000, 10) });
+    const r = await ask(users.maxi, "Hi");
+    // 25k, 50k, 75k: no fourth call after passing 60k
+    assert.equal(calls.length, 3);
+    assert.equal(r.status, 502);
+    assert.equal(r.data.code, "AI_TOO_LONG");
+    assert.equal(await used(users.maxi), 1);
+    assert.deepEqual(await usageRow(users.maxi), { calls: 1, input: 75000, output: 30 });
+});
+
+test("a turn that answers past the token budget still returns its answer", { skip: NO_DB }, async () => {
+    script = turns({ ...toolTurn(["list_event_types", {}]), usage: usage(59000, 10) }, { ...textTurn("done"), usage: usage(5000, 10) });
+    const r = await ask(users.maxi, "Hi");
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.message, "done");
+});
+
+test("the whole loop has a deadline: AI_TIMEOUT, the allowance kept once a call answered", { skip: NO_DB }, async () => {
+    const before = process.env.ASSISTANT_DEADLINE_MS;
+    process.env.ASSISTANT_DEADLINE_MS = "400";
+    // each call takes 250 ms unless its signal aborts it first
+    script = (params, n, options) => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(toolTurn(["list_event_types", {}])), 250);
+        options?.signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); });
+    });
+    try {
+        const started = Date.now();
+        const r = await ask(users.maxi, "Hi");
+        assert.ok(Date.now() - started < 1500, "the deadline ended it");
+        assert.equal(r.status, 502);
+        assert.equal(r.data.code, "AI_TIMEOUT");
+        assert.equal(calls.length, 2);
+        assert.equal(await used(users.maxi), 1, "the first call answered: the message counts");
+        // each call gets the time that is left, never more
+        assert.ok(callOptions[0].timeout <= 400, String(callOptions[0].timeout));
+        assert.ok(callOptions[1].timeout < callOptions[0].timeout, `${callOptions[1].timeout} < ${callOptions[0].timeout}`);
+        assert.ok(callOptions[1].signal, "an abort signal bounds the retries too");
+    } finally {
+        if (before === undefined) delete process.env.ASSISTANT_DEADLINE_MS; else process.env.ASSISTANT_DEADLINE_MS = before;
+    }
+});
+
+test("the deadline passes before the first call answers: the allowance is given back", { skip: NO_DB }, async () => {
+    const before = process.env.ASSISTANT_DEADLINE_MS;
+    process.env.ASSISTANT_DEADLINE_MS = "100";
+    script = (params, n, options) => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(textTurn("late")), 1000);
+        options?.signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); });
+    });
+    try {
+        const r = await ask(users.maxi, "Hi");
+        assert.equal(r.status, 502);
+        assert.equal(r.data.code, "AI_TIMEOUT");
+        assert.equal(await used(users.maxi), 0);
+    } finally {
+        if (before === undefined) delete process.env.ASSISTANT_DEADLINE_MS; else process.env.ASSISTANT_DEADLINE_MS = before;
+    }
 });
 
 test("get_schedule: done copies of a repeating series are left out, the range comes first", { skip: NO_DB }, async () => {

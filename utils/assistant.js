@@ -12,7 +12,11 @@
 //          | { type: 'delete_entry', id, summary }
 //          | { type: 'study_plan', subject, examDate, topics }
 //   Every action is checked again here; an id that isn't one of the user's own tasks is dropped (and
-//   the message says something couldn't be done). At most 6 model calls and the last 10 messages.
+//   the message says something couldn't be done). The last 10 messages go to the model.
+//   What one message may cost is bounded: at most 6 model calls, at most 3 lookups per model turn (the
+//   others get an error result: narrow it down), the loop stops once the input tokens of its calls pass
+//   ASSISTANT_INPUT_TOKENS_MAX (60 000; both: AI_TOO_LONG), and the whole loop has ASSISTANT_DEADLINE_MS
+//   (60 s; AI_TIMEOUT), each call getting the time that is left.
 //   A thrown error carries usage (the tokens so far) and modelCalls (how many calls came back).
 // Nothing of the chat is kept; the caller adds the token numbers to the day's total (utils/quota.js).
 
@@ -23,6 +27,11 @@ const MESSAGES_MAX = 40;    // messages accepted in a request (the older ones ar
 const MESSAGE_MAX = 2000;   // characters per message
 const CALLS_MAX = 6;        // model calls per message
 const MAX_TOKENS = 3000;    // per model call (thinking included)
+const LOOKUPS_MAX = 3;      // read tools run per model turn
+const CALL_TIMEOUT_MS = 20000; // one model call (one attempt), never more than the time left
+// per message, read when a message comes (env overrides them)
+const inputTokensMax = () => Number(process.env.ASSISTANT_INPUT_TOKENS_MAX) || 60000;
+const deadlineMs = () => Number(process.env.ASSISTANT_DEADLINE_MS) || 60000;
 const ACTIONS_MAX = 20;
 const SCHEDULE_DAYS_MAX = 62;
 const SCHEDULE_ROWS_MAX = 100;
@@ -225,6 +234,7 @@ function proposal(name, input, { types, check }) {
 }
 
 const WRITE_TOOLS = ["create_entry", "update_entry", "delete_entry", "study_plan"];
+const READ_TOOLS = ["get_schedule", "find_entries", "list_event_types"];
 
 // the proposals of one turn: valid ones whose ids are the user's own tasks; { actions, dropped }
 async function proposals(uses, { db, userId, types, check }) {
@@ -260,6 +270,7 @@ async function runAssistant({ db, userId, messages, language, now = new Date() }
     const text = TEXT[language] ?? TEXT.en;
     const usage = { inputTokens: 0, outputTokens: 0 };
     let answered = 0; // model calls that came back (the message is then paid for, see ai.js)
+    const deadline = Date.now() + deadlineMs();
     try {
         const [{ rows: [me] }, { rows: types }] = await Promise.all([
             db.query(`SELECT COALESCE(timezone, 'Europe/Berlin') AS tz,
@@ -275,7 +286,13 @@ async function runAssistant({ db, userId, messages, language, now = new Date() }
         if (conversation.length === 0) throw new AiError("AI_FAILED", "no message");
 
         for (let n = 0; n < CALLS_MAX; n++) {
-            const turn = await converse({ system, messages: conversation, tools: toolList(), maxTokens: MAX_TOKENS });
+            const left = deadline - Date.now();
+            if (left <= 0) throw new AiError("AI_TIMEOUT", "deadline");
+            // the signal ends the call (retries included) when the loop's time is up
+            const turn = await converse({
+                system, messages: conversation, tools: toolList(), maxTokens: MAX_TOKENS,
+                timeoutMs: Math.min(CALL_TIMEOUT_MS, left), signal: AbortSignal.timeout(left),
+            });
             answered++;
             usage.inputTokens += turn.usage.inputTokens;
             usage.outputTokens += turn.usage.outputTokens;
@@ -300,9 +317,19 @@ async function runAssistant({ db, userId, messages, language, now = new Date() }
                 return { message: clip(parts.filter(Boolean).join("\n\n")), actions, usage };
             }
 
-            // the read tools, all answered in one message
+            // another call would follow: not once this message's input tokens are spent
+            if (usage.inputTokens > inputTokensMax()) throw new AiError("AI_TOO_LONG", "input token budget");
+
+            // the read tools, all answered in one message (every tool_use gets its result), at most
+            // LOOKUPS_MAX of them run
             const results = [];
+            let lookups = 0;
             for (const use of uses) {
+                if (READ_TOOLS.includes(use.name) && lookups >= LOOKUPS_MAX) {
+                    results.push({ type: "tool_result", tool_use_id: use.id, is_error: true, content: `Too many lookups in one step (at most ${LOOKUPS_MAX}): narrow your request and look up only what you need.` });
+                    continue;
+                }
+                if (READ_TOOLS.includes(use.name)) lookups++;
                 const data = await readTool(use.name, use.input, context);
                 if (!data || data.error) {
                     results.push({ type: "tool_result", tool_use_id: use.id, is_error: true, content: data?.error ?? `unknown tool ${use.name}` });
@@ -313,7 +340,7 @@ async function runAssistant({ db, userId, messages, language, now = new Date() }
             conversation.push({ role: "assistant", content: turn.content });
             conversation.push({ role: "user", content: results });
         }
-        throw new AiError("AI_FAILED", "too many steps");
+        throw new AiError("AI_TOO_LONG", "too many steps");
     } catch (err) {
         // the tokens spent before it failed are still counted, and how many calls came back
         if (err && typeof err === "object") {
