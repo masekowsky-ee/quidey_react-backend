@@ -100,6 +100,7 @@ beforeEach(async () => {
         customers: { create: async () => ({ id: "cus_1" }) },
     };
     billing._deps.stripe.__serve = (sub) => { current[sub.id] = sub; };
+    billing._deps.stripe.__has = (id) => id in current;
     billing._deps.playRequest = async (method, url) => {
         calls.play.push([method, url]);
         return billing._deps.playAnswers.get(url.replace(/.*tokens\//, "").replace(/:.*/, "")) ?? {};
@@ -109,7 +110,11 @@ beforeEach(async () => {
 
 const row = async (provider, providerId) => (await db.query("SELECT * FROM subscriptions WHERE provider = $1 AND provider_id = $2", [provider, providerId])).rows[0];
 const user = async () => (await db.query("SELECT pro_until, max_until FROM users WHERE id = $1", [uid])).rows[0];
-const webhook = (type, object) => billing.stripeWebhook(db, JSON.stringify({ type, data: { object } }), "sig");
+// Stripe knows the subscription: unless a test served its state already, the event carries it
+const webhook = (type, object) => {
+    if (!billing._deps.stripe.__has(object.id)) billing._deps.stripe.__serve(object);
+    return billing.stripeWebhook(db, JSON.stringify({ type, data: { object } }), "sig");
+};
 
 test("a Stripe webhook for a Max price saves tier max and sets max_until", { skip: NO_DB }, async () => {
     const owner = await webhook("customer.subscription.created", stripeSub("sub_m", "price_max_y"));
@@ -248,4 +253,19 @@ test("proStatus reports the tier and plan of the current subscription", { skip: 
     assert.ok(status.maxUntil);
     assert.equal(status.active, true);
     assert.equal(status.stripeMax, true);
+});
+
+test("a stale or retried Pro-era webhook after the upgrade to Max does not downgrade the row", { skip: NO_DB }, async () => {
+    const pro = stripeSub("sub_late", "price_pro_m");
+    billing._deps.stripe.__serve(pro);
+    await webhook("customer.subscription.created", pro);
+    await billing.stripeCheckout(db, { userId: uid, tier: "max", plan: "yearly", language: "en", frontendUrl: "https://app.test" });
+    assert.equal((await row("stripe", "sub_late")).tier, "max");
+    // Stripe delivers the old created / updated events (payload: still the Pro price) late
+    await webhook("customer.subscription.updated", stripeSub("sub_late", "price_pro_m"));
+    await webhook("customer.subscription.created", pro);
+    const saved = await row("stripe", "sub_late");
+    assert.equal(saved.tier, "max");
+    assert.equal(saved.plan, "yearly");
+    assert.ok((await user()).max_until);
 });

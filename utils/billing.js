@@ -260,7 +260,18 @@ async function retireOtherPro(db, userId, keepProvider, keepProviderId) {
 // The webhook: (raw body, signature header) → the user whose Pro changed (or null)
 async function stripeWebhook(db, rawBody, signature) {
     const event = deps.stripe.webhooks.constructEvent(rawBody, signature, process.env.STRIPE_WEBHOOK_SECRET);
-    if (event.type.startsWith("customer.subscription.")) return saveStripeSubscription(db, event.data.object);
+    if (event.type.startsWith("customer.subscription.")) {
+        // Stripe doesn't keep the order of events and retries old ones for days: the payload may
+        // describe the subscription as it was (a Pro price after the upgrade to Max), so the
+        // current state is asked for. Only a subscription Stripe no longer knows keeps its payload.
+        let current = event.data.object;
+        try {
+            current = await deps.stripe.subscriptions.retrieve(current.id);
+        } catch (err) {
+            if (err.code !== "resource_missing") throw err;
+        }
+        return saveStripeSubscription(db, current ?? event.data.object);
+    }
     if (event.type === "checkout.session.completed" && event.data.object.subscription) {
         const sub = await deps.stripe.subscriptions.retrieve(String(event.data.object.subscription));
         return saveStripeSubscription(db, sub);
