@@ -81,7 +81,7 @@ beforeEach(async () => {
     await db.query("DELETE FROM subscriptions");
     await db.query("DELETE FROM users");
     uid = (await db.query("INSERT INTO users (username, password_hash, email, stripe_customer_id) VALUES ('maxb', 'x', 'maxb@example.com', 'cus_1') RETURNING id")).rows[0].id;
-    calls = { stripeUpdate: [], stripeCheckout: [], play: [] };
+    calls = { stripeUpdate: [], stripeCheckout: [], stripeCustomer: [], play: [] };
     let current = {};
     billing._deps.stripe = {
         webhooks: { constructEvent: (body) => JSON.parse(body) },
@@ -97,7 +97,7 @@ beforeEach(async () => {
             },
         },
         checkout: { sessions: { create: async (p) => { calls.stripeCheckout.push(p); return { url: "https://checkout.test/x" }; } } },
-        customers: { create: async () => ({ id: "cus_1" }) },
+        customers: { create: async (p) => { calls.stripeCustomer.push(p); return { id: "cus_1" }; } },
     };
     billing._deps.stripe.__serve = (sub) => { current[sub.id] = sub; };
     billing._deps.stripe.__has = (id) => id in current;
@@ -188,6 +188,48 @@ test("Pro to Max on Stripe changes the running subscription (prorated, invoiced 
     const rows = (await db.query("SELECT tier, plan FROM subscriptions WHERE user_id = $1", [uid])).rows;
     assert.deepEqual(rows, [{ tier: "max", plan: "yearly" }]);
     assert.ok((await user()).max_until);
+});
+
+test("a past_due Stripe Pro can't buy Max: PAYMENT_PAST_DUE, no Checkout, no customer, no change", { skip: NO_DB }, async () => {
+    const pro = stripeSub("sub_due", "price_pro_m", { status: "past_due" });
+    billing._deps.stripe.__serve(pro);
+    await webhook("customer.subscription.updated", pro);
+    // the user has no Stripe customer yet either: nothing may be created at Stripe
+    await db.query("UPDATE users SET stripe_customer_id = NULL WHERE id = $1", [uid]);
+    assert.equal((await billing.proStatus(db, uid)).paymentPastDue, true);
+    for (const plan of ["monthly", "yearly"]) {
+        await assert.rejects(
+            billing.stripeCheckout(db, { userId: uid, tier: "max", plan, language: "de", frontendUrl: "https://app.test" }),
+            { status: 409, code: "PAYMENT_PAST_DUE" });
+    }
+    assert.equal(calls.stripeCheckout.length, 0, "a new Checkout would be a second subscription");
+    assert.equal(calls.stripeCustomer.length, 0);
+    assert.equal(calls.stripeUpdate.length, 0);
+    assert.equal((await row("stripe", "sub_due")).tier, "pro");
+});
+
+test("every running Stripe Pro status the in-place upgrade doesn't take is refused", { skip: NO_DB }, async () => {
+    // RUNNING minus active / trialing (Play's own statuses included, should a row ever carry one)
+    for (const status of ["past_due", "canceled_pending", "grace", "on_hold_grace"]) {
+        await db.query("DELETE FROM subscriptions");
+        await db.query(
+            `INSERT INTO subscriptions (user_id, provider, provider_id, plan, tier, status, current_period_end, cancel_at_period_end)
+            VALUES ($1, 'stripe', 'sub_odd', 'monthly', 'pro', $2, now() + interval '10 days', false)`, [uid, status]);
+        await assert.rejects(
+            billing.stripeCheckout(db, { userId: uid, tier: "max", plan: "monthly", language: "de", frontendUrl: "https://app.test" }),
+            { code: "PAYMENT_PAST_DUE" }, status);
+        assert.equal((await billing.proStatus(db, uid)).paymentPastDue, true, status);
+    }
+    assert.equal(calls.stripeCheckout.length, 0);
+});
+
+test("an active Stripe Pro is not past due and still upgrades in place", { skip: NO_DB }, async () => {
+    const pro = stripeSub("sub_ok", "price_pro_m");
+    billing._deps.stripe.__serve(pro);
+    await webhook("customer.subscription.created", pro);
+    assert.equal((await billing.proStatus(db, uid)).paymentPastDue, false);
+    assert.deepEqual(await billing.stripeCheckout(db, { userId: uid, tier: "max", plan: "monthly", language: "de", frontendUrl: "https://app.test" }), { upgraded: true });
+    assert.equal(calls.stripeCheckout.length, 0);
 });
 
 test("a Max checkout without a Pro subscription is a normal Stripe Checkout with the Max price", { skip: NO_DB }, async () => {

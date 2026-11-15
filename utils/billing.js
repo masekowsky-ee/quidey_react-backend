@@ -26,6 +26,11 @@ const PLANS = ["monthly", "yearly"];
 const TIERS = ["pro", "max"];
 // statuses that still give Pro until the period's end (past_due / grace: Stripe / Google retry the payment)
 const RUNNING = ["active", "trialing", "past_due", "canceled_pending", "grace", "on_hold_grace"];
+// a running Stripe Pro in one of these is bought up to Max in place; one in any other running status
+// (past_due: an open invoice Stripe is still retrying) blocks Max at Stripe, since a new Checkout
+// would start a second subscription beside it (PAYMENT_PAST_DUE)
+const UPGRADES_IN_PLACE = ["active", "trialing"];
+const BLOCKS_MAX = RUNNING.filter((status) => !UPGRADES_IN_PLACE.includes(status));
 
 // ---------- Stripe ----------
 const STRIPE_KEY = process.env.STRIPE_SECRET_KEY || "";
@@ -119,9 +124,21 @@ async function saveSubscription(db, { userId, provider, providerId, plan, tier, 
     return owner;
 }
 
+// Whether the account has a running Stripe Pro whose payment is overdue (or in another running status
+// the in-place upgrade doesn't take): Max can't be bought at Stripe until it is settled in the portal
+async function stripeProPastDue(db, userId) {
+    const { rows } = await db.query(
+        `SELECT 1 FROM subscriptions WHERE user_id = $1 AND provider = 'stripe' AND tier = 'pro'
+            AND status = ANY($2::text[]) AND current_period_end > now() LIMIT 1`,
+        [userId, BLOCKS_MAX]
+    );
+    return rows.length > 0;
+}
+
 // What the app shows: { active, gift, until, tier: 'max' | 'pro' | null, maxUntil, subscription: {
-// provider, tier, plan, status, periodEnd, cancelAtPeriodEnd } | null, stripe, stripeMax, play }
-// (stripe / stripeMax / play: whether that way is open)
+// provider, tier, plan, status, periodEnd, cancelAtPeriodEnd } | null, paymentPastDue, stripe, stripeMax, play }
+// (stripe / stripeMax / play: whether that way is open; paymentPastDue: a running Stripe Pro waits for a
+// payment, so the web offers no Max upgrade until it is settled, see stripeProPastDue)
 async function proStatus(db, userId) {
     const user = (await db.query("SELECT is_pro, pro_until, is_max, max_until, stripe_customer_id FROM users WHERE id = $1", [userId])).rows[0];
     const sub = (await db.query(
@@ -141,6 +158,7 @@ async function proStatus(db, userId) {
             provider: sub.provider, tier: sub.tier, plan: sub.plan, status: sub.status,
             periodEnd: sub.current_period_end, cancelAtPeriodEnd: sub.cancel_at_period_end,
         } : null,
+        paymentPastDue: await stripeProPastDue(db, userId),
         canManageStripe: Boolean(STRIPE_ENABLED && user?.stripe_customer_id),
         stripe: STRIPE_ENABLED,
         stripeMax: STRIPE_MAX_ENABLED,
@@ -153,13 +171,18 @@ async function proStatus(db, userId) {
 // Checkout for a tier and plan. A running Stripe Pro that is bought up to Max is changed in place
 // (one subscription, the unused Pro time credited, the difference invoiced now, nothing happens if
 // that payment fails): answers { upgraded: true }. Otherwise { url } of a Checkout session.
+// A running Stripe Pro in a status the in-place change doesn't take (past_due) is refused with an
+// error { status: 409, code: 'PAYMENT_PAST_DUE' } before anything is created at Stripe.
 async function stripeCheckout(db, { userId, tier = "pro", plan, language, frontendUrl }) {
     const price = STRIPE_PRICES[tier]?.[plan];
     if (!price) throw new Error(`No Stripe price for ${tier} ${plan}`);
     if (tier === "max") {
+        if (await stripeProPastDue(db, userId)) {
+            throw Object.assign(new Error("The Pro subscription has an unpaid invoice"), { status: 409, code: "PAYMENT_PAST_DUE" });
+        }
         const running = (await db.query(
-            "SELECT provider_id FROM subscriptions WHERE user_id = $1 AND provider = 'stripe' AND tier = 'pro' AND status IN ('active', 'trialing') AND current_period_end > now() ORDER BY current_period_end DESC LIMIT 1",
-            [userId]
+            "SELECT provider_id FROM subscriptions WHERE user_id = $1 AND provider = 'stripe' AND tier = 'pro' AND status = ANY($2::text[]) AND current_period_end > now() ORDER BY current_period_end DESC LIMIT 1",
+            [userId, UPGRADES_IN_PLACE]
         )).rows[0];
         if (running) {
             const sub = await deps.stripe.subscriptions.retrieve(running.provider_id);

@@ -6473,7 +6473,7 @@ const proChanged = (userId) => {
     realtime.toUser(userId, "pro:changed", {});
 };
 
-// My Pro / Max: { active, gift, until, tier, maxUntil, subscription, canManageStripe, stripe, stripeMax, play, prices, playAccountId }
+// My Pro / Max: { active, gift, until, tier, maxUntil, subscription, paymentPastDue, canManageStripe, stripe, stripeMax, play, prices, playAccountId }
 app.get("/api/billing", authenticateToken, requireProBilling, async (req, res) => {
     try {
         res.json({ ...(await billing.proStatus(pool, req.user.userId)), prices: PRO_PRICES, playAccountId: billing.playAccountId(req.user.userId) });
@@ -6483,7 +6483,8 @@ app.get("/api/billing", authenticateToken, requireProBilling, async (req, res) =
 });
 
 // Stripe Checkout for { tier: 'pro' | 'max' (default pro), plan: 'monthly' | 'yearly' }: { url } to send
-// the browser to, or { upgraded: true } when a running Stripe Pro was changed to Max in place (prorated)
+// the browser to, or { upgraded: true } when a running Stripe Pro was changed to Max in place (prorated);
+// 409 PAYMENT_PAST_DUE for Max while a Stripe Pro waits for its payment (nothing created at Stripe)
 app.post("/api/billing/checkout", authenticateToken, requireProBilling, billingLimiter, async (req, res) => {
     if (!billing.STRIPE_ENABLED) return res.status(503).json({ error: "Payments are not set up", code: "BILLING_DISABLED" });
     const plan = req.body?.plan;
@@ -6497,11 +6498,15 @@ app.post("/api/billing/checkout", authenticateToken, requireProBilling, billingL
         // a running subscription is changed in the portal, not bought twice (Pro to Max is the exception)
         const has = tier === "max" ? status.tier === "max" : Boolean(status.until && new Date(status.until) > new Date());
         if (has) return res.status(409).json({ error: `You already have ${tier === "max" ? "Max" : "Pro"}`, code: "ALREADY_SUBSCRIBED" });
+        // a Stripe Pro waiting for its payment can't be changed in place, and a new Checkout would
+        // be a second subscription beside it: settle the payment in the portal first
+        if (tier === "max" && status.paymentPastDue) return res.status(409).json({ error: "Settle the open Pro payment first", code: "PAYMENT_PAST_DUE" });
         const language = LANGUAGES.includes(req.body?.language) ? req.body.language : "de";
         const result = await billing.stripeCheckout(pool, { userId: req.user.userId, tier, plan, language, frontendUrl: FRONTEND_URL });
         if (result.upgraded) proChanged(req.user.userId);
         res.json(result);
     } catch (err) {
+        if (err?.code === "PAYMENT_PAST_DUE") return res.status(409).json({ error: "Settle the open Pro payment first", code: "PAYMENT_PAST_DUE" });
         serverError(res, err);
     }
 });
