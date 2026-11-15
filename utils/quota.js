@@ -10,9 +10,11 @@ const DAILY = {
     scan: Number(process.env.QUOTA_SCAN) || 1,
     // a quick-entry line the rules didn't understand, read by the AI
     ai_line: Number(process.env.QUOTA_AI_LINE) || 5,
+    // a message to the assistant (Max)
+    assistant: Number(process.env.QUOTA_ASSISTANT) || 20,
 };
 // the names the app sees
-const PUBLIC_NAME = { scan: "scan", ai_line: "aiLine" };
+const PUBLIC_NAME = { scan: "scan", ai_line: "aiLine", assistant: "assistant" };
 
 // today in the account's time zone, and when tomorrow starts there (as a timestamp)
 const DAY_SQL = `
@@ -44,7 +46,7 @@ async function giveBack(db, userId, kind, day) {
     await db.query("UPDATE daily_quota SET used = used - 1 WHERE user_id = $1 AND day = $2 AND kind = $3 AND used > 0", [userId, day, kind]);
 }
 
-// { scan: { used, max }, aiLine: { used, max }, resetsAt }
+// { scan: { used, max }, aiLine: { used, max }, assistant: { used, max }, resetsAt }
 async function status(db, userId) {
     const { rows } = await db.query(`
         WITH today AS (${DAY_SQL})
@@ -55,6 +57,17 @@ async function status(db, userId) {
         out[PUBLIC_NAME[kind]] = { used: rows.find(row => row.kind === kind)?.used ?? 0, max: DAILY[kind] };
     }
     return out;
+}
+
+// adds one answer's token numbers to the account's total for the day (numbers only, no content)
+async function recordUsage(db, userId, day, { inputTokens, outputTokens }) {
+    await db.query(`
+        INSERT INTO assistant_usage (user_id, day, calls, input_tokens, output_tokens)
+        VALUES ($1, $2, 1, $3, $4)
+        ON CONFLICT (user_id, day) DO UPDATE SET calls = assistant_usage.calls + 1,
+            input_tokens = assistant_usage.input_tokens + EXCLUDED.input_tokens,
+            output_tokens = assistant_usage.output_tokens + EXCLUDED.output_tokens`,
+        [userId, day, Math.max(0, Math.round(Number(inputTokens) || 0)), Math.max(0, Math.round(Number(outputTokens) || 0))]);
 }
 
 // the answer when nothing is left today
@@ -68,6 +81,7 @@ function refuse(res, kind, booked) {
 // old days aren't needed (called now and then)
 async function forgetOldDays(db) {
     await db.query("DELETE FROM daily_quota WHERE day < (now() - interval '8 days')::date");
+    await db.query("DELETE FROM assistant_usage WHERE day < (now() - interval '8 days')::date");
 }
 
-module.exports = { DAILY, take, giveBack, status, refuse, forgetOldDays };
+module.exports = { DAILY, take, giveBack, recordUsage, status, refuse, forgetOldDays };
