@@ -62,27 +62,32 @@ async function playRequest(method, url) {
 
 // ---------- the account's Pro ----------
 
-// users.pro_until from the account's running subscriptions (null when none)
+// users.pro_until from the account's running subscriptions (null when none; Max counts for Pro too),
+// users.max_until from the running Max ones
 async function refreshProUntil(db, userId) {
     if (!userId) return;
     await db.query(
         `UPDATE users SET pro_until = (
             SELECT max(current_period_end) FROM subscriptions
             WHERE user_id = $1 AND status = ANY($2::text[]) AND current_period_end > now()
+        ), max_until = (
+            SELECT max(current_period_end) FROM subscriptions
+            WHERE user_id = $1 AND tier = 'max' AND status = ANY($2::text[]) AND current_period_end > now()
         ) WHERE id = $1`,
         [userId, RUNNING]
     );
 }
 
-async function saveSubscription(db, { userId, provider, providerId, plan, status, periodEnd, cancelAtPeriodEnd }) {
+// tier: 'pro' | 'max'
+async function saveSubscription(db, { userId, provider, providerId, plan, tier = "pro", status, periodEnd, cancelAtPeriodEnd }) {
     const saved = await db.query(
-        `INSERT INTO subscriptions (user_id, provider, provider_id, plan, status, current_period_end, cancel_at_period_end)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `INSERT INTO subscriptions (user_id, provider, provider_id, plan, tier, status, current_period_end, cancel_at_period_end)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (provider, provider_id) DO UPDATE SET
-            user_id = COALESCE(subscriptions.user_id, EXCLUDED.user_id), plan = EXCLUDED.plan, status = EXCLUDED.status,
+            user_id = COALESCE(subscriptions.user_id, EXCLUDED.user_id), plan = EXCLUDED.plan, tier = EXCLUDED.tier, status = EXCLUDED.status,
             current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, updated_at = now()
         RETURNING user_id`,
-        [userId ?? null, provider, providerId, plan, status, periodEnd, cancelAtPeriodEnd]
+        [userId ?? null, provider, providerId, plan, tier, status, periodEnd, cancelAtPeriodEnd]
     );
     const owner = saved.rows[0]?.user_id;
     await refreshProUntil(db, owner);

@@ -17,7 +17,7 @@ const { PUSH_PUBLIC_KEY, PUSH_FCM_ENABLED, PUSH_KINDS, PUSH_MAX_DEVICES, PUSH_TE
 const http = require("node:http");
 const realtime = require("./realtime");
 const { toNotice, noticeEntryAdded, noticeFamilyAssigned, pushChat } = require("./utils/groupNotices");
-const { ACCESS_MODE, PRO_BILLING, requireProBilling, hasPro, hasFullAccess, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
+const { ACCESS_MODE, PRO_BILLING, requireProBilling, hasMax, hasPro, hasFullAccess, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
 const { FREE_LIMITS, FREE_STATS_DAYS, limited, usage, refuseOverLimit } = require("./utils/limits");
 const { FCM_ENDPOINT, isFcmEndpoint } = require("./utils/fcm");
 const progress = require("./utils/progress");
@@ -175,7 +175,7 @@ async function loadAccount(userId) {
     const cached = accountCache.get(userId);
     if (cached && Date.now() - cached.at < ACCOUNT_CACHE_MS) return cached.account;
     const result = await pool.query(
-        "SELECT id, username, is_pro, pro_until, is_tester, is_admin, trial_at, token_version FROM users WHERE id = $1",
+        "SELECT id, username, is_pro, pro_until, is_max, max_until, is_tester, is_admin, trial_at, token_version FROM users WHERE id = $1",
         [userId]
     );
     const account = result.rows[0] ?? null;
@@ -825,7 +825,7 @@ app.get("/api/sessions/:id/tasks", async (req, res) => {
 app.get("/api/me" , authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
-            `SELECT users.id, users.username, users.is_pro, users.pro_until, users.is_admin, users.is_tester, users.trial_at, users.has_password,
+            `SELECT users.id, users.username, users.is_pro, users.pro_until, users.is_max, users.max_until, users.is_admin, users.is_tester, users.trial_at, users.has_password,
                 users.google_sub IS NOT NULL AS google_linked,
                 to_char(users.allday_reminder_time, 'HH24:MI') AS allday_reminder_time,
                 users.tour_seen_at IS NOT NULL AS tour_seen, users.saved_colors, users.tips_seen, users.tips_off,
@@ -862,6 +862,8 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
             proSales: PRO_BILLING,
             // Pro: paid (pro_until ahead) or a gift (is_pro); limits/usage only on the free plan
             pro: { active: hasPro(row), gift: row.is_pro, until: row.pro_until },
+            // Max (above Pro): a gift (is_max), a running subscription (max_until) or an admin
+            max: { active: hasMax(row), gift: row.is_max, until: row.max_until },
             limits: limited(row) ? { ...FREE_LIMITS, statsDays: FREE_STATS_DAYS } : null,
             usage: limited(row) ? await usage(pool, row.id) : null,
             hasPassword: row.has_password,
@@ -879,7 +881,7 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
 // For accounts without full access; asking again changes nothing.
 app.post("/api/trial", authenticateToken, async (req, res) => {
     try {
-        const { rows: [user] } = await pool.query("SELECT is_pro, pro_until, is_tester, is_admin FROM users WHERE id = $1", [req.user.userId]);
+        const { rows: [user] } = await pool.query("SELECT is_pro, pro_until, is_max, max_until, is_tester, is_admin FROM users WHERE id = $1", [req.user.userId]);
         if (!user) return res.status(401).json({ error: "User not found" });
         if (hasFullAccess(user)) return res.status(409).json({ error: "You already have access", code: "ALREADY_PRO" });
         await pool.query("UPDATE users SET trial_at = COALESCE(trial_at, now()) WHERE id = $1", [req.user.userId]);
@@ -898,7 +900,7 @@ app.post("/api/beta-requests", authenticateToken, async (req, res) => {
     if (reason.length > 1000) return res.status(400).json({ error: "The reason is too long", code: "REASON_TOO_LONG" });
 
     try {
-        const user = await pool.query("SELECT is_pro, pro_until, is_tester, is_admin FROM users WHERE id = $1", [userId]);
+        const user = await pool.query("SELECT is_pro, pro_until, is_max, max_until, is_tester, is_admin FROM users WHERE id = $1", [userId]);
         if (user.rows.length === 0) return res.status(401).json({ error: "User not found" });
         if (hasFullAccess(user.rows[0])) return res.status(409).json({ error: "You already have access", code: "ALREADY_PRO" });
 
@@ -2133,7 +2135,7 @@ async function logAdminAction(db, admin, target, action) {
 // A user as the admin panel shows them (incl. email, which only admins ever see)
 const ADMIN_USER_SELECT = `
     SELECT users.id, users.username, users.display_name, users.email, users.created_at,
-        users.is_pro, users.pro_until, users.is_admin, users.is_tester,
+        users.is_pro, users.pro_until, users.is_max, users.max_until, users.is_admin, users.is_tester,
         to_char(users.birth_date, 'YYYY-MM-DD') AS birth_date, users.email_verified,
         users.terms_accepted_at, users.privacy_accepted_at, users.language, users.timezone,
         users.has_password, (users.google_sub IS NOT NULL) AS has_google, users.level, users.is_owner,
@@ -2154,6 +2156,8 @@ const toAdminUser = (row) => ({
     // isPro: Pro as a gift (admin panel); proUntil: the end of a paid subscription
     isPro: row.is_pro,
     proUntil: row.pro_until,
+    isMax: row.is_max,
+    maxUntil: row.max_until,
     isAdmin: row.is_admin,
     isTester: row.is_tester,
     birthDate: row.birth_date,
@@ -2423,21 +2427,21 @@ app.get("/api/admin/users/export", async (req, res) => {
     }
 });
 
-// Give or take away pro / admin / tester: { isPro?, isAdmin?, isTester? }. Not for yourself, and owners keep admin.
+// Give or take away pro / max / admin / tester: { isPro?, isMax?, isAdmin?, isTester? }. Not for yourself, and owners keep admin.
 app.patch("/api/admin/users/:id", async (req, res) => {
     const targetId = idParam(req.params.id);
-    const { isPro, isAdmin, isTester } = req.body ?? {};
+    const { isPro, isMax, isAdmin, isTester } = req.body ?? {};
     if (!targetId) return adminFail(res, 404, "USER_NOT_FOUND", "User not found");
     if (targetId === req.admin.id) return adminFail(res, 400, "SELF", "You can't change your own access");
-    const changes = [isPro, isAdmin, isTester];
+    const changes = [isPro, isMax, isAdmin, isTester];
     if (changes.some(value => value !== undefined && typeof value !== "boolean") || changes.every(value => value === undefined)) {
-        return adminFail(res, 400, "INVALID_CHANGE", "Send isPro, isAdmin and/or isTester as true or false");
+        return adminFail(res, 400, "INVALID_CHANGE", "Send isPro, isMax, isAdmin and/or isTester as true or false");
     }
 
     const client = await pool.connect();
     try {
         await client.query("BEGIN");
-        const before = await client.query("SELECT id, username, is_pro, is_admin, is_tester, is_owner FROM users WHERE id = $1 FOR UPDATE", [targetId]);
+        const before = await client.query("SELECT id, username, is_pro, is_max, is_admin, is_tester, is_owner FROM users WHERE id = $1 FOR UPDATE", [targetId]);
         const target = before.rows[0];
         if (!target) {
             await client.query("ROLLBACK");
@@ -2452,6 +2456,10 @@ app.patch("/api/admin/users/:id", async (req, res) => {
             await client.query("UPDATE users SET is_pro = $1 WHERE id = $2", [isPro, targetId]);
             await logAdminAction(client, req.admin, target, isPro ? "grant_pro" : "revoke_pro");
         }
+        if (isMax !== undefined && isMax !== target.is_max) {
+            await client.query("UPDATE users SET is_max = $1 WHERE id = $2", [isMax, targetId]);
+            await logAdminAction(client, req.admin, target, isMax ? "grant_max" : "revoke_max");
+        }
         if (isAdmin !== undefined && isAdmin !== target.is_admin) {
             await client.query("UPDATE users SET is_admin = $1 WHERE id = $2", [isAdmin, targetId]);
             await logAdminAction(client, req.admin, target, isAdmin ? "grant_admin" : "revoke_admin");
@@ -2461,7 +2469,7 @@ app.patch("/api/admin/users/:id", async (req, res) => {
             await logAdminAction(client, req.admin, target, isTester ? "grant_tester" : "revoke_tester");
         }
         // giving pro or tester answers an open request
-        if (isPro || isTester) {
+        if (isPro || isMax || isTester) {
             await client.query(
                 "UPDATE beta_access_requests SET status = 'approved', decided_at = now() WHERE user_id = $1 AND status = 'pending'",
                 [targetId]
@@ -2469,8 +2477,9 @@ app.patch("/api/admin/users/:id", async (req, res) => {
         }
         await client.query("COMMIT");
         forgetAccount(targetId);
+        if (isMax !== undefined && isMax !== target.is_max) proChanged(targetId); // the open apps re-read Pro / Max
         // without access the sockets lose it too; whoever still has it connects again
-        if (isPro === false || isAdmin === false || isTester === false) realtime.disconnectUser(targetId);
+        if (isPro === false || isMax === false || isAdmin === false || isTester === false) realtime.disconnectUser(targetId);
         res.json(await loadAdminUser(pool, targetId));
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});

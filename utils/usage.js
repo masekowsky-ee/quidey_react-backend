@@ -76,7 +76,7 @@ async function accountOf(db, userId) {
     const hit = accounts.get(userId);
     if (hit && Date.now() - hit.at < ACCOUNT_TTL_MS) return hit.account;
     const { rows } = await db.query(
-        "SELECT usage_consent, timezone, language, is_pro, pro_until, is_tester, is_admin FROM users WHERE id = $1", [userId]);
+        "SELECT usage_consent, timezone, language, is_pro, pro_until, is_max, max_until, is_tester, is_admin FROM users WHERE id = $1", [userId]);
     const account = rows[0] ?? null;
     accounts.set(userId, { at: Date.now(), account });
     return account;

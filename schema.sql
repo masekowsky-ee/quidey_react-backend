@@ -68,7 +68,7 @@ CREATE TABLE public.admin_actions (
     target_username text NOT NULL,
     action text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT admin_actions_action_check CHECK ((action = ANY (ARRAY['grant_pro'::text, 'revoke_pro'::text, 'grant_admin'::text, 'revoke_admin'::text, 'grant_tester'::text, 'revoke_tester'::text, 'approve_request'::text, 'decline_request'::text, 'reset_request'::text, 'remove_avatar'::text, 'export_users'::text])))
+    CONSTRAINT admin_actions_action_check CHECK ((action = ANY (ARRAY['grant_pro'::text, 'revoke_pro'::text, 'grant_admin'::text, 'revoke_admin'::text, 'grant_tester'::text, 'revoke_tester'::text, 'approve_request'::text, 'decline_request'::text, 'reset_request'::text, 'remove_avatar'::text, 'export_users'::text, 'grant_max'::text, 'revoke_max'::text])))
 );
 
 --
@@ -2651,7 +2651,8 @@ ALTER TABLE public.users ADD CONSTRAINT users_tips_seen_check CHECK ((cardinalit
 --
 -- PostgreSQL database dump complete
 --
--- 047: the timetable from WebUntis (see migrations/047_untis.sql)
+
+-- 047: the timetable from WebUntis (see migrations/047_untis.sql)
 -- Both go with the account, and disconnecting deletes them.
 CREATE TABLE IF NOT EXISTS public.untis_accounts (
     user_id integer NOT NULL PRIMARY KEY REFERENCES public.users(id) ON DELETE CASCADE,
@@ -2746,3 +2747,10 @@ ALTER TABLE public.users ADD COLUMN IF NOT EXISTS trial_at timestamp with time z
 
 -- the task a homework suggestion became (tasks from Untis homework don't count toward the task limit)
 ALTER TABLE public.untis_homework_suggestions ADD COLUMN IF NOT EXISTS task_id integer REFERENCES public.tasks(id) ON DELETE SET NULL;
+
+-- 053: the Max plan (see migrations/053_max_plan.sql)
+ALTER TABLE public.subscriptions ADD COLUMN IF NOT EXISTS tier text NOT NULL DEFAULT 'pro';
+ALTER TABLE public.subscriptions DROP CONSTRAINT IF EXISTS subscriptions_tier_check;
+ALTER TABLE public.subscriptions ADD CONSTRAINT subscriptions_tier_check CHECK (tier IN ('pro', 'max'));
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS max_until timestamp with time zone;
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS is_max boolean NOT NULL DEFAULT false;

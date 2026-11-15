@@ -194,7 +194,7 @@ module.exports = function untisRouter({ pool }) {
         const [{ rows: [{ today }] }, { rows: known }, { rows: [account] }] = await Promise.all([
             pool.query(`SELECT to_char((now() AT TIME ZONE COALESCE(timezone, 'Europe/Berlin'))::date, 'YYYY-MM-DD') AS today FROM users WHERE id = $1`, [userId]),
             pool.query("SELECT untis_homework_id FROM untis_homework_suggestions WHERE user_id = $1", [userId]),
-            pool.query("SELECT is_pro, pro_until, is_admin FROM users WHERE id = $1", [userId]),
+            pool.query("SELECT is_pro, pro_until, is_max, max_until, is_admin FROM users WHERE id = $1", [userId]),
         ]);
         const seen = new Set(known.map(r => String(r.untis_homework_id)));
         const back = new Date(Date.parse(from) - 7 * 86400000).toISOString().slice(0, 10);
