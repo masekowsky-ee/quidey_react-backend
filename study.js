@@ -25,7 +25,9 @@ const cleanColor = (value) => (typeof value !== 'string' ? undefined
 const SHAPES = ['circle', 'square', 'triangle', 'diamond', 'star', 'hexagon', 'heart'];
 const cleanShape = (value) => (value === null ? null : SHAPES.includes(value) ? value : undefined);
 const KINDS = ['exam', 'assignment', 'presentation', 'other'];
-const MODES = ['slots', 'days'];
+// 'none': only a date (no parts, nothing planned, a calendar event)
+const MODES = ['slots', 'days', 'none'];
+const EVENT_MINUTES = 60;
 const STATUSES = ['active', 'done', 'archived'];
 const MAX_PARTS = 40;
 const ESTIMATE_SOURCES = ['history', 'pages', 'ai', 'default', 'manual'];
@@ -55,6 +57,16 @@ function cleanDate(value) {
 }
 
 const TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+// A study window: { from, to } (each a day or null, from not after to), or null when malformed
+function cleanWindow(from, to) {
+    const parse = (value) => (value === null || value === undefined ? null : cleanDate(value) ?? false);
+    const a = parse(from);
+    const b = parse(to);
+    if (a === false || b === false) return null;
+    if (a && b && a > b) return null;
+    return { from: a, to: b };
+}
 
 // Emoji: a short string or null; undefined when invalid.
 function cleanEmoji(value) {
@@ -240,7 +252,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         res.json(subjects.map((s) => {
             const next = goals.find((g) => g.goal.subjectId === s.id);
             return { ...subjectView(s, next ? {
-                id: next.goal.id, name: next.goal.name, kind: next.goal.kind, due: next.goal.due, shape: next.goal.shape,
+                id: next.goal.id, name: next.goal.name, kind: next.goal.kind, due: next.goal.due, shape: next.goal.shape, planMode: next.goal.planMode,
                 ...goalProgress(next, clock),
             } : null), exam: averageOf(s.id, true), other: averageOf(s.id, false) };
         }));
@@ -417,16 +429,22 @@ module.exports = ({ pool, realtime, loadTask }) => {
             )).rows.map((r) => r.shape));
             shape = SHAPES.find((s) => !used.has(s)) ?? SHAPES[0];
         }
+        const window = cleanWindow(body.studyFrom ?? null, body.studyTo ?? null);
+        if (!window) return invalid(res, 'studyFrom');
         if (!Array.isArray(body.parts)) return invalid(res, 'parts');
-        if (body.parts.length === 0) return fail(res, 400, 'no_parts', 'A goal needs at least one part');
+        const dateOnly = body.planMode === 'none';
+        if (dateOnly ? body.parts.length > 0 : body.parts.length === 0) {
+            return fail(res, 400, dateOnly ? 'invalid_input' : 'no_parts', dateOnly ? 'A goal that is only a date has no parts' : 'A goal needs at least one part');
+        }
         const parts = cleanParts(body.parts);
         if (!parts) return invalid(res, 'parts');
         const exam = body.kind === 'exam';
         if (parts.length + (exam ? 1 : 0) > MAX_PARTS) return invalid(res, 'parts');
         const clock = await getClock(pool, userId);
         if (due < clock.today) return fail(res, 400, 'due_in_past', 'The due date is in the past');
+        if (window.to && window.to < clock.today) return invalid(res, 'studyTo');
 
-        if (exam) {
+        if (exam && !dateOnly) {
             const lang = (await pool.query('SELECT language FROM users WHERE id = $1', [userId])).rows[0].language;
             parts.push({
                 name: lang === 'en' ? 'Review' : 'Wiederholung', estimate: reviewMinutes(parts.map((p) => p.estimate)), source: 'default', role: 'review',
@@ -437,10 +455,20 @@ module.exports = ({ pool, realtime, loadTask }) => {
         try {
             await client.query('BEGIN');
             goalId = (await client.query(
-                `INSERT INTO goals (user_id, subject_id, kind, name, due, due_time, plan_mode, shape)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-                [userId, subjectId, body.kind, name, due, dueTime, body.planMode, shape]
+                `INSERT INTO goals (user_id, subject_id, kind, name, due, due_time, plan_mode, shape, study_from, study_to)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+                [userId, subjectId, body.kind, name, due, dueTime, body.planMode, shape, window.from, window.to]
             )).rows[0].id;
+            if (dateOnly) {
+                // the date goes into the calendar as an event of its own, kept in step by PATCH
+                const color = (await client.query('SELECT color FROM subjects WHERE id = $1', [subjectId])).rows[0]?.color ?? null;
+                const eventId = (await client.query(
+                    `INSERT INTO tasks (kind, user_id, name, color, due, due_time, duration_minutes, reminders)
+                    VALUES ('event', $1, $2, $3, $4, $5, $6, '{}') RETURNING id`,
+                    [userId, name, color, due, dueTime, EVENT_MINUTES]
+                )).rows[0].id;
+                await client.query('UPDATE goals SET event_task_id = $2 WHERE id = $1', [goalId, eventId]);
+            }
             for (const [i, p] of parts.entries()) {
                 await client.query(
                     `INSERT INTO goal_parts (goal_id, name, position, estimate_minutes, estimate_source, role)
@@ -462,7 +490,10 @@ module.exports = ({ pool, realtime, loadTask }) => {
         const userId = req.user.userId;
         const id = idParam(req.params.id);
         const current = (await pool.query(
-            "SELECT to_char(due, 'YYYY-MM-DD') AS due, status, subject_id FROM goals WHERE id = $1 AND user_id = $2", [id, userId]
+            `SELECT to_char(due, 'YYYY-MM-DD') AS due, status, subject_id, plan_mode,
+                to_char(study_from, 'YYYY-MM-DD') AS study_from, to_char(study_to, 'YYYY-MM-DD') AS study_to,
+                (SELECT count(*)::int FROM goal_parts WHERE goal_id = goals.id) AS part_count
+            FROM goals WHERE id = $1 AND user_id = $2`, [id, userId]
         )).rows[0];
         if (!current) return notFound(res);
         const body = req.body || {};
@@ -480,7 +511,20 @@ module.exports = ({ pool, realtime, loadTask }) => {
         }
         if (body.planMode !== undefined) {
             if (!MODES.includes(body.planMode)) return invalid(res, 'planMode');
+            // a plan needs topics; "only a date" is only for a goal that has none
+            if (body.planMode !== 'none' && current.part_count === 0) return fail(res, 400, 'no_parts', 'A goal needs at least one part');
+            if (body.planMode === 'none' && current.part_count > 0) return fail(res, 400, 'has_parts', 'A goal with parts is planned');
             set('plan_mode', body.planMode);
+        }
+        if (body.studyFrom !== undefined || body.studyTo !== undefined) {
+            const window = cleanWindow(
+                body.studyFrom !== undefined ? body.studyFrom : current.study_from,
+                body.studyTo !== undefined ? body.studyTo : current.study_to
+            );
+            if (!window) return invalid(res, 'studyFrom');
+            if (body.studyTo && window.to < (await getClock(pool, userId)).today) return invalid(res, 'studyTo');
+            if (body.studyFrom !== undefined) set('study_from', window.from);
+            if (body.studyTo !== undefined) set('study_to', window.to);
         }
         if (body.shape !== undefined) {
             const shape = cleanShape(body.shape);
@@ -524,6 +568,15 @@ module.exports = ({ pool, realtime, loadTask }) => {
         }
         if (sets.length === 0) return invalid(res, 'body');
         await pool.query(`UPDATE goals SET ${sets.join(', ')} WHERE id = $1 AND user_id = $2`, params);
+        if (body.name !== undefined || body.due !== undefined || body.dueTime !== undefined) {
+            // the calendar event of a date-only goal follows its name, day and time
+            await pool.query(
+                `UPDATE tasks SET name = goals.name, due = goals.due, due_time = goals.due_time
+                FROM goals WHERE goals.id = $1 AND goals.user_id = $2 AND tasks.id = goals.event_task_id AND tasks.user_id = $2`,
+                [id, userId]
+            );
+            changed(userId);
+        }
         res.json(await goalDetail(userId, id));
     });
 
@@ -543,6 +596,8 @@ module.exports = ({ pool, realtime, loadTask }) => {
                 if (doomed.length) removed = (await client.query('DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2', [doomed, userId])).rowCount;
             }
             await unpinParts(client, userId, partIds);
+            // the calendar event of a date-only goal goes with it
+            await client.query('DELETE FROM tasks WHERE user_id = $2 AND id = (SELECT event_task_id FROM goals WHERE id = $1 AND user_id = $2)', [id, userId]);
             await client.query('DELETE FROM goals WHERE id = $1 AND user_id = $2', [id, userId]); // parts go, tasks keep (goal_part_id -> null)
         });
         changed(userId);

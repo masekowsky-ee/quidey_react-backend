@@ -62,7 +62,7 @@ function chunk(minutes, sessionMinutes) {
 }
 
 // The days a goal can be studied on: from today (tomorrow once today is over) to the day before
-// `due`. In `slots` mode only weekdays that have a window count, and today only while some window
+// `due` (or the goal's study window, if it is narrower). In `slots` mode only weekdays that have a window count, and today only while some window
 // still has a whole session left after now (rounded up to 5 minutes).
 function planningDays(goal, today, nowMinutes, windows, sessionMinutes = 1) {
     if (!isDay(goal.due) || !isDay(today)) return [];
@@ -71,8 +71,12 @@ function planningDays(goal, today, nowMinutes, windows, sessionMinutes = 1) {
     const todayOver = slots
         ? !windowsOn(today, windows).some((w) => w.end - Math.max(w.start, now) >= sessionMinutes)
         : nowMinutes >= DAYS_CUTOFF;
+    // an optional study window (studyFrom / studyTo, both days included) narrows the range
+    let first = todayOver ? addDays(today, 1) : today;
+    if (isDay(goal.studyFrom) && goal.studyFrom > first) first = goal.studyFrom;
+    const stop = isDay(goal.studyTo) && addDays(goal.studyTo, 1) < goal.due ? addDays(goal.studyTo, 1) : goal.due;
     const days = [];
-    for (let day = todayOver ? addDays(today, 1) : today; day < goal.due; day = addDays(day, 1)) {
+    for (let day = first; day < stop; day = addDays(day, 1)) {
         if (!slots || windowsOn(day, windows).length) days.push(day);
     }
     return days;

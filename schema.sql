@@ -2766,3 +2766,12 @@ CREATE TABLE IF NOT EXISTS public.assistant_usage (
     output_tokens bigint DEFAULT 0 NOT NULL,
     CONSTRAINT assistant_usage_pkey PRIMARY KEY (user_id, day)
 );
+
+-- 055: a goal as a date only (plan_mode 'none'), a study window, the calendar event of a date-only goal
+ALTER TABLE public.goals DROP CONSTRAINT IF EXISTS goals_plan_mode_check;
+ALTER TABLE public.goals ADD CONSTRAINT goals_plan_mode_check CHECK (plan_mode IN ('slots', 'days', 'none'));
+ALTER TABLE public.goals ADD COLUMN IF NOT EXISTS study_from date;
+ALTER TABLE public.goals ADD COLUMN IF NOT EXISTS study_to date;
+ALTER TABLE public.goals ADD COLUMN IF NOT EXISTS event_task_id integer REFERENCES public.tasks(id) ON DELETE SET NULL;
+ALTER TABLE public.goals DROP CONSTRAINT IF EXISTS goals_study_window_check;
+ALTER TABLE public.goals ADD CONSTRAINT goals_study_window_check CHECK (study_from IS NULL OR study_to IS NULL OR study_from <= study_to);

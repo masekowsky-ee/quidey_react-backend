@@ -42,6 +42,33 @@ test('planningDays: from today to the day before due', () => {
         ['2026-11-09', '2026-11-10', '2026-11-11', '2026-11-12', '2026-11-13', '2026-11-14']);
 });
 
+test('planningDays: a study window clips the days, both ends included', () => {
+    const w = everyDay('08:00', '20:00');
+    assert.deepEqual(planningDays(goal({ studyFrom: '2026-11-11', studyTo: '2026-11-12' }), TODAY, 8 * 60, w),
+        ['2026-11-11', '2026-11-12']);
+    assert.deepEqual(planningDays(goal({ studyFrom: '2026-11-12' }), TODAY, 8 * 60, w),
+        ['2026-11-12', '2026-11-13', '2026-11-14']);
+    assert.deepEqual(planningDays(goal({ studyTo: '2026-11-10' }), TODAY, 8 * 60, w),
+        ['2026-11-09', '2026-11-10']);
+});
+
+test('planningDays: a window reaching past the due date still stops the day before it', () => {
+    const w = everyDay('08:00', '20:00');
+    assert.equal(planningDays(goal({ studyTo: '2026-12-31' }), TODAY, 8 * 60, w).at(-1), '2026-11-14');
+});
+
+test('planningDays: a window that is over, or starts after the due date, gives no days', () => {
+    const w = everyDay('08:00', '20:00');
+    assert.deepEqual(planningDays(goal({ studyTo: '2026-11-08' }), TODAY, 8 * 60, w), []);
+    assert.deepEqual(planningDays(goal({ studyFrom: '2026-11-20' }), TODAY, 8 * 60, w), []);
+});
+
+test('plan: sessions stay inside the study window', () => {
+    const result = plan(input({ goals: [goal({ studyFrom: '2026-11-12', studyTo: '2026-11-13' })] }));
+    assert.ok(result.sessions.length > 0);
+    assert.ok(dates(result.sessions).every((d) => d >= '2026-11-12' && d <= '2026-11-13'));
+});
+
 test('planningDays (days): starts tomorrow from 19:00 on', () => {
     const w = everyDay('08:00', '20:00');
     assert.equal(planningDays(goal(), TODAY, 19 * 60 - 1, w)[0], '2026-11-09');

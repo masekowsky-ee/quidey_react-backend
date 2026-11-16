@@ -2910,7 +2910,9 @@ describe("Fokusraum: alarm, routines, notebook", () => {
         assert.deepEqual(list[0].attachments[1], { kind: "image", name: "tafel.png" });
         assert.equal((await call("GET", `/api/notebook/${note.id}`, null, fa.token)).data.attachments[1].data, picture);
 
-        assert.equal((await call("POST", "/api/notebook", { title: "", body: " " }, fa.token)).data.field, "body");
+        const blank = await call("POST", "/api/notebook", { title: "", body: "" }, fa.token);
+        assert.equal(blank.status, 201, "a new, still empty note is saved");
+        assert.equal((await call("DELETE", `/api/notebook/${blank.data.id}`, null, fa.token)).status, 200);
         assert.equal((await call("POST", "/api/notebook", { body: "x", attachments: [{ kind: "link", url: "javascript:alert(1)" }] }, fa.token)).data.field, "attachments");
         assert.equal((await call("POST", "/api/notebook", { body: "x", attachments: [{ kind: "image", data: "data:image/svg+xml;base64,PHN2Zz4=" }] }, fa.token)).data.field, "attachments");
         assert.equal((await call("POST", "/api/notebook", { body: "x", taskId }, fb.token)).status, 404, "not somebody else's task");
@@ -3709,6 +3711,83 @@ describe("study goals", () => {
         assert.equal(r.data.name, "Mathematik");
         assert.equal(r.data.archived, true);
         assert.equal((await call("PATCH", `${S}/subjects/${sub.id}`, { color: "beige" }, tess.token)).status, 400);
+    });
+
+    test("a goal can be made as a date only: no parts, no plan, an event in the calendar", async () => {
+        const sub = await newSubject(tess, "Latein-Termin");
+        const r = await call("POST", `${S}/goals`, { subjectId: sub.id, kind: "exam", name: "Klausur 1", due: daysFromToday(12), dueTime: "09:30", planMode: "none", parts: [] }, tess.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        assert.equal(r.data.planMode, "none");
+        assert.deepEqual(r.data.parts, []);
+        assert.ok(r.data.eventTaskId, "the event is linked");
+        const [event] = await sql("SELECT kind, name, to_char(due, 'YYYY-MM-DD') AS due, to_char(due_time, 'HH24:MI') AS time FROM tasks WHERE id = $1 AND user_id = $2", [r.data.eventTaskId, tess.id]);
+        assert.deepEqual(event, { kind: "event", name: "Klausur 1", due: daysFromToday(12), time: "09:30" });
+
+        // the subject's list names it as the next goal, with its mode
+        const listed = (await call("GET", `${S}/subjects`, null, tess.token)).data.find(x => x.id === sub.id);
+        assert.equal(listed.nextGoal.id, r.data.id);
+        assert.equal(listed.nextGoal.planMode, "none");
+
+        // nothing is planned for it
+        const planned = (await call("GET", `${S}/plan`, null, tess.token)).data;
+        assert.ok(!(planned.sessions ?? []).some(x => x.goalId === r.data.id));
+
+        // a date, a time or a name changed moves the event along
+        const moved = await call("PATCH", `${S}/goals/${r.data.id}`, { due: daysFromToday(14), dueTime: "10:00", name: "Klausur Latein" }, tess.token);
+        assert.equal(moved.status, 200, JSON.stringify(moved.data));
+        const [after] = await sql("SELECT name, to_char(due, 'YYYY-MM-DD') AS due, to_char(due_time, 'HH24:MI') AS time FROM tasks WHERE id = $1", [r.data.eventTaskId]);
+        assert.deepEqual(after, { name: "Klausur Latein", due: daysFromToday(14), time: "10:00" });
+
+        // no parts, so no plan can be switched on
+        const plan = await call("PATCH", `${S}/goals/${r.data.id}`, { planMode: "days" }, tess.token);
+        assert.equal(plan.status, 400);
+        assert.equal(plan.data.code, "no_parts");
+
+        // the event deleted by hand: the goal stays
+        await sql("DELETE FROM tasks WHERE id = $1", [r.data.eventTaskId]);
+        const kept = (await call("GET", `${S}/goals/${r.data.id}`, null, tess.token)).data;
+        assert.equal(kept.eventTaskId, null);
+    });
+
+    test("deleting a date-only goal takes its calendar event with it", async () => {
+        const sub = await newSubject(tess, "Kunst-Termin");
+        const r = await call("POST", `${S}/goals`, { subjectId: sub.id, kind: "exam", name: "Klausur K", due: daysFromToday(8), planMode: "none", parts: [] }, tess.token);
+        assert.equal(r.status, 201, JSON.stringify(r.data));
+        assert.equal((await call("DELETE", `${S}/goals/${r.data.id}`, null, tess.token)).status, 200);
+        assert.equal((await sql("SELECT 1 FROM tasks WHERE id = $1", [r.data.eventTaskId])).length, 0);
+    });
+
+    test("a goal without parts needs the date-only mode", async () => {
+        const sub = await newSubject(tess, "Griechisch-Termin");
+        const r = await call("POST", `${S}/goals`, { subjectId: sub.id, kind: "exam", name: "K", due: daysFromToday(9), planMode: "days", parts: [] }, tess.token);
+        assert.equal(r.status, 400);
+        assert.equal(r.data.code, "no_parts");
+    });
+
+    test("a study window: validated, stored, changed and cleared", async () => {
+        const sub = await newSubject(tess, "Chemie-Fenster");
+        const goal = await newGoal(tess, sub.id, { studyFrom: daysFromToday(2), studyTo: daysFromToday(6) });
+        assert.equal(goal.studyFrom, daysFromToday(2));
+        assert.equal(goal.studyTo, daysFromToday(6));
+        const bad = { subjectId: sub.id, kind: "exam", name: "X", due: daysFromToday(10), planMode: "days", parts: [{ name: "A", estimateMinutes: 60 }] };
+        assert.equal((await call("POST", `${S}/goals`, { ...bad, studyFrom: daysFromToday(6), studyTo: daysFromToday(2) }, tess.token)).data.code, "invalid_input");
+        assert.equal((await call("POST", `${S}/goals`, { ...bad, studyFrom: "morgen" }, tess.token)).data.code, "invalid_input");
+        assert.equal((await call("POST", `${S}/goals`, { ...bad, studyTo: daysFromToday(-1) }, tess.token)).data.code, "invalid_input");
+        const cleared = await call("PATCH", `${S}/goals/${goal.id}`, { studyFrom: null, studyTo: null }, tess.token);
+        assert.equal(cleared.data.studyFrom, null);
+        assert.equal(cleared.data.studyTo, null);
+        const flipped = await call("PATCH", `${S}/goals/${goal.id}`, { studyFrom: daysFromToday(5), studyTo: daysFromToday(3) }, tess.token);
+        assert.equal(flipped.data.code, "invalid_input");
+    });
+
+    test("sessions stay inside a goal's study window", async () => {
+        const sub = await newSubject(tess, "Bio-Fenster");
+        const goal = await newGoal(tess, sub.id, { studyFrom: daysFromToday(3), studyTo: daysFromToday(4), due: daysFromToday(9) });
+        const preview = (await call("GET", `${S}/plan`, null, tess.token)).data;
+        const mine = (preview.goals ?? []).find(g => g.goalId === goal.id || g.id === goal.id);
+        const days = (mine?.sessions ?? []).map(x => x.date ?? x.due);
+        assert.ok(days.length > 0, JSON.stringify(preview).slice(0, 400));
+        assert.ok(days.every(d => d >= daysFromToday(3) && d <= daysFromToday(4)), days.join());
     });
 
     test("an exam gets a review part last; validation errors", async () => {

@@ -63,6 +63,7 @@ async function loadGoals(db, userId, { id = null, subjectId = null } = {}) {
     const goals = (await db.query(
         `SELECT id, subject_id, kind, name, to_char(due, 'YYYY-MM-DD') AS due, to_char(due_time, 'HH24:MI') AS due_time,
             plan_mode, status, freed_minutes, shape, grade::float8 AS grade, graded_at,
+            to_char(study_from, 'YYYY-MM-DD') AS study_from, to_char(study_to, 'YYYY-MM-DD') AS study_to, event_task_id,
             (SELECT archived FROM subjects WHERE subjects.id = goals.subject_id) AS subject_archived
         FROM goals WHERE ${where.join(' AND ')} ORDER BY due, id`,
         params
@@ -82,6 +83,7 @@ async function loadGoals(db, userId, { id = null, subjectId = null } = {}) {
                 id: g.id, subjectId: g.subject_id, kind: g.kind, name: g.name, due: g.due, dueTime: g.due_time,
                 planMode: g.plan_mode, status: g.status, freedMinutes: g.freed_minutes, shape: g.shape ?? null,
                 gradePoints: g.grade, gradedAt: g.graded_at,
+                studyFrom: g.study_from, studyTo: g.study_to, eventTaskId: g.event_task_id,
                 subjectArchived: g.subject_archived,
             },
             parts: own.map((p) => ({
@@ -111,6 +113,7 @@ function goalView({ goal, parts, sessions }) {
         id: goal.id, subjectId: goal.subjectId, kind: goal.kind, name: goal.name, due: goal.due,
         dueTime: goal.dueTime, planMode: goal.planMode, status: goal.status, shape: goal.shape ?? null,
         gradePoints: goal.gradePoints ?? null, gradedAt: goal.gradedAt ?? null,
+        studyFrom: goal.studyFrom ?? null, studyTo: goal.studyTo ?? null, eventTaskId: goal.eventTaskId ?? null,
         parts: parts.map((p) => partView(p, sessions)),
         sessions: sessions.map((s) => ({
             taskId: s.taskId, partId: s.partId, due: s.date, dueTime: s.time,
@@ -156,7 +159,8 @@ async function loadBusy(db, userId, today, until, activePartIds) {
 const ACTIVE_GOAL_SQL = `goals.status = 'active'
     AND goals.subject_id IN (SELECT id FROM subjects WHERE subjects.user_id = $1 AND NOT subjects.archived)`;
 const isEnded = (goal, today) => goal.due < today;
-const isPlanned = (goal, today) => goal.status === 'active' && !goal.subjectArchived && !isEnded(goal, today);
+// a goal that is only a date (plan_mode 'none') is never planned, watched or pushed
+const isPlanned = (goal, today) => goal.status === 'active' && goal.planMode !== 'none' && !goal.subjectArchived && !isEnded(goal, today);
 async function loadActiveGoals(db, userId, today) {
     return (await loadGoals(db, userId)).filter((g) => isPlanned(g.goal, today));
 }
@@ -182,7 +186,7 @@ async function loadPlanInput(db, userId, now = new Date()) {
     for (const { goal, parts, sessions: own } of goals) {
         const ctx = { today: clock.today, nowMinutes: clock.nowMinutes, planMode: goal.planMode };
         planGoals.push({
-            id: goal.id, kind: goal.kind, due: goal.due, planMode: goal.planMode,
+            id: goal.id, kind: goal.kind, due: goal.due, planMode: goal.planMode, studyFrom: goal.studyFrom, studyTo: goal.studyTo,
             parts: parts.map((p) => ({
                 id: p.id, position: p.position, role: p.role,
                 remaining: partProgress(p, own.filter((s) => s.partId === p.id)).remaining,
