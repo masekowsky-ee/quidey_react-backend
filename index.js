@@ -7102,7 +7102,7 @@ function cleanNote(body, partial) {
         if (typeof body.trashed !== "boolean") return { field: "trashed" };
         out.trashed_at = body.trashed ? new Date().toISOString() : null;
     }
-    if (!partial && !out.title && !out.body.trim() && !(body.attachments?.length)) return { field: "body" };
+    // an empty note is fine: "new note" makes one, the editor fills it (and the list names it "Untitled")
     return { values: out };
 }
 
