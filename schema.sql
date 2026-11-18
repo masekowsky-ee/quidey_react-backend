@@ -2775,3 +2775,14 @@ ALTER TABLE public.goals ADD COLUMN IF NOT EXISTS study_to date;
 ALTER TABLE public.goals ADD COLUMN IF NOT EXISTS event_task_id integer REFERENCES public.tasks(id) ON DELETE SET NULL;
 ALTER TABLE public.goals DROP CONSTRAINT IF EXISTS goals_study_window_check;
 ALTER TABLE public.goals ADD CONSTRAINT goals_study_window_check CHECK (study_from IS NULL OR study_to IS NULL OR study_from <= study_to);
+
+-- 056: idempotency keys for requests the apps send again after being offline (see migrations/056_idempotency_keys.sql)
+CREATE TABLE IF NOT EXISTS public.idempotency_keys (
+    user_id integer NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    key text NOT NULL,
+    status integer,
+    response jsonb,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT idempotency_keys_pkey PRIMARY KEY (user_id, key)
+);
+CREATE INDEX IF NOT EXISTS idempotency_keys_created_at_idx ON public.idempotency_keys (created_at);

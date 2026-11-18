@@ -242,6 +242,81 @@ describe("contact form and feedback", () => {
     });
 });
 
+describe("requests the apps send again after being offline (Idempotency-Key)", () => {
+    const key = () => `test-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+
+    test("a task made twice with the same key exists once, and the second answer is the first", async () => {
+        const ann = await member("idemtask");
+        const k = key();
+        const first = await call("POST", "/api/tasks", { name: "Once" }, ann.token, { "Idempotency-Key": k });
+        assert.equal(first.status, 201);
+        const again = await call("POST", "/api/tasks", { name: "Once" }, ann.token, { "Idempotency-Key": k });
+        assert.equal(again.status, 201);
+        assert.equal(again.data.id, first.data.id);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE user_id = $1", [ann.id]))[0].n, 1);
+    });
+
+    test("without a key every request makes its own", async () => {
+        const ann = await member("idemnone");
+        await call("POST", "/api/tasks", { name: "A" }, ann.token);
+        await call("POST", "/api/tasks", { name: "A" }, ann.token);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM tasks WHERE user_id = $1", [ann.id]))[0].n, 2);
+    });
+
+    test("a key belongs to one account", async () => {
+        const ann = await member("idemann");
+        const ben = await member("idemben");
+        const k = key();
+        const a = await call("POST", "/api/tasks", { name: "Ann's" }, ann.token, { "Idempotency-Key": k });
+        const b = await call("POST", "/api/tasks", { name: "Ben's" }, ben.token, { "Idempotency-Key": k });
+        assert.notEqual(a.data.id, b.data.id);
+        assert.equal(b.data.name, "Ben's");
+    });
+
+    test("a refused request leaves the key free for a corrected one", async () => {
+        const ann = await member("idemfix");
+        const k = key();
+        const bad = await call("POST", "/api/tasks", { name: "" }, ann.token, { "Idempotency-Key": k });
+        assert.equal(bad.status, 400);
+        const good = await call("POST", "/api/tasks", { name: "Fixed" }, ann.token, { "Idempotency-Key": k });
+        assert.equal(good.status, 201);
+    });
+
+    test("a focus session saved twice with the same key counts once", async () => {
+        const ann = await member("idemsession");
+        const k = key();
+        const body = { totalTime: 1500, workedTasks: [], group: "all", date: new Date().toISOString() };
+        const first = await call("POST", "/api/sessions", body, ann.token, { "Idempotency-Key": k });
+        assert.equal(first.status, 201, JSON.stringify(first.data));
+        const again = await call("POST", "/api/sessions", body, ann.token, { "Idempotency-Key": k });
+        assert.deepEqual(again.data, first.data);
+        assert.equal((await sql("SELECT count(*)::int AS n FROM sessions WHERE user_id = $1", [ann.id]))[0].n, 1);
+    });
+
+    test("a malformed key is refused", async () => {
+        const ann = await member("idembad");
+        const r = await call("POST", "/api/tasks", { name: "x" }, ann.token, { "Idempotency-Key": "no" });
+        assert.equal(r.status, 400);
+        assert.equal(r.data.code, "INVALID_IDEMPOTENCY_KEY");
+    });
+});
+
+describe("which app version is current", () => {
+    test("is public and answers per platform", async () => {
+        const r = await call("GET", "/api/app-version?platform=android&version=3");
+        assert.equal(r.status, 200);
+        assert.equal(r.data.platform, "android");
+        assert.equal(r.data.updateAvailable, false);
+        assert.equal(r.data.mustUpdate, false);
+        assert.match(r.data.storeUrl, /play\.google\.com/);
+    });
+
+    test("refuses an unknown platform", async () => {
+        const r = await call("GET", "/api/app-version?platform=symbian&version=1");
+        assert.equal(r.status, 400);
+    });
+});
+
 describe("intro tour", () => {
     test("a new account hasn't seen it until it says so", async () => {
         const ann = await member("tournew");

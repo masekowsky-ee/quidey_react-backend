@@ -11,6 +11,8 @@ const { OAuth2Client } = require("google-auth-library");
 const { hashToken, createVerificationToken } = require("./utils/verificationToken");
 const { sendVerificationMail, sendContactMail, sendFeedbackMail, sendCancellationMail } = require("./utils/mailer");
 const billing = require("./utils/billing");
+const { idempotency } = require("./utils/idempotency");
+const { versionInfo } = require("./utils/appVersion");
 const { startReminderMails } = require("./utils/reminderMails");
 const { startFocusSchedule } = require("./utils/focus");
 const { PUSH_PUBLIC_KEY, PUSH_FCM_ENABLED, PUSH_KINDS, PUSH_MAX_DEVICES, PUSH_TEXTS, pushLater, deliver, startPushSchedule } = require("./utils/push");
@@ -246,6 +248,17 @@ app.use("/api/notebook", authenticateToken);
 app.use("/api/usage", authenticateToken);
 app.use("/api/ai", authenticateToken);
 app.use("/api/untis", authenticateToken);
+// requests the apps queue while offline carry an Idempotency-Key: a retry never makes a second one
+app.use(["/api/tasks", "/api/sessions"], idempotency(pool));
+
+// The native apps ask which version is current (and which too old to keep working): public, no
+// account needed, so a blocked old app can still be told to update. See utils/appVersion.js.
+app.get("/api/app-version", (req, res) => {
+    const info = versionInfo(String(req.query.platform ?? ""), req.query.version);
+    if (!info) return res.status(400).json({ error: "Unknown platform", code: "INVALID_INPUT", field: "platform" });
+    res.set("Cache-Control", "no-store");
+    res.json(info);
+});
 
 // Closed beta: the app's data is only for pro users and testers (and admins, see utils/access.js).
 // Checked against the account on every request (not stored in the token; see loadAccount), so
