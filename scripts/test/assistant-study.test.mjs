@@ -119,6 +119,7 @@ before(async () => {
     await goal("oldExam2", users.maxi, "math", "exam", "Test 2", { status: "done", grade: 10 });
     await goal("oldHw", users.maxi, "math", "assignment", "Blatt 3", { status: "done", grade: 6 });
     await goal("archivedGoal", users.maxi, "math", "other", "Alt", { status: "archived" });
+    await goal("endedGoal", users.maxi, "math", "assignment", "Gestern faellig", { due: day(-1) });
 
     await subject("secret", users.otto, "Ottos Geheimfach");
     await goal("ottoGoal", users.otto, "secret", "exam", "Ottos Klausur");
@@ -183,7 +184,7 @@ test("study_overview: the user's subjects with active goals, part counts and ave
     assert.equal(math.archived, false);
     assert.equal(math.examAverage, 11);   // points scale: (12 + 10) / 2
     assert.equal(math.otherAverage, 6);
-    assert.equal(math.goals.length, 1);   // done and archived goals are left out
+    assert.equal(math.goals.length, 1);   // done, archived and ended (due yesterday) goals are left out
     assert.deepEqual(math.goals[0], {
         id: ids.exam, name: "Klausur Analysis", kind: "exam", due: day(10), dueTime: null, planMode: "slots", partCount: 3, partsDone: 1,
     });
@@ -251,4 +252,16 @@ test("the study tools count as lookups: the fourth in one turn gets an error", {
     assert.equal(results.length, 4);
     assert.equal(results[3].is_error, true);
     assert.ok(!results[0].is_error && !results[2].is_error);
+});
+
+test("study_overview: an active goal whose day is over is left out and not counted, one due tomorrow stays", { skip: NO_DB }, async () => {
+    await pool.query("INSERT INTO goals (user_id, subject_id, kind, name, due) VALUES ($1, $2, 'assignment', 'Morgen faellig', $3)", [users.maxi.id, ids.math, day(1)]);
+    try {
+        const r = await useTool(users.maxi, "study_overview", {});
+        const names = r.data.subjects[0].goals.map(g => g.name);
+        assert.deepEqual(names, ["Morgen faellig", "Klausur Analysis"]);
+        assert.ok(!names.includes("Gestern faellig"));
+    } finally {
+        await pool.query("DELETE FROM goals WHERE name = 'Morgen faellig'");
+    }
 });

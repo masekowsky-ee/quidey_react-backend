@@ -8,6 +8,7 @@
 // readStudy(name, input, { db, userId }) → the result, or { error }, or null for a name that isn't one of these.
 
 const { fromPoints, average } = require("./grades");
+const { getClock, isEnded } = require("./studyLoad");
 
 const SUBJECTS_MAX = 30;
 const GOALS_PER_SUBJECT_MAX = 8;
@@ -40,14 +41,17 @@ async function overview({ db, userId }) {
     if (!shown.length) return { subjects: [] };
     const subjectIds = shown.map(s => s.id);
 
-    // active goals, the next due first, with how many parts are done
-    const { rows: goals } = await db.query(
+    // active goals that have not ended (as GET /subjects: a goal whose day is over has ended), the next due
+    // first, with how many parts are done
+    const clock = await getClock(db, userId);
+    const { rows: allGoals } = await db.query(
         `SELECT goals.id, goals.subject_id, goals.name, goals.kind, to_char(goals.due, 'YYYY-MM-DD') AS due,
             to_char(goals.due_time, 'HH24:MI') AS due_time, goals.plan_mode,
             count(goal_parts.id)::int AS part_count, count(goal_parts.done_at)::int AS parts_done
         FROM goals LEFT JOIN goal_parts ON goal_parts.goal_id = goals.id
         WHERE goals.user_id = $1 AND goals.status = 'active' AND goals.subject_id = ANY($2::int[])
         GROUP BY goals.id ORDER BY goals.due, goals.due_time NULLS LAST, goals.id`, [userId, subjectIds]);
+    const goals = allGoals.filter(g => !isEnded(g, clock.today));
     // grades as GET /subjects: one mean of the exams' points and one of the other work's
     const { rows: graded } = await db.query(
         `SELECT subject_id, (kind = 'exam') AS exam, grade::float8 AS grade FROM goals
