@@ -19,7 +19,7 @@ const { PUSH_PUBLIC_KEY, PUSH_FCM_ENABLED, PUSH_KINDS, PUSH_MAX_DEVICES, PUSH_TE
 const http = require("node:http");
 const realtime = require("./realtime");
 const { toNotice, noticeEntryAdded, noticeFamilyAssigned, pushChat } = require("./utils/groupNotices");
-const { ACCESS_MODE, PRO_BILLING, requireProBilling, hasMax, hasPro, hasFullAccess, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
+const { ACCESS_MODE, PRO_BILLING, requireProBilling, hasMax, hasAssistant, hasPro, hasFullAccess, hasAppAccess, hasTesterAccess, APP_ACCESS_SQL } = require("./utils/access");
 const { FREE_LIMITS, FREE_STATS_DAYS, limited, usage, refuseOverLimit } = require("./utils/limits");
 const { FCM_ENDPOINT, isFcmEndpoint } = require("./utils/fcm");
 const progress = require("./utils/progress");
@@ -877,6 +877,8 @@ app.get("/api/me" , authenticateToken, async (req, res) => {
             pro: { active: hasPro(row), gift: row.is_pro, until: row.pro_until },
             // Max (above Pro): a gift (is_max), a running subscription (max_until) or an admin
             max: { active: hasMax(row), gift: row.is_max, until: row.max_until },
+            // the AI assistant: Max, or a tester (a few messages a day, see utils/quota.js assistantMax)
+            assistant: { active: hasAssistant(row) },
             limits: limited(row) ? { ...FREE_LIMITS, statsDays: FREE_STATS_DAYS } : null,
             usage: limited(row) ? await usage(pool, row.id) : null,
             hasPassword: row.has_password,

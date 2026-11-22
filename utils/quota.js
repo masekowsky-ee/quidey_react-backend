@@ -5,6 +5,8 @@
 // the last one: → { ok, used, max, day, resetsAt }. giveBack(...) returns it when the work failed.
 // The app reads what is left from GET /api/ai/quota.
 
+const { hasMax } = require("./access");
+
 const DAILY = {
     // a document / photos / a note read into a study plan, notes or entries
     scan: Number(process.env.QUOTA_SCAN) || 1,
@@ -13,6 +15,11 @@ const DAILY = {
     // a message to the assistant (Max)
     assistant: Number(process.env.QUOTA_ASSISTANT) || 20,
 };
+// testers without Max may try the assistant a few times a day
+const ASSISTANT_TESTER = Number(process.env.QUOTA_ASSISTANT_TESTER) || 3;
+
+// the assistant's messages a day for this account: Max (and admins) the full allowance, testers a few
+const assistantMax = (account) => (hasMax(account) ? DAILY.assistant : ASSISTANT_TESTER);
 // the names the app sees
 const PUBLIC_NAME = { scan: "scan", ai_line: "aiLine", assistant: "assistant" };
 
@@ -23,8 +30,8 @@ const DAY_SQL = `
                AT TIME ZONE COALESCE(users.timezone, 'Europe/Berlin')) AS resets_at
     FROM users WHERE users.id = $1`;
 
-async function take(db, userId, kind) {
-    const max = DAILY[kind];
+// max: this account's allowance when it isn't the standard one (the assistant: assistantMax)
+async function take(db, userId, kind, max = DAILY[kind]) {
     const { rows } = await db.query(`
         WITH today AS (${DAY_SQL}),
         booked AS (
@@ -47,14 +54,14 @@ async function giveBack(db, userId, kind, day) {
 }
 
 // { scan: { used, max }, aiLine: { used, max }, assistant: { used, max }, resetsAt }
-async function status(db, userId) {
+async function status(db, userId, { assistant = DAILY.assistant } = {}) {
     const { rows } = await db.query(`
         WITH today AS (${DAY_SQL})
         SELECT today.resets_at, daily_quota.kind, daily_quota.used
         FROM today LEFT JOIN daily_quota ON daily_quota.user_id = $1 AND daily_quota.day = today.day`, [userId]);
     const out = { resetsAt: rows[0]?.resets_at ?? null };
     for (const kind of Object.keys(DAILY)) {
-        out[PUBLIC_NAME[kind]] = { used: rows.find(row => row.kind === kind)?.used ?? 0, max: DAILY[kind] };
+        out[PUBLIC_NAME[kind]] = { used: rows.find(row => row.kind === kind)?.used ?? 0, max: kind === "assistant" ? assistant : DAILY[kind] };
     }
     return out;
 }
@@ -84,4 +91,4 @@ async function forgetOldDays(db) {
     await db.query("DELETE FROM assistant_usage WHERE day < (now() - interval '8 days')::date");
 }
 
-module.exports = { DAILY, take, giveBack, recordUsage, status, refuse, forgetOldDays };
+module.exports = { DAILY, assistantMax, take, giveBack, recordUsage, status, refuse, forgetOldDays };

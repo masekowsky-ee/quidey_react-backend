@@ -92,6 +92,8 @@ before(async () => {
     await add("pia", { pro: true });
     await add("fred", {});
     await add("rita", { max: true });
+    await add("tessa", {});
+    await pool.query("UPDATE users SET is_tester = true WHERE id = $1", [users.tessa.id]);
     const day = in2days();
     const task = async (key, owner, name) => {
         const { rows: [t] } = await pool.query(
@@ -151,6 +153,25 @@ test("without Max: 403 MAX_REQUIRED, no allowance taken, no model call", { skip:
         assert.equal(await used(who), 0);
     }
     assert.equal(calls.length, 0);
+});
+
+test("a tester without Max may use the assistant three times a day, the fourth is refused", { skip: NO_DB }, async () => {
+    script = turns(textTurn("ok"));
+    for (let i = 0; i < 3; i++) {
+        const r = await ask(users.tessa, "Hi");
+        assert.equal(r.status, 200, JSON.stringify(r.data));
+        assert.deepEqual(r.data.quota.assistant, { used: i + 1, max: 3 });
+    }
+    const refused = await ask(users.tessa, "Hi");
+    assert.equal(refused.status, 429);
+    assert.equal(refused.data.code, "QUOTA_REACHED");
+    assert.equal(refused.data.max, 3);
+    assert.equal(calls.length, 3);
+    const q = await call("GET", "/api/ai/quota", null, users.tessa);
+    assert.deepEqual(q.data.assistant, { used: 3, max: 3 });
+    // Max keeps its 20
+    const m = await call("GET", "/api/ai/quota", null, users.maxi);
+    assert.equal(m.data.assistant.max, 20);
 });
 
 test("GET /quota includes the assistant allowance", { skip: NO_DB }, async () => {

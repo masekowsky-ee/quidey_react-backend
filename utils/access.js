@@ -38,6 +38,10 @@ const hasFullAccess = (account) => ACCESS_MODE === "open" || Boolean(hasPro(acco
 
 const hasAppAccess = (account) => hasFullAccess(account) || hasTrial(account);
 
+// The AI assistant: Max, and testers with a small daily allowance (QUOTA_ASSISTANT_TESTER, 3 by default,
+// see assistantMax in utils/quota.js). A tester who is also Max has the Max allowance.
+const hasAssistant = (account) => Boolean(account && (hasMax(account) || account.is_tester));
+
 // The AI features (utils/ai.js, ai.js, the study estimates, the homework time estimate): Pro (a gift or a
 // running subscription) and admins; testers get no AI unless they are Pro too.
 const hasAiAccess = (account) => Boolean(account && (hasPro(account) || account.is_admin));
@@ -56,4 +60,4 @@ const APP_ACCESS_SQL = ACCESS_MODE === "open" ? "true" : `(${PRO_SQL} OR users.i
 // The same as hasTesterAccess, for SQL on the users table
 const TESTER_ACCESS_SQL = "(users.is_tester OR users.is_admin)";
 
-module.exports = { ACCESS_MODE, PRO_BILLING, requireProBilling, hasMax, hasPro, hasAiAccess, hasTrial, hasFullAccess, hasAppAccess, hasTesterAccess, hasNoLimits, MAX_SQL, PRO_SQL, APP_ACCESS_SQL, TESTER_ACCESS_SQL };
+module.exports = { ACCESS_MODE, PRO_BILLING, requireProBilling, hasMax, hasAssistant, hasPro, hasAiAccess, hasTrial, hasFullAccess, hasAppAccess, hasTesterAccess, hasNoLimits, MAX_SQL, PRO_SQL, APP_ACCESS_SQL, TESTER_ACCESS_SQL };

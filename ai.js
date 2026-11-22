@@ -13,7 +13,7 @@
 const express = require("express");
 const quota = require("./utils/quota");
 const { ask, available, AiError, aiErrorResponse } = require("./utils/ai");
-const { hasAiAccess, hasMax } = require("./utils/access");
+const { hasAiAccess, hasAssistant } = require("./utils/access");
 const assistant = require("./utils/assistant");
 
 const TASK_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
@@ -249,11 +249,11 @@ module.exports = function aiRouter({ pool }) {
     // (the job gets the booking, { day, ... }). keepWhen(err): true keeps it used although the job
     // failed, because the failed work was already paid for (the assistant, once the model answered).
     async function withQuota(req, res, kind, job, { keepWhen } = {}) {
-        const booked = await quota.take(pool, req.user.userId, kind);
+        const booked = await quota.take(pool, req.user.userId, kind, kind === "assistant" ? quota.assistantMax(req.account) : undefined);
         if (!booked.ok) return quota.refuse(res, kind, booked);
         try {
             const result = await job(booked);
-            res.json({ ...result, quota: await quota.status(pool, req.user.userId) });
+            res.json({ ...result, quota: await quota.status(pool, req.user.userId, { assistant: quota.assistantMax(req.account) }) });
         } catch (err) {
             if (!keepWhen?.(err)) await quota.giveBack(pool, req.user.userId, kind, booked.day).catch(() => {});
             if (err instanceof AiError) return aiErrorResponse(res, err);
@@ -264,19 +264,19 @@ module.exports = function aiRouter({ pool }) {
     // available: false when the AI isn't set up here (no ANTHROPIC_API_KEY): the app hides its buttons
     // (and not for accounts without AI access: Pro and admins only, see utils/access.js)
     router.get("/quota", async (req, res) => {
-        res.json({ available: available() && hasAiAccess(req.account), ...await quota.status(pool, req.user.userId) });
+        res.json({ available: available() && hasAiAccess(req.account), ...await quota.status(pool, req.user.userId, { assistant: quota.assistantMax(req.account) }) });
     });
 
     //   POST /api/ai/assistant { messages: [{ role: 'user' | 'assistant', content }], language: 'de' | 'en' }
     //        → { message, actions, quota }: the Max assistant (utils/assistant.js, where the actions
-    //        are described). Max only (403 MAX_REQUIRED, before anything is counted); one "assistant"
-    //        of the day (20; 429 QUOTA_REACHED with resetsAt when none is left). It is given back when
+    //        are described). Max, and testers (403 MAX_REQUIRED for everybody else, before anything is counted); one "assistant"
+    //        of the day (20 for Max, 3 for a tester without Max, QUOTA_ASSISTANT_TESTER; 429 QUOTA_REACHED with resetsAt when none is left). It is given back when
     //        the AI fails before the model answered once; after that the message counts even if the
     //        run fails (max_tokens, too many steps), so failing runs can't be repeated for free. Up to 40 messages, the user's up to 2000 characters (longer answers are
     //        shortened, and the message sent back is never longer), the last one the user's; only
     //        the last 10 go to Anthropic. Nothing of the chat is kept here, only the day's token numbers.
     router.post("/assistant", (req, res, next) => {
-        if (hasMax(req.account)) return next();
+        if (hasAssistant(req.account)) return next();
         res.status(403).json({ error: "The assistant is part of Quidey Max", code: "MAX_REQUIRED" });
     }, async (req, res) => {
         const body = assistant.readRequest(req.body);
