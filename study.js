@@ -230,11 +230,34 @@ module.exports = ({ pool, realtime, loadTask }) => {
         }
     }
 
+    // The subject of a goal / part was worked on just now (the study page lists the last one first).
+    const touchGoal = (db, goalId) => db.query(
+        'UPDATE subjects SET last_activity_at = now() WHERE id = (SELECT subject_id FROM goals WHERE id = $1)', [goalId]
+    ).catch(() => {});
+    const touchPart = (db, partId) => db.query(
+        `UPDATE subjects SET last_activity_at = now()
+        WHERE id = (SELECT goals.subject_id FROM goal_parts JOIN goals ON goals.id = goal_parts.goal_id WHERE goal_parts.id = $1)`, [partId]
+    ).catch(() => {});
+
     // ---------- subjects ----------
     router.get('/subjects', async (req, res) => {
         const userId = req.user.userId;
         const subjects = (await pool.query(
-            'SELECT * FROM subjects WHERE user_id = $1 ORDER BY archived, lower(name), id', [userId]
+            `SELECT subjects.*, GREATEST(
+                subjects.last_activity_at,
+                (SELECT max(sessions.date) FROM sessions
+                    JOIN session_tasks ON session_tasks.session_id = sessions.id
+                    JOIN tasks ON tasks.id = session_tasks.task_id
+                    JOIN goal_parts ON goal_parts.id = tasks.goal_part_id
+                    JOIN goals ON goals.id = goal_parts.goal_id
+                    WHERE goals.subject_id = subjects.id),
+                (SELECT max(goal_parts.done_at) FROM goal_parts JOIN goals ON goals.id = goal_parts.goal_id WHERE goals.subject_id = subjects.id),
+                (SELECT max(tasks.completed_at) FROM tasks
+                    JOIN goal_parts ON goal_parts.id = tasks.goal_part_id
+                    JOIN goals ON goals.id = goal_parts.goal_id
+                    WHERE goals.subject_id = subjects.id)
+            ) AS activity_at
+            FROM subjects WHERE user_id = $1 ORDER BY archived, lower(name), id`, [userId]
         )).rows;
         const clock = await getClock(pool, userId);
         // sorted by due; a goal whose day is over has ended (ruling 29)
@@ -254,7 +277,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
             return { ...subjectView(s, next ? {
                 id: next.goal.id, name: next.goal.name, kind: next.goal.kind, due: next.goal.due, shape: next.goal.shape, planMode: next.goal.planMode,
                 ...goalProgress(next, clock),
-            } : null), exam: averageOf(s.id, true), other: averageOf(s.id, false) };
+            } : null), lastActivityAt: s.activity_at ?? s.created_at, exam: averageOf(s.id, true), other: averageOf(s.id, false) };
         }));
     });
 
@@ -568,6 +591,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         }
         if (sets.length === 0) return invalid(res, 'body');
         await pool.query(`UPDATE goals SET ${sets.join(', ')} WHERE id = $1 AND user_id = $2`, params);
+        await touchGoal(pool, id);
         if (body.name !== undefined || body.due !== undefined || body.dueTime !== undefined) {
             // the calendar event of a date-only goal follows its name, day and time
             await pool.query(
@@ -657,6 +681,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
         } finally {
             client.release();
         }
+        await touchGoal(pool, goalId);
         res.status(201).json(await partDetail(userId, goalId, partId));
     });
 
@@ -739,6 +764,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
             return true;
         });
         if (!found) return notFound(res);
+        await touchPart(pool, partId);
         if (removed) changed(userId);
         res.json(await partDetail(userId, goalId, partId));
     });
@@ -996,8 +1022,44 @@ module.exports = ({ pool, realtime, loadTask }) => {
             VALUES ('task', $1, $2, $3, $4, $5, $6, $7, true, '{}') RETURNING id`,
             [userId, part.name, part.color, clock.today, time, clock.sessionMinutes, part.id]
         )).rows[0].id;
+        await touchPart(pool, part.id);
         changed(userId);
         res.status(201).json({ task: await loadTask(id, userId) });
+    });
+
+    // A planned session moved or made shorter by hand: { date?, time?, minutes? }. Done ones are not
+    // changed. The session is pinned from then on (the planner leaves it where it was put).
+    router.patch('/sessions/:taskId', async (req, res) => {
+        const userId = req.user.userId;
+        const taskId = idParam(req.params.taskId);
+        const body = req.body || {};
+        const sets = [];
+        const params = [taskId, userId];
+        const set = (column, value) => { params.push(value); sets.push(`${column} = $${params.length}`); };
+        if (body.date !== undefined) {
+            const date = cleanDate(body.date);
+            if (!date) return invalid(res, 'date');
+            set('due', date);
+        }
+        if (body.time !== undefined) {
+            if (body.time !== null && (typeof body.time !== 'string' || !TIME.test(body.time))) return invalid(res, 'time');
+            set('due_time', body.time);
+        }
+        if (body.minutes !== undefined) {
+            const minutes = cleanEstimate(body.minutes);
+            if (minutes == null) return invalid(res, 'minutes');
+            set('duration_minutes', minutes);
+        }
+        if (sets.length === 0) return invalid(res, 'body');
+        const row = (await pool.query(
+            `UPDATE tasks SET ${sets.join(', ')}, plan_pinned = true
+            WHERE id = $1 AND user_id = $2 AND ${MY_SESSION} AND NOT COALESCE(done, false)
+            RETURNING goal_part_id`, params
+        )).rows[0];
+        if (!row) return notFound(res);
+        await touchPart(pool, row.goal_part_id);
+        changed(userId);
+        res.json({ task: await loadTask(taskId, userId) });
     });
 
     // Gives a session back to the planner.
@@ -1013,33 +1075,34 @@ module.exports = ({ pool, realtime, loadTask }) => {
     });
 
     // ---------- status and estimates ----------
-    // Parts that reached their estimate (credit) but are not ticked off: their replaceable sessions
-    // go and count as freed time. One goal per transaction, the goal locked first (lock order goal -> tasks).
+    // Parts that reached their estimate (credit) but are not ticked off are ticked off now: finishPart keeps
+    // their credit, their replaceable sessions go and count as freed time. One goal per transaction, the
+    // goal locked first (lock order goal -> tasks). Returns the parts finished: [{ goalId, partId }].
     async function releaseAhead(userId, goalIds) {
-        let deleted = 0;
+        const finished = [];
         for (const id of goalIds) {
-            deleted += await inTransaction(async (client) => {
+            const parts = await inTransaction(async (client) => {
                 await client.query('SELECT id FROM goals WHERE id = $1 AND user_id = $2 FOR UPDATE', [id, userId]);
                 const [fresh] = await loadGoals(client, userId, { id });
-                if (!fresh || fresh.goal.status !== 'active') return 0;
+                if (!fresh || fresh.goal.status !== 'active') return [];
                 const clock = await getClock(client, userId);
                 const { aheadPartIds } = goalStatus({ ...fresh, busy: [] }, clock);
-                const open = new Set(fresh.parts.filter((p) => !p.doneAt).map((p) => p.id));
-                const gone = fresh.sessions.filter((s) => aheadPartIds.includes(s.partId) && open.has(s.partId) && isReplaceable(s, clock));
-                if (!gone.length) return 0;
-                const deleted = await deleteReplaceable(client, userId, gone.map((s) => s.taskId));
-                if (deleted.length) await client.query('UPDATE goals SET freed_minutes = freed_minutes + $2 WHERE id = $1', [id, sumMinutes(deleted)]);
-                return deleted.length;
+                const open = fresh.parts.filter((p) => !p.doneAt && aheadPartIds.includes(p.id));
+                for (const part of open) await finishPart(client, userId, { id: part.id, goal_id: id });
+                return open.map((p) => ({ goalId: id, partId: p.id }));
             });
+            if (parts.length) await touchGoal(pool, id);
+            finished.push(...parts);
         }
-        return deleted;
+        return finished;
     }
 
     router.get('/status', async (req, res) => {
         const userId = req.user.userId;
         let loaded = await loadPlanInput(pool, userId);
         const ahead = statusOf(loaded).filter(({ g, status }) => status.aheadPartIds.some((pid) => g.parts.find((p) => p.id === pid && !p.doneAt)));
-        if (ahead.length && await releaseAhead(userId, ahead.map(({ g }) => g.goal.id))) {
+        const autoFinished = ahead.length ? await releaseAhead(userId, ahead.map(({ g }) => g.goal.id)) : [];
+        if (autoFinished.length) {
             changed(userId);
             loaded = await loadPlanInput(pool, userId);
         }
@@ -1053,6 +1116,7 @@ module.exports = ({ pool, realtime, loadTask }) => {
                 conflictTaskIds: status.conflictTaskIds, freedMinutes: g.goal.freedMinutes,
             })),
             notifiedMinutes: Object.fromEntries(rows.map(({ g }) => [g.goal.id, notified.get(g.goal.id) ?? 0])),
+            autoFinished,
             aiAvailable: makeAiClient() !== null && hasAiAccess(req.account),
         });
     });

@@ -2462,6 +2462,7 @@ CREATE TABLE IF NOT EXISTS public.subjects (
     color text,
     archived boolean NOT NULL DEFAULT false,
     created_at timestamp with time zone NOT NULL DEFAULT now(),
+    last_activity_at timestamp with time zone,
     CONSTRAINT subjects_color_check
         CHECK (color IS NULL OR color IN ('red', 'orange', 'yellow', 'green', 'teal', 'blue', 'violet', 'pink'))
 );
