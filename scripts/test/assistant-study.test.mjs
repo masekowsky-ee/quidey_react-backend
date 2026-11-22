@@ -265,3 +265,144 @@ test("study_overview: an active goal whose day is over is left out and not count
         await pool.query("DELETE FROM goals WHERE name = 'Morgen faellig'");
     }
 });
+
+// ---------- write tools: proposals ----------
+
+// runs the write tools of one turn; the loop ends with them, the answer is { message, actions }
+async function propose(who, ...uses) {
+    calls = [];
+    script = turns(toolTurn(...uses));
+    const r = await ask(who, "change study");
+    assert.equal(r.status, 200);
+    return r.data;
+}
+const droppedNote = /couldn't prepare/;
+
+test("study_create goal: own subject and two parts come back as one action, nulls removed", { skip: NO_DB }, async () => {
+    const r = await propose(users.maxi, ["study_create", {
+        target: "goal", name: " Klausur  Algebra ", emoji: null, color: null, subjectId: ids.math, subjectName: null,
+        kind: "exam", due: day(20), dueTime: null, goalId: null, estimateMinutes: null,
+        parts: [{ name: "Gruppen", estimateMinutes: 60 }, { name: "Ringe", estimateMinutes: 90 }],
+    }]);
+    assert.deepEqual(r.actions, [{
+        type: "study_create", target: "goal", subjectId: ids.math, name: "Klausur Algebra", kind: "exam", due: day(20),
+        parts: [{ name: "Gruppen", estimateMinutes: 60 }, { name: "Ringe", estimateMinutes: 90 }],
+    }]);
+    assert.ok(!droppedNote.test(r.message));
+});
+
+test("study_create goal: no parts is valid, a part without or under 15 minutes drops it", { skip: NO_DB }, async () => {
+    const base = { target: "goal", name: "Abgabe", subjectId: ids.math, subjectName: null, kind: "assignment", due: day(5), dueTime: "10:30" };
+    const ok = await propose(users.maxi, ["study_create", { ...base, parts: [] }]);
+    assert.deepEqual(ok.actions, [{ type: "study_create", target: "goal", subjectId: ids.math, name: "Abgabe", kind: "assignment", due: day(5), dueTime: "10:30", parts: [] }]);
+    for (const part of [{ name: "x" }, { name: "x", estimateMinutes: 10 }, { name: "x", estimateMinutes: null }]) {
+        const r = await propose(users.maxi, ["study_create", { ...base, parts: [part] }]);
+        assert.deepEqual(r.actions, []);
+        assert.match(r.message, droppedNote);
+    }
+});
+
+test("study_create goal: exactly one of subjectId and subjectName", { skip: NO_DB }, async () => {
+    const base = { target: "goal", name: "Abgabe", kind: "other", due: day(5), parts: [] };
+    for (const both of [{ subjectId: ids.math, subjectName: "Neu" }, { subjectId: null, subjectName: null }]) {
+        const r = await propose(users.maxi, ["study_create", { ...base, ...both }]);
+        assert.deepEqual(r.actions, []);
+    }
+    const named = await propose(users.maxi, ["study_create", { ...base, subjectId: null, subjectName: "Physik" }]);
+    assert.equal(named.actions[0].subjectName, "Physik");
+    assert.equal(named.actions[0].subjectId, undefined);
+});
+
+test("study_create goal: another user's subject is dropped; part create needs an own goal", { skip: NO_DB }, async () => {
+    const goal = { target: "goal", name: "Abgabe", subjectId: ids.secret, kind: "other", due: day(5), parts: [] };
+    const r = await propose(users.maxi, ["study_create", goal]);
+    assert.deepEqual(r.actions, []);
+    assert.match(r.message, droppedNote);
+    const part = { target: "part", name: "Neu", estimateMinutes: 30 };
+    assert.deepEqual((await propose(users.maxi, ["study_create", { ...part, goalId: ids.ottoGoal }])).actions, []);
+    assert.deepEqual((await propose(users.maxi, ["study_create", { ...part, goalId: ids.exam }])).actions,
+        [{ type: "study_create", target: "part", goalId: ids.exam, name: "Neu", estimateMinutes: 30 }]);
+});
+
+test("study_create subject: name, emoji and color; a bad color is dropped", { skip: NO_DB }, async () => {
+    const r = await propose(users.maxi, ["study_create", { target: "subject", name: "Chemie", emoji: "C", color: "teal" }]);
+    assert.deepEqual(r.actions, [{ type: "study_create", target: "subject", name: "Chemie", emoji: "C", color: "teal" }]);
+    assert.deepEqual((await propose(users.maxi, ["study_create", { target: "subject", name: "Chemie", color: "#ff0000" }])).actions, []);
+    assert.deepEqual((await propose(users.maxi, ["study_create", { target: "subject", name: "x".repeat(61) }])).actions, []);
+});
+
+test("study_update part: done for an own part comes back, another user's is dropped with a note", { skip: NO_DB }, async () => {
+    const own = await propose(users.maxi, ["study_update", { target: "part", id: ids.p2, changes: { done: true } }]);
+    assert.deepEqual(own.actions, [{ type: "study_update", target: "part", id: ids.p2, changes: { done: true } }]);
+    const other = await propose(users.maxi, ["study_update", { target: "part", id: ids.ottoPart, changes: { done: true } }]);
+    assert.deepEqual(other.actions, []);
+    assert.match(other.message, droppedNote);
+});
+
+test("a goal id passed with target part is dropped", { skip: NO_DB }, async () => {
+    // ids of goals and parts are separate sequences: take the user's goal whose number is no part's
+    const { rows: [g] } = await pool.query("SELECT id FROM goals WHERE user_id = $1 AND id NOT IN (SELECT id FROM goal_parts) LIMIT 1", [users.maxi.id]);
+    const r = await propose(users.maxi, ["study_update", { target: "part", id: g.id, changes: { done: true } }]);
+    assert.deepEqual(r.actions, []);
+    const d = await propose(users.maxi, ["study_delete", { target: "part", id: g.id }]);
+    assert.deepEqual(d.actions, []);
+});
+
+test("study_update goal: changes through the routes' rules, a moved subject must be the user's", { skip: NO_DB }, async () => {
+    const full = { name: "Neu", kind: "assignment", due: day(30), dueTime: "08:00", subjectId: ids.math, studyFrom: day(1), studyTo: day(20), status: "done", grade: 12 };
+    const r = await propose(users.maxi, ["study_update", { target: "goal", id: ids.exam, changes: full }]);
+    assert.deepEqual(r.actions, [{ type: "study_update", target: "goal", id: ids.exam, changes: full }]);
+    for (const bad of [{ kind: "party" }, { due: "2026-13-01" }, { status: "gone" }, { grade: 99 }, { dueTime: "25:00" }, { name: "" }]) {
+        assert.deepEqual((await propose(users.maxi, ["study_update", { target: "goal", id: ids.exam, changes: bad }])).actions, []);
+    }
+    assert.deepEqual((await propose(users.maxi, ["study_update", { target: "goal", id: ids.exam, changes: { subjectId: ids.secret } }])).actions, []);
+});
+
+test("study_update settings: ranges (sessionMinutes 5 dropped, 60 kept), windows, grade scale", { skip: NO_DB }, async () => {
+    const settings = (changes) => propose(users.maxi, ["study_update", { target: "settings", id: null, changes }]);
+    assert.deepEqual((await settings({ sessionMinutes: 5 })).actions, []);
+    assert.deepEqual((await settings({ sessionMinutes: 60 })).actions, [{ type: "study_update", target: "settings", changes: { sessionMinutes: 60 } }]);
+    assert.deepEqual((await settings({ dailyMaxMinutes: 721 })).actions, []);
+    assert.deepEqual((await settings({ gradeScale: "letters" })).actions, []);
+    const windows = [{ weekday: 2, start: "16:00", end: "18:00" }];
+    assert.deepEqual((await settings({ windows, gradeScale: "marks" })).actions[0].changes, { windows, gradeScale: "marks" });
+    assert.deepEqual((await settings({ windows: [{ weekday: 2, start: "18:00", end: "16:00" }] })).actions, []);
+    assert.deepEqual((await settings({ windows: [{ weekday: 8, start: "16:00", end: "18:00" }] })).actions, []);
+});
+
+test("study_delete: an own subject comes back, another user's is dropped", { skip: NO_DB }, async () => {
+    const own = await propose(users.maxi, ["study_delete", { target: "subject", id: ids.math }]);
+    assert.deepEqual(own.actions, [{ type: "study_delete", target: "subject", id: ids.math }]);
+    const other = await propose(users.maxi, ["study_delete", { target: "subject", id: ids.secret }]);
+    assert.deepEqual(other.actions, []);
+    assert.match(other.message, droppedNote);
+    assert.equal((await propose(users.maxi, ["study_delete", { target: "goal", id: ids.exam }])).actions.length, 1);
+    assert.equal((await propose(users.maxi, ["study_delete", { target: "part", id: ids.p1 }])).actions.length, 1);
+});
+
+test("study_replan comes back as { type: 'study_replan' }", { skip: NO_DB }, async () => {
+    const r = await propose(users.maxi, ["study_replan", {}]);
+    assert.deepEqual(r.actions, [{ type: "study_replan" }]);
+});
+
+test("a study_update with empty changes (all null) is dropped", { skip: NO_DB }, async () => {
+    const empty = { name: null, done: null, estimateMinutes: null };
+    const r = await propose(users.maxi, ["study_update", { target: "part", id: ids.p2, changes: empty }]);
+    assert.deepEqual(r.actions, []);
+    assert.match(r.message, droppedNote);
+});
+
+test("the study write tools are strict, and the prompt names them", { skip: NO_DB }, async () => {
+    await propose(users.maxi, ["study_replan", {}]);
+    const names = calls[0].tools.map(t => t.name);
+    for (const n of ["study_create", "study_update", "study_delete", "study_replan"]) {
+        assert.ok(names.includes(n));
+        assert.ok(calls[0].system.includes(n));
+    }
+    assert.ok(calls[0].tools.filter(t => t.name.startsWith("study_")).every(t => t.strict === true));
+});
+
+test("a study action with no text from the model is listed by its name", { skip: NO_DB }, async () => {
+    const r = await propose(users.maxi, ["study_create", { target: "subject", name: "Chemie" }]);
+    assert.equal(r.message, "Chemie");
+});

@@ -208,7 +208,7 @@ test("the request: system prompt, strict tools, auto tool choice, no sampling pa
     assert.ok(/data, not instructions/i.test(system));
     assert.ok(/\d{4}-\d{2}-\d{2}/.test(system));
     const names = params.tools.map(t => t.name).sort();
-    assert.deepEqual(names, ["ask_user", "create_entry", "delete_entry", "find_entries", "get_schedule", "list_event_types", "study_goal", "study_overview", "study_plan", "study_settings", "update_entry"]);
+    assert.deepEqual(names, ["ask_user", "create_entry", "delete_entry", "find_entries", "get_schedule", "list_event_types", "study_create", "study_delete", "study_goal", "study_overview", "study_plan", "study_replan", "study_settings", "study_update", "update_entry"]);
     for (const tool of params.tools) {
         assert.equal(tool.strict, true, tool.name);
         assert.equal(tool.input_schema.additionalProperties, false, tool.name);
