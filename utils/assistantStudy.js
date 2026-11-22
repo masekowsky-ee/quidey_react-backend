@@ -25,7 +25,7 @@ const STUDY_READ_TOOLS = ["study_overview", "study_goal", "study_settings"];
 // the tool definitions; `tool` is the builder of toolList() in assistant.js
 function studyReadTools(tool) {
     return nonStrict([
-        tool("study_overview", "Read the user's study area: their subjects, each with its active goals (exams, assignments, presentations: id, name, kind, due date, part counts) and the grade averages in the user's grade scale. At most 30 subjects.",
+        tool("study_overview", "Read the user's study area: their subjects, each with its active goals (exams, assignments, presentations: id, name, kind, due date, part counts; ended: true when the day is over, such a goal can still be graded) and the grade averages in the user's grade scale. At most 30 subjects.",
             {}),
         tool("study_goal", "Read one study goal of the user (an id from study_overview) with its parts: estimate in minutes, done, role, order.",
             { id: { type: "integer" } }),
@@ -61,14 +61,14 @@ function studyProposalTools(tool) {
                 parts: nullable({ type: "array", items: object({ name: { type: "string" }, estimateMinutes: { type: "integer" } }) }),
                 goalId: int, estimateMinutes: int,
             }),
-        tool("study_update", "Propose a change to the user's own study data (ids from study_overview or study_goal; never guess one). target 'subject' (id): name, emoji, color, archived. 'goal' (id): name, kind, due, dueTime, subjectId, studyFrom, studyTo, status (active, done, archived), grade (a number in the user's grade scale). 'part' (id): name, estimateMinutes, done. 'settings' (id null): sessionMinutes 15-180, dailyMaxMinutes 15-720, windows (replaces all: weekday 1-7, start and end HH:MM), gradeScale (points or marks). Set only what changes, the rest null. The user confirms or previews it in the app.",
+        tool("study_update", "Propose a change to the user's own study data (ids from study_overview or study_goal; never guess one). target 'subject' (id): name, emoji, color, archived. 'goal' (id): name, kind, due, dueTime, subjectId, studyFrom, studyTo, status (active, done, archived), grade (a number in the user's grade scale; a grade needs status 'done', so set status 'done' in the same change). 'part' (id): name, estimateMinutes, done. 'settings' (id null): sessionMinutes 15-180, dailyMaxMinutes 15-720, windows (replaces all: weekday 1-7, start and end HH:MM), gradeScale (points or marks). Set only what changes, the rest null. The user confirms or previews it in the app.",
             {
                 target: targets(["subject", "goal", "part", "settings"]),
                 id: int,
                 changes: object({
                     name: str, emoji: str, color: str, archived: nullable({ type: "boolean" }),
                     kind: str, due: str, dueTime: str, subjectId: int, studyFrom: str, studyTo: str, status: str,
-                    grade: nullable({ type: "number" }),
+                    grade: { ...nullable({ type: "number" }), description: "Only together with status 'done' (a goal that isn't done can't get a grade)." },
                     estimateMinutes: int, done: nullable({ type: "boolean" }),
                     sessionMinutes: int, dailyMaxMinutes: int,
                     windows: nullable({ type: "array", items: object({ weekday: { type: "integer" }, start: { type: "string" }, end: { type: "string" } }) }),
@@ -132,7 +132,8 @@ function createGoal(input, label, check) {
     const dueTime = present(input.dueTime) ? check.validTime(input.dueTime) : undefined;
     if (!Object.values(subject)[0] || !KINDS.includes(input.kind) || !due || dueTime === null) return null;
     const list = input.parts ?? [];
-    if (!Array.isArray(list) || list.length > PARTS_MAX) return null;
+    // the route adds a review part to an exam
+    if (!Array.isArray(list) || list.length > (input.kind === "exam" ? PARTS_MAX - 1 : PARTS_MAX)) return null;
     const parts = [];
     for (const p of list) {
         const name = nameOf(p?.name, 200);
@@ -234,8 +235,7 @@ async function overview({ db, userId }) {
     if (!shown.length) return { subjects: [] };
     const subjectIds = shown.map(s => s.id);
 
-    // active goals that have not ended (as GET /subjects: a goal whose day is over has ended), the next due
-    // first, with how many parts are done
+    // active goals, the next due first with the ended ones (day over) after them, with how many parts are done
     const clock = await getClock(db, userId);
     const { rows: allGoals } = await db.query(
         `SELECT goals.id, goals.subject_id, goals.name, goals.kind, to_char(goals.due, 'YYYY-MM-DD') AS due,
@@ -244,7 +244,9 @@ async function overview({ db, userId }) {
         FROM goals LEFT JOIN goal_parts ON goal_parts.goal_id = goals.id
         WHERE goals.user_id = $1 AND goals.status = 'active' AND goals.subject_id = ANY($2::int[])
         GROUP BY goals.id ORDER BY goals.due, goals.due_time NULLS LAST, goals.id`, [userId, subjectIds]);
-    const goals = allGoals.filter(g => !isEnded(g, clock.today));
+    // the ended ones (the Lernen UI still lets the user grade them) come after the open ones, each group in due order
+    const endedOf = (g) => isEnded(g, clock.today);
+    const goals = [...allGoals.filter(g => !endedOf(g)), ...allGoals.filter(endedOf)];
     // grades as GET /subjects: one mean of the exams' points and one of the other work's
     const { rows: graded } = await db.query(
         `SELECT subject_id, (kind = 'exam') AS exam, grade::float8 AS grade FROM goals
@@ -263,7 +265,7 @@ async function overview({ db, userId }) {
             examAverage: averageOf(s.id, true), otherAverage: averageOf(s.id, false),
             goals: own.slice(0, GOALS_PER_SUBJECT_MAX).map(g => ({
                 id: g.id, name: g.name, kind: g.kind, due: g.due, dueTime: g.due_time, planMode: g.plan_mode,
-                partCount: g.part_count, partsDone: g.parts_done,
+                partCount: g.part_count, partsDone: g.parts_done, ...(isEnded(g, clock.today) ? { ended: true } : {}),
             })),
         };
     });
@@ -278,12 +280,13 @@ async function goalDetail(input, { db, userId }) {
             grade::float8 AS grade, to_char(study_from, 'YYYY-MM-DD') AS study_from, to_char(study_to, 'YYYY-MM-DD') AS study_to
         FROM goals WHERE id = $1 AND user_id = $2`, [id, userId]);
     if (!goal) return { error: "no such goal" };
+    const clock = await getClock(db, userId);
     const { rows: parts } = await db.query(
         `SELECT id, name, estimate_minutes, done_at IS NOT NULL AS done, role, position
         FROM goal_parts WHERE goal_id = $1 ORDER BY position, id`, [id]);
     return {
         id: goal.id, subjectId: goal.subject_id, name: goal.name, kind: goal.kind, due: goal.due, dueTime: goal.due_time,
-        status: goal.status,
+        status: goal.status, ...(isEnded(goal, clock.today) ? { ended: true } : {}),
         grade: goal.grade == null ? null : fromPoints(goal.grade, await scaleOf(db, userId)),
         studyFrom: goal.study_from, studyTo: goal.study_to,
         parts: parts.map(p => ({ id: p.id, name: p.name, estimateMinutes: p.estimate_minutes, done: p.done, role: p.role, position: p.position })),

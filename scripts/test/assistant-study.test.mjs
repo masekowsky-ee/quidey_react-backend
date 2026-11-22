@@ -184,10 +184,13 @@ test("study_overview: the user's subjects with active goals, part counts and ave
     assert.equal(math.archived, false);
     assert.equal(math.examAverage, 11);   // points scale: (12 + 10) / 2
     assert.equal(math.otherAverage, 6);
-    assert.equal(math.goals.length, 1);   // done, archived and ended (due yesterday) goals are left out
+    assert.equal(math.goals.length, 2);   // done and archived goals are left out; the ended one (due yesterday) comes last
     assert.deepEqual(math.goals[0], {
         id: ids.exam, name: "Klausur Analysis", kind: "exam", due: day(10), dueTime: null, planMode: "slots", partCount: 3, partsDone: 1,
     });
+    assert.equal(math.goals[1].id, ids.endedGoal);
+    assert.equal(math.goals[1].ended, true);
+    assert.equal("ended" in math.goals[0], false);
     assert.equal(r.data.more, undefined);
     assert.ok(!JSON.stringify(r.data).includes("Ottos"));
 });
@@ -216,7 +219,9 @@ test("study_goal: own goal with its parts and done flags", { skip: NO_DB }, asyn
     assert.equal(r.data.name, "Klausur Analysis");
     assert.equal(r.data.kind, "exam");
     assert.equal(r.data.status, "active");
+    assert.equal("ended" in r.data, false);
     assert.equal(r.data.grade, null);
+    assert.equal((await useTool(users.maxi, "study_goal", { id: ids.endedGoal })).data.ended, true);
     assert.deepEqual(r.data.parts.map(p => [p.name, p.done, p.role, p.position, p.estimateMinutes]), [
         ["Ableitungen", true, "part", 0, 45], ["Integrale", false, "part", 1, 45], ["Wiederholung", false, "review", 2, 45],
     ]);
@@ -254,13 +259,13 @@ test("the study tools count as lookups: the fourth in one turn gets an error", {
     assert.ok(!results[0].is_error && !results[2].is_error);
 });
 
-test("study_overview: an active goal whose day is over is left out and not counted, one due tomorrow stays", { skip: NO_DB }, async () => {
+test("study_overview: an active goal whose day is over is listed after the open ones with ended: true, inside the cap", { skip: NO_DB }, async () => {
     await pool.query("INSERT INTO goals (user_id, subject_id, kind, name, due) VALUES ($1, $2, 'assignment', 'Morgen faellig', $3)", [users.maxi.id, ids.math, day(1)]);
     try {
         const r = await useTool(users.maxi, "study_overview", {});
         const names = r.data.subjects[0].goals.map(g => g.name);
-        assert.deepEqual(names, ["Morgen faellig", "Klausur Analysis"]);
-        assert.ok(!names.includes("Gestern faellig"));
+        assert.deepEqual(names, ["Morgen faellig", "Klausur Analysis", "Gestern faellig"]);
+        assert.deepEqual(r.data.subjects[0].goals.map(g => g.ended === true), [false, false, true]);
     } finally {
         await pool.query("DELETE FROM goals WHERE name = 'Morgen faellig'");
     }
@@ -300,6 +305,23 @@ test("study_create goal: no parts is valid, a part without or under 15 minutes d
         assert.deepEqual(r.actions, []);
         assert.match(r.message, droppedNote);
     }
+});
+
+test("study_create goal: an exam takes 39 topics (the route adds a review part), other kinds 40", { skip: NO_DB }, async () => {
+    const parts = (n) => Array.from({ length: n }, (_, i) => ({ name: `T${i}`, estimateMinutes: 30 }));
+    const base = { target: "goal", name: "Gross", subjectId: ids.math, subjectName: null, due: day(5), dueTime: null };
+    assert.equal((await propose(users.maxi, ["study_create", { ...base, kind: "exam", parts: parts(39) }])).actions.length, 1);
+    assert.deepEqual((await propose(users.maxi, ["study_create", { ...base, kind: "exam", parts: parts(40) }])).actions, []);
+    assert.equal((await propose(users.maxi, ["study_create", { ...base, kind: "assignment", parts: parts(40) }])).actions.length, 1);
+});
+
+test("study_update says a grade needs status done; the prompt tells study_plan from study_create", { skip: NO_DB }, async () => {
+    await propose(users.maxi, ["study_replan", {}]);
+    const update = calls[0].tools.find(t => t.name === "study_update");
+    assert.match(update.description, /grade[^.]*status 'done'|status 'done'[^.]*grade/);
+    assert.match(JSON.stringify(update.input_schema), /done/);
+    assert.match(calls[0].system, /grade needs status 'done'/);
+    assert.match(calls[0].system, /study_plan only when/);
 });
 
 test("study_create goal: exactly one of subjectId and subjectName", { skip: NO_DB }, async () => {
