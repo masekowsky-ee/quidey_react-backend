@@ -3,7 +3,8 @@
 //
 // runAssistant({ db, userId, messages, language, now }) → { message, actions, usage: { inputTokens, outputTokens } }
 //   Read tools run here, on the user's own rows (and tasks friends shared with them, like GET /api/tasks):
-//     get_schedule({ from, to }), find_entries({ query }), list_event_types().
+//     get_schedule({ from, to }), find_entries({ query }), list_event_types(), and for the study area
+//     study_overview(), study_goal({ id }), study_settings() (utils/assistantStudy.js).
 //   Write tools never write: create_entry, update_entry, delete_entry and study_plan end the loop and
 //   come back as actions, which the app applies through the usual routes (moves and deletes after the
 //   user confirms). ask_user({ question }) ends it with the question as the message.
@@ -21,6 +22,7 @@
 // Nothing of the chat is kept; the caller adds the token numbers to the day's total (utils/quota.js).
 
 const { converse, AiError } = require("./ai");
+const { readStudy, studyReadTools, STUDY_READ_TOOLS } = require("./assistantStudy");
 
 const HISTORY_MAX = 10;     // messages sent to the model
 const MESSAGES_MAX = 40;    // messages accepted in a request (the older ones are left out)
@@ -76,6 +78,7 @@ function toolList() {
         tool("find_entries", "Find the user's tasks and events whose name contains the words.",
             { query: { type: "string" } }),
         tool("list_event_types", "List the names of the user's event types.", {}),
+        ...studyReadTools(tool),
         { name: "create_entry", strict: true, input_schema: ENTRY_SCHEMA,
             description: "Propose a new task, event or reminder. Nothing is saved yet: the app shows it to the user. Dates YYYY-MM-DD, times HH:MM; null for what the user didn't say." },
         tool("update_entry", "Propose a change to one of the user's own entries (an id from get_schedule or find_entries with own: true). Set only what changes, the rest null. The user confirms it in the app.",
@@ -192,6 +195,7 @@ async function readTool(name, input, { db, userId, types, check }) {
         return { entries: rows.map(entryForModel) };
     }
     if (name === "list_event_types") return { eventTypes: types.map(t => t.name) };
+    if (STUDY_READ_TOOLS.includes(name)) return readStudy(name, input, { db, userId });
     return null;
 }
 
@@ -234,7 +238,7 @@ function proposal(name, input, { types, check }) {
 }
 
 const WRITE_TOOLS = ["create_entry", "update_entry", "delete_entry", "study_plan"];
-const READ_TOOLS = ["get_schedule", "find_entries", "list_event_types"];
+const READ_TOOLS = ["get_schedule", "find_entries", "list_event_types", ...STUDY_READ_TOOLS];
 
 // the proposals of one turn: valid ones whose ids are the user's own tasks; { actions, dropped }
 async function proposals(uses, { db, userId, types, check }) {
