@@ -24,15 +24,19 @@ const STUDY_READ_TOOLS = ["study_overview", "study_goal", "study_settings"];
 
 // the tool definitions; `tool` is the builder of toolList() in assistant.js
 function studyReadTools(tool) {
-    return [
+    return nonStrict([
         tool("study_overview", "Read the user's study area: their subjects, each with its active goals (exams, assignments, presentations: id, name, kind, due date, part counts) and the grade averages in the user's grade scale. At most 30 subjects.",
             {}),
         tool("study_goal", "Read one study goal of the user (an id from study_overview) with its parts: estimate in minutes, done, role, order.",
             { id: { type: "integer" } }),
         tool("study_settings", "Read the user's study settings: session length and daily maximum in minutes, the weekly study windows (weekday 1 = Monday to 7 = Sunday) and the grade scale (points 0-15, or marks 1-6 with 1 best).",
             {}),
-    ];
+    ]);
 }
+
+// The study tools aren't strict: Anthropic caps the optional and union-typed parameters over all strict tools of a
+// request, and this module checks every input itself (an absent field counts as null).
+const nonStrict = (list) => list.map(t => ({ ...t, strict: false }));
 
 const COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "violet", "pink"];
 const KINDS = ["exam", "assignment", "presentation", "other"];
@@ -48,7 +52,7 @@ const targets = (list) => ({ type: "string", enum: list });
 function studyProposalTools(tool) {
     const int = nullable({ type: "integer" });
     const str = nullable({ type: "string" });
-    return [
+    return nonStrict([
         tool("study_create", "Propose creating something in the study area (Lernen). target 'subject': name (max 60), optional emoji and color (red, orange, yellow, green, teal, blue, violet, pink). target 'goal': name, kind (exam, assignment, presentation, other), due (YYYY-MM-DD), optional dueTime, exactly one of subjectId (from study_overview) or subjectName (a new subject), and parts (topics with estimateMinutes 15-1200; an empty list is a goal with only a date). target 'part': goalId, name, estimateMinutes. You don't save anything: the app creates it at once. Null for what doesn't apply.",
             {
                 target: targets(["subject", "goal", "part"]),
@@ -74,7 +78,7 @@ function studyProposalTools(tool) {
         tool("study_delete", "Propose deleting one of the user's own subjects, goals or parts (an id from study_overview or study_goal). The user confirms it in the app.",
             { target: targets(["subject", "goal", "part"]), id: { type: "integer" } }),
         tool("study_replan", "Propose replanning the user's study sessions: the app shows a preview of the new plan.", {}),
-    ];
+    ]);
 }
 
 // ---------- write tools: proposals, checked ----------
@@ -94,9 +98,10 @@ const TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
 const rangeOf = (min, max) => (value) => (Number.isInteger(value) && value >= min && value <= max ? value : null);
 const oneOf = (list) => (value) => (list.includes(value) ? value : null);
 
-// the fields of `raw` that are set, each through its check; null when one of them is invalid
-function pick(raw, checks) {
+// the fields of `raw` that are set, each through its check; null when one of them is invalid or isn't one of `checks`
+function pick(raw, checks, only = true) {
     const out = {};
+    if (only && raw && typeof raw === "object" && Object.keys(raw).some(k => present(raw[k]) && !(k in checks))) return null;
     for (const [key, fn] of Object.entries(checks)) {
         if (!present(raw?.[key])) continue;
         const value = fn(raw[key]);
@@ -162,7 +167,7 @@ function studyProposal(name, input, { check }) {
         const label = nameOf(input?.name, target === "subject" ? 60 : 200);
         if (!label) return null;
         if (target === "subject") {
-            const extra = pick(input, { emoji: emojiOf, color: colorOf });
+            const extra = pick(input, { emoji: emojiOf, color: colorOf }, false);
             return extra && { type: "study_create", target, name: label, ...extra };
         }
         if (target === "part") {

@@ -392,17 +392,43 @@ test("a study_update with empty changes (all null) is dropped", { skip: NO_DB },
     assert.match(r.message, droppedNote);
 });
 
-test("the study write tools are strict, and the prompt names them", { skip: NO_DB }, async () => {
+test("the study tools are not strict (the server validates), and the prompt names the write tools", { skip: NO_DB }, async () => {
     await propose(users.maxi, ["study_replan", {}]);
     const names = calls[0].tools.map(t => t.name);
     for (const n of ["study_create", "study_update", "study_delete", "study_replan"]) {
         assert.ok(names.includes(n));
         assert.ok(calls[0].system.includes(n));
     }
-    assert.ok(calls[0].tools.filter(t => t.name.startsWith("study_")).every(t => t.strict === true));
+    const studyTools = calls[0].tools.filter(t => /^study_(create|update|delete|replan|overview|goal|settings)$/.test(t.name));
+    assert.equal(studyTools.length, 7);
+    assert.ok(studyTools.every(t => t.strict === false));
+    assert.equal(calls[0].tools.find(t => t.name === "study_plan").strict, true);
 });
 
 test("a study action with no text from the model is listed by its name", { skip: NO_DB }, async () => {
     const r = await propose(users.maxi, ["study_create", { target: "subject", name: "Chemie" }]);
     assert.equal(r.message, "Chemie");
+});
+
+test("omitted nullable fields count as null: a part update with only target, id and changes.done", { skip: NO_DB }, async () => {
+    const r = await propose(users.maxi, ["study_update", { target: "part", id: ids.p2, changes: { done: true } }]);
+    assert.deepEqual(r.actions, [{ type: "study_update", target: "part", id: ids.p2, changes: { done: true } }]);
+});
+
+test("omitted nullable fields count as null: a goal create without dueTime, subjectName, parts", { skip: NO_DB }, async () => {
+    const r = await propose(users.maxi, ["study_create", { target: "goal", name: "Abgabe", subjectId: ids.math, kind: "other", due: day(5) }]);
+    assert.deepEqual(r.actions, [{ type: "study_create", target: "goal", subjectId: ids.math, name: "Abgabe", kind: "other", due: day(5), parts: [] }]);
+    const named = await propose(users.maxi, ["study_create", { target: "goal", name: "Abgabe", subjectName: "Physik", kind: "other", due: day(5), parts: [{ name: "a", estimateMinutes: 30 }] }]);
+    assert.equal(named.actions[0].subjectName, "Physik");
+});
+
+test("a field that doesn't belong to the target drops the whole update", { skip: NO_DB }, async () => {
+    const r = await propose(users.maxi, ["study_update", { target: "goal", id: ids.exam, changes: { name: "x", done: true } }]);
+    assert.deepEqual(r.actions, []);
+    assert.match(r.message, droppedNote);
+    const s = await propose(users.maxi, ["study_update", { target: "settings", changes: { sessionMinutes: 60, name: "x" } }]);
+    assert.deepEqual(s.actions, []);
+    // null for a foreign field is fine
+    const ok = await propose(users.maxi, ["study_update", { target: "goal", id: ids.exam, changes: { name: "x", done: null } }]);
+    assert.equal(ok.actions.length, 1);
 });

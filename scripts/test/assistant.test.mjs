@@ -210,7 +210,9 @@ test("the request: system prompt, strict tools, auto tool choice, no sampling pa
     const names = params.tools.map(t => t.name).sort();
     assert.deepEqual(names, ["ask_user", "create_entry", "delete_entry", "find_entries", "get_schedule", "list_event_types", "study_create", "study_delete", "study_goal", "study_overview", "study_plan", "study_replan", "study_settings", "study_update", "update_entry"]);
     for (const tool of params.tools) {
-        assert.equal(tool.strict, true, tool.name);
+        // the study tools check their input themselves and aren't strict (Anthropic caps optional parameters over strict tools)
+        const studyTool = /^study_(create|update|delete|replan|overview|goal|settings)$/.test(tool.name);
+        assert.equal(tool.strict, !studyTool, tool.name);
         assert.equal(tool.input_schema.additionalProperties, false, tool.name);
         assert.deepEqual([...tool.input_schema.required].sort(), Object.keys(tool.input_schema.properties).sort(), tool.name);
     }
